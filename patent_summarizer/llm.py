@@ -27,7 +27,7 @@ class RateLimiter:
     ):
         if rpm <= 0:
             raise ValueError("rpm must be positive")
-        self.interval = 60.0 / rpm + safety_seconds
+        self.interval = 60.0 / rpm + safety_seconds # 每个请求之间的最小间隔时间，单位秒
         self.clock = clock or time.monotonic
         self.sleeper = sleeper or time.sleep
         self._lock = threading.Lock()
