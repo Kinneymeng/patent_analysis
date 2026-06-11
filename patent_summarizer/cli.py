@@ -3,13 +3,16 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from .classification_pipeline import CheckpointStore, PatentClassificationPipeline, discover_classification_documents
 from .config import ConfigError, load_config
 from .discovery import discover_documents
 from .extractors import TextExtractor
+from .excel_export import write_classification_workbook
 from .llm import RateLimitedOpenAIClient
 from .logging_utils import RunLogger
 from .processor import PatentProcessor, ProcessingResult
 from .summarizer import PatentSummarizer
+from .taxonomy import load_taxonomy
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -17,6 +20,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.command == "run":
         return run(args)
+    if args.command == "classify":
+        return classify(args)
     parser.print_help()
     return 2
 
@@ -32,6 +37,16 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--limit", type=int, help="Process only the first N pending files")
     run_parser.add_argument("--api-rpm", type=int, help="Override PATENT_API_RPM")
     run_parser.add_argument("--env-file", type=Path, default=Path(".env"), help="Path to .env config file")
+
+    classify_parser = subparsers.add_parser("classify", help="Classify documents into a two-level Excel taxonomy")
+    classify_parser.add_argument("--input", required=True, type=Path, help="Folder containing PDF/DOCX documents")
+    classify_parser.add_argument("--classes", required=True, type=Path, help="XLSX file with first-level and second-level categories")
+    classify_parser.add_argument("--output", required=True, type=Path, help="Output XLSX classification report")
+    classify_parser.add_argument("--recursive", action="store_true", help="Scan subfolders recursively")
+    classify_parser.add_argument("--dry-run", action="store_true", help="List files without calling the API")
+    classify_parser.add_argument("--limit", type=int, help="Process only the first N files")
+    classify_parser.add_argument("--api-rpm", type=int, help="Override PATENT_API_RPM")
+    classify_parser.add_argument("--env-file", type=Path, default=Path(".env"), help="Path to .env config file")
     return parser
 
 
@@ -92,4 +107,67 @@ def run(args: argparse.Namespace) -> int:
             print(f"FAIL\t{item.source}\t{exc}")
 
     print(f"Done. success={success}, failed={failed}, pending={len(items)}")
+    return 0 if failed == 0 else 1
+
+
+def classify(args: argparse.Namespace) -> int:
+    input_root = args.input.resolve()
+    try:
+        items = list(discover_classification_documents(input_root, recursive=args.recursive))
+    except (FileNotFoundError, NotADirectoryError) as exc:
+        print(f"Input error: {exc}")
+        return 2
+
+    if args.limit is not None:
+        items = items[: args.limit]
+
+    if args.dry_run:
+        for item in items:
+            print(f"CLASSIFY\t{item.source}\t(summary: {item.output})")
+        print(f"Files: {len(items)}")
+        return 0
+
+    try:
+        taxonomy = load_taxonomy(args.classes)
+        config = load_config(env_path=args.env_file, api_rpm=args.api_rpm)
+    except (ConfigError, RuntimeError, FileNotFoundError) as exc:
+        print(f"Config error: {exc}")
+        return 2
+
+    client = RateLimitedOpenAIClient(
+        base_url=config.base_url,
+        api_key=config.api_key,
+        model=config.model,
+        rpm=config.api_rpm,
+        max_retries=config.max_retries,
+    )
+    pipeline = PatentClassificationPipeline(
+        TextExtractor(ocr_enabled=config.ocr_enabled),
+        PatentSummarizer(client),
+        client,
+        taxonomy,
+    )
+    checkpoint = CheckpointStore(input_root / ".patent_summary_logs" / "classifications.jsonl")
+    successes = checkpoint.load_successes()
+
+    rows = []
+    failed = 0
+    for item in items:
+        key = str(item.source)
+        if key in successes:
+            rows.append(successes[key])
+            print(f"SKIP\t{item.source}")
+            continue
+        try:
+            row = pipeline.process(item.source, item.output)
+            checkpoint.record_success(row)
+            rows.append(row)
+            print(f"OK\t{item.source}")
+        except Exception as exc:
+            failed += 1
+            checkpoint.record_failure(item.source, exc.__class__.__name__, str(exc))
+            print(f"FAIL\t{item.source}\t{exc}")
+
+    write_classification_workbook(rows, args.output)
+    print(f"Done. rows={len(rows)}, failed={failed}, output={args.output}")
     return 0 if failed == 0 else 1

@@ -41,3 +41,13 @@ python -m patent_summarizer run --input "D:\path\to\patents" --recursive
 - `--api-rpm N`：覆盖 `.env` 中的请求上限。
 
 每个 `a.pdf` 或 `a.docx` 会在原文件旁生成 `a.md`。运行日志写到输入目录下的 `.patent_summary_logs/run.jsonl`，失败清单写到 `.patent_summary_logs/failures.csv`。
+
+## 分类到 Excel
+
+准备两列分类表，第一列为一级分类，第二列为二级分类，例如本项目的 `class.xlsx`。运行：
+
+```powershell
+python -m patent_summarizer classify --input "D:\path\to\patents" --classes class.xlsx --output patent_classification.xlsx --recursive
+```
+
+分类流程会优先复用同名 `.md` 摘要；若摘要不存在，会先生成摘要再分类。结果 Excel 每篇专利一行，包含主分类、候选分类、置信度、复核状态、分类理由以及摘要字段。中途结果写入输入目录下的 `.patent_summary_logs/classifications.jsonl`，再次运行时会复用已完成记录。
