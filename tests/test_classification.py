@@ -13,6 +13,7 @@ from patent_summarizer.classifier import parse_classification_response
 from patent_summarizer.cli import build_parser
 from patent_summarizer.excel_export import EXPORT_HEADERS, ClassificationExportRow, write_classification_workbook
 from patent_summarizer.markdown_summary import parse_summary_sections
+from patent_summarizer.metadata import BIBLIOGRAPHIC_FIELD_NAMES
 from patent_summarizer.taxonomy import Taxonomy, TaxonomyItem, load_taxonomy
 
 
@@ -42,6 +43,15 @@ class TaxonomyTests(unittest.TestCase):
 class MarkdownSummaryTests(unittest.TestCase):
     def test_parses_known_summary_sections(self):
         markdown = """# CN001.pdf
+## 著录信息
+- 申请号：CN202411111111
+- 申请日：2024年1月2日
+- 公开（公告）号：未提及
+- 公开（公告）日：未提及
+- 申请人：示例公司
+- 发明人：张三
+- IPC/CPC：B62D
+
 ## 专利主题
 一种车辆控制方法。
 
@@ -59,6 +69,7 @@ class MarkdownSummaryTests(unittest.TestCase):
         sections = parse_summary_sections(markdown)
 
         self.assertEqual(sections["专利主题"], "一种车辆控制方法。")
+        self.assertIn("申请号：CN202411111111", sections["著录信息"])
         self.assertEqual(sections["技术领域"], "底盘控制。")
         self.assertEqual(sections["潜在分类关键词"], "- 智驾\n- 底盘")
         self.assertEqual(sections["摘要全文"], markdown.strip())
@@ -151,6 +162,7 @@ class ExcelExportTests(unittest.TestCase):
                 review_status="通过",
                 reason="摘要提到控制目标融合",
                 sections={"专利主题": "一种车辆控制方法。", "技术领域": "底盘控制。", "摘要全文": "全文"},
+                metadata={"申请号": "CN202411111111", "申请日": "2024-01-02", "申请人": "示例公司"},
             )
 
             write_classification_workbook([row], output)
@@ -159,14 +171,19 @@ class ExcelExportTests(unittest.TestCase):
             ws = wb.active
             headers = [cell.value for cell in ws[1]]
             values = [cell.value for cell in ws[2]]
+            by_header = dict(zip(headers, values))
 
         self.assertEqual(headers, EXPORT_HEADERS)
-        self.assertEqual(values[0], "CN001.pdf")
-        self.assertEqual(values[1], "一种车辆控制方法。")
-        self.assertEqual(values[4], "自适应与机器学习")
-        self.assertEqual(values[5], "底盘与智驾域的控制目标融合")
-        self.assertEqual(values[10], "一种车辆控制方法。")
-        self.assertEqual(values[11], "底盘控制。")
+        for header in BIBLIOGRAPHIC_FIELD_NAMES:
+            self.assertIn(header, headers)
+        self.assertEqual(by_header["文件名"], "CN001.pdf")
+        self.assertEqual(by_header["专利名称"], "一种车辆控制方法。")
+        self.assertEqual(by_header["申请号"], "CN202411111111")
+        self.assertEqual(by_header["申请日"], "2024-01-02")
+        self.assertEqual(by_header["主一级分类"], "自适应与机器学习")
+        self.assertEqual(by_header["主二级分类"], "底盘与智驾域的控制目标融合")
+        self.assertEqual(by_header["专利主题"], "一种车辆控制方法。")
+        self.assertEqual(by_header["技术领域"], "底盘控制。")
 
 
 class FakeExtractor:
@@ -300,6 +317,7 @@ class CliTests(unittest.TestCase):
                 "--limit",
                 "10",
                 "--dry-run",
+                "--refresh-summaries",
             ]
         )
 
@@ -309,6 +327,32 @@ class CliTests(unittest.TestCase):
         self.assertEqual(args.output, Path("result.xlsx"))
         self.assertTrue(args.recursive)
         self.assertEqual(args.limit, 10)
+        self.assertTrue(args.dry_run)
+        self.assertTrue(args.refresh_summaries)
+
+    def test_parser_accepts_analyze_command_arguments(self):
+        parser = build_parser()
+
+        args = parser.parse_args(
+            [
+                "analyze",
+                "--classification",
+                "patent_classification.xlsx",
+                "--output",
+                "patent_trends.xlsx",
+                "--api-rpm",
+                "6",
+                "--batch-size",
+                "20",
+                "--dry-run",
+            ]
+        )
+
+        self.assertEqual(args.command, "analyze")
+        self.assertEqual(args.classification, Path("patent_classification.xlsx"))
+        self.assertEqual(args.output, Path("patent_trends.xlsx"))
+        self.assertEqual(args.api_rpm, 6)
+        self.assertEqual(args.batch_size, 20)
         self.assertTrue(args.dry_run)
 
 

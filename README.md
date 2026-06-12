@@ -50,4 +50,27 @@ python -m patent_summarizer run --input "D:\path\to\patents" --recursive
 python -m patent_summarizer classify --input "D:\path\to\patents" --classes class.xlsx --output patent_classification.xlsx --recursive
 ```
 
-分类流程会优先复用同名 `.md` 摘要；若摘要不存在，会先生成摘要再分类。结果 Excel 每篇专利一行，包含主分类、候选分类、置信度、复核状态、分类理由以及摘要字段。中途结果写入输入目录下的 `.patent_summary_logs/classifications.jsonl`，再次运行时会复用已完成记录。
+分类流程会优先复用同名 `.md` 摘要；若摘要不存在，会先生成摘要再分类。结果 Excel 每篇专利一行，包含主分类、候选分类、置信度、复核状态、分类理由、著录项字段以及摘要字段。中途结果写入输入目录下的 `.patent_summary_logs/classifications.jsonl`，再次运行时会复用已完成记录。
+
+如需让旧摘要重新抽取申请号、申请日、公开日、申请人、发明人、IPC/CPC 等著录信息，可增加：
+
+```powershell
+python -m patent_summarizer classify --input "D:\path\to\patents" --classes class.xlsx --output patent_classification.xlsx --recursive --refresh-summaries
+```
+- `--refresh-summaries`：刷新所有摘要，包括已分类的。
+
+## 标签趋势分析
+
+分类完成后，可按“主二级分类”聚合专利并生成趋势分析报告：
+
+```powershell
+python -m patent_summarizer analyze --classification patent_classification.xlsx --output patent_trends.xlsx
+```
+
+趋势分析会读取分类结果 Excel，按标签统计专利数、年度分布、置信度、复核数量、热点关键词，并调用同一 OpenAI 兼容接口生成每个标签的发展现状、发展阶段、主要技术路线、热点方向、机会与空白、风险和证据局限。输出工作簿包含 `标签总览`、`年度趋势`、`趋势报告`、`专利明细` 四个 Sheet。
+
+常用参数：
+
+- `--dry-run`：只列出待分析标签，不调用 API。
+- `--batch-size N`：单个标签下每批送入模型的专利数量，默认 40。
+- `--api-rpm N`：覆盖 `.env` 中的请求上限。

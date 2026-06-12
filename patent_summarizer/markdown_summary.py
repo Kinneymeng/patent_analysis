@@ -4,6 +4,7 @@ import re
 
 
 SUMMARY_SECTION_NAMES = [
+    "著录信息",
     "专利主题",
     "技术领域",
     "背景问题",

@@ -13,6 +13,8 @@ from .logging_utils import RunLogger
 from .processor import PatentProcessor, ProcessingResult
 from .summarizer import PatentSummarizer
 from .taxonomy import load_taxonomy
+from .trend_analysis import TrendAnalyzer, TrendCheckpointStore, build_trend_groups, load_classification_workbook
+from .trend_excel_export import write_trend_workbook
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -22,6 +24,8 @@ def main(argv: list[str] | None = None) -> int:
         return run(args)
     if args.command == "classify":
         return classify(args)
+    if args.command == "analyze":
+        return analyze(args)
     parser.print_help()
     return 2
 
@@ -47,6 +51,15 @@ def build_parser() -> argparse.ArgumentParser:
     classify_parser.add_argument("--limit", type=int, help="Process only the first N files")
     classify_parser.add_argument("--api-rpm", type=int, help="Override PATENT_API_RPM")
     classify_parser.add_argument("--env-file", type=Path, default=Path(".env"), help="Path to .env config file")
+    classify_parser.add_argument("--refresh-summaries", action="store_true", help="Regenerate Markdown summaries before classifying")
+
+    analyze_parser = subparsers.add_parser("analyze", help="Analyze patent trends from a classification workbook")
+    analyze_parser.add_argument("--classification", required=True, type=Path, help="Input XLSX classification report")
+    analyze_parser.add_argument("--output", required=True, type=Path, help="Output XLSX trend report")
+    analyze_parser.add_argument("--api-rpm", type=int, help="Override PATENT_API_RPM")
+    analyze_parser.add_argument("--env-file", type=Path, default=Path(".env"), help="Path to .env config file")
+    analyze_parser.add_argument("--batch-size", type=int, default=40, help="Patents per LLM trend-analysis batch")
+    analyze_parser.add_argument("--dry-run", action="store_true", help="List trend groups without calling the API")
     return parser
 
 
@@ -146,9 +159,10 @@ def classify(args: argparse.Namespace) -> int:
         PatentSummarizer(client),
         client,
         taxonomy,
+        refresh_summary=args.refresh_summaries,
     )
     checkpoint = CheckpointStore(input_root / ".patent_summary_logs" / "classifications.jsonl")
-    successes = checkpoint.load_successes()
+    successes = {} if args.refresh_summaries else checkpoint.load_successes()
 
     rows = []
     failed = 0
@@ -171,3 +185,38 @@ def classify(args: argparse.Namespace) -> int:
     write_classification_workbook(rows, args.output)
     print(f"Done. rows={len(rows)}, failed={failed}, output={args.output}")
     return 0 if failed == 0 else 1
+
+
+def analyze(args: argparse.Namespace) -> int:
+    try:
+        records = load_classification_workbook(args.classification)
+    except (RuntimeError, FileNotFoundError) as exc:
+        print(f"Input error: {exc}")
+        return 2
+
+    groups = build_trend_groups(records)
+    if args.dry_run:
+        for stats, _records in groups:
+            print(f"TREND\t{stats.first_level}\t{stats.second_level}\tpatents={stats.patent_count}")
+        print(f"Trend groups: {len(groups)}")
+        return 0
+
+    try:
+        config = load_config(env_path=args.env_file, api_rpm=args.api_rpm)
+    except ConfigError as exc:
+        print(f"Config error: {exc}")
+        return 2
+
+    client = RateLimitedOpenAIClient(
+        base_url=config.base_url,
+        api_key=config.api_key,
+        model=config.model,
+        rpm=config.api_rpm,
+        max_retries=config.max_retries,
+    )
+    analyzer = TrendAnalyzer(client, batch_size=args.batch_size)
+    checkpoint = TrendCheckpointStore(args.output.parent / ".patent_summary_logs" / f"{args.output.stem}.jsonl")
+    result = analyzer.analyze(records, checkpoint=checkpoint)
+    write_trend_workbook(result, args.output)
+    print(f"Done. trend_groups={len(result.reports)}, patents={len(records)}, output={args.output}")
+    return 0

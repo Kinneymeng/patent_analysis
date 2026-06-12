@@ -9,6 +9,7 @@ from .classifier import ChatClient, classify_summary
 from .discovery import DocumentItem, SUPPORTED_SUFFIXES
 from .excel_export import ClassificationExportRow
 from .markdown_summary import parse_summary_sections
+from .metadata import parse_bibliographic_metadata
 from .processor import Extractor, Summarizer
 from .taxonomy import Taxonomy
 
@@ -26,16 +27,19 @@ class PatentClassificationPipeline:
         classifier_client: ChatClient,
         taxonomy: Taxonomy,
         max_candidates: int = 3,
+        refresh_summary: bool = False,
     ):
         self.extractor = extractor
         self.summarizer = summarizer
         self.classifier_client = classifier_client
         self.taxonomy = taxonomy
         self.max_candidates = max_candidates
+        self.refresh_summary = refresh_summary
 
     def process(self, source: Path, summary_path: Path) -> ClassificationExportRow:
         summary = self._summary(source, summary_path)
         sections = parse_summary_sections(summary)
+        metadata = parse_bibliographic_metadata(sections.get("著录信息", ""))
         result = classify_summary(
             self.classifier_client,
             source.name,
@@ -55,10 +59,11 @@ class PatentClassificationPipeline:
             review_status=result.review_status,
             reason=result.reason,
             sections=sections,
+            metadata=metadata,
         )
 
     def _summary(self, source: Path, summary_path: Path) -> str:
-        if summary_path.exists():
+        if summary_path.exists() and not self.refresh_summary:
             return summary_path.read_text(encoding="utf-8", errors="ignore")
         text = self.extractor.extract(source)
         if not text.strip():
@@ -127,6 +132,7 @@ def _row_from_dict(payload: dict[str, object]) -> ClassificationExportRow:
         review_status=str(payload.get("review_status", "")),
         reason=str(payload.get("reason", "")),
         sections=payload.get("sections") if isinstance(payload.get("sections"), dict) else {},
+        metadata=payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {},
     )
 
 

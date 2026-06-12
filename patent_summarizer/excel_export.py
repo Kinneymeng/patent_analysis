@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from .markdown_summary import SUMMARY_SECTION_NAMES
+from .metadata import BIBLIOGRAPHIC_FIELD_NAMES
 
 
 EXPORT_HEADERS = [
@@ -11,6 +12,7 @@ EXPORT_HEADERS = [
     "专利名称",
     "文件路径",
     "摘要路径",
+    *BIBLIOGRAPHIC_FIELD_NAMES,
     "主一级分类",
     "主二级分类",
     "主分类置信度",
@@ -35,6 +37,7 @@ class ClassificationExportRow:
     review_status: str
     reason: str
     sections: dict[str, str]
+    metadata: dict[str, str] = field(default_factory=dict)
 
 
 def write_classification_workbook(rows: list[ClassificationExportRow], output: Path) -> None:
@@ -59,10 +62,13 @@ def write_classification_workbook(rows: list[ClassificationExportRow], output: P
 
     for column in ws.columns:
         letter = column[0].column_letter
-        if letter in {"C", "D", "T"}:
+        header = str(column[0].value or "")
+        if header in {"文件路径", "摘要路径", "摘要全文"}:
             ws.column_dimensions[letter].width = 48
-        elif letter in {"H", "J"}:
+        elif header in {"候选分类", "分类理由", "背景问题", "核心方案", "关键创新点", "权利要求要点", "摘要依据与不确定点"}:
             ws.column_dimensions[letter].width = 36
+        elif header in {"申请人", "发明人", "著录信息"}:
+            ws.column_dimensions[letter].width = 28
         else:
             ws.column_dimensions[letter].width = 18
     for row_cells in ws.iter_rows(min_row=2):
@@ -79,6 +85,7 @@ def _row_values(row: ClassificationExportRow) -> list[object]:
         row.patent_name,
         row.source_path,
         row.summary_path,
+        *[row.metadata.get(name, "") for name in BIBLIOGRAPHIC_FIELD_NAMES],
         row.primary_first_level,
         row.primary_second_level,
         row.primary_confidence,
