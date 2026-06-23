@@ -34,10 +34,20 @@ class TextExtractor:
                     encoding="utf-8",
                 )
             except FileNotFoundError as exc:
-                raise ExtractionError("Pandoc is required to extract DOCX text") from exc
+                return self._extract_docx_with_pypandoc(path, exc)
             if result.returncode != 0:
                 raise ExtractionError(f"Pandoc failed for {path}: {result.stderr.strip()}")
             return output.read_text(encoding="utf-8", errors="ignore")
+
+    def _extract_docx_with_pypandoc(self, path: Path, original_error: FileNotFoundError) -> str:
+        try:
+            import pypandoc  # type: ignore
+        except ImportError as exc:
+            raise ExtractionError("DOCX extraction requires Pandoc or pypandoc-binary") from original_error or exc
+        try:
+            return str(pypandoc.convert_file(str(path), "markdown"))
+        except Exception as exc:
+            raise ExtractionError(f"pypandoc failed for {path}: {exc}") from exc
 
     def _extract_pdf(self, path: Path) -> str:
         text = self._extract_pdf_with_pdfplumber(path)

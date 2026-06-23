@@ -43,6 +43,16 @@ class DiscoveryTests(unittest.TestCase):
 
         self.assertEqual([item.source.name for item in found], ["a.pdf"])
 
+    def test_suffix_filter_can_limit_discovery_to_docx(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "a.pdf").write_bytes(b"%PDF")
+            (root / "b.docx").write_bytes(b"docx")
+
+            found = list(discover_documents(root, recursive=False, overwrite=False, suffixes={".docx"}))
+
+        self.assertEqual([item.source.name for item in found], ["b.docx"])
+
 
 if __name__ == "__main__":
     unittest.main()

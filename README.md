@@ -74,3 +74,54 @@ python -m patent_summarizer analyze --classification patent_classification.xlsx 
 - `--dry-run`：只列出待分析标签，不调用 API。
 - `--batch-size N`：单个标签下每批送入模型的专利数量，默认 40。
 - `--api-rpm N`：覆盖 `.env` 中的请求上限。
+
+## 便携 GUI EXE
+
+Windows 便携版只处理 DOCX 文件，不处理 PDF/OCR。GUI 使用 CustomTkinter，并内置 `pypandoc-binary` 提供的 Pandoc。
+
+### 自行打包
+
+在项目根目录运行以下命令：
+
+```powershell
+conda run -n temp python -m pip install -e .
+conda run -n temp python -m pip install pypandoc-binary pyinstaller customtkinter
+conda run -n temp python build_portable.py
+```
+
+构建结果位于 `dist\PatentSummarizer\`，包含：
+
+- `PatentSummarizer.exe`：主程序。
+- `.env`：API 配置。若项目根目录没有 `.env`，构建脚本会复制 `.env.example` 作为模板。
+- `class.xlsx`：分类表。
+- `_internal\`：EXE 运行依赖，包含 CustomTkinter、Python 运行库和 Pandoc 等文件。
+
+使用时把整个 `dist\PatentSummarizer\` 文件夹复制给使用者，不要只复制 EXE。打开 EXE 后选择专利目录，再选择“批量总结”“分类”或“趋势分析”运行。
+
+如果 `dist\PatentSummarizer\` 已存在，`build_portable.py` 会停止，避免覆盖已有便携包。需要重新打包时，先手动备份、改名或清理旧的构建输出，再重新运行打包命令。
+
+### 可清理文件
+
+以下是构建或测试产生的文件夹，确认不再需要后可以删除：
+
+- `build\`
+- `build_fixed\`
+- `build_modern\`
+- `build_palette\`
+- `dist_fixed\`
+- `dist_modern\`
+- `dist_palette\`
+- `patent_summarizer.egg-info\`
+- `__pycache__\`
+- `patent_summarizer\__pycache__\`
+- `tests\__pycache__\`
+
+以下不要删除，除非你明确不再需要对应功能：
+
+- `dist\PatentSummarizer\`：最终便携版程序目录。
+- `dist\PatentSummarizer\_internal\`：EXE 运行依赖。
+- `dist\PatentSummarizer\.env`：EXE 运行配置。
+- `dist\PatentSummarizer\class.xlsx`：EXE 分类功能需要的分类表。
+- `patent_summarizer\`、`tests\`、`pyproject.toml`、`PatentSummarizer.spec`、`build_portable.py`：源码、测试和打包配置。
+
+安全提醒：`.env` 可能包含 API Key，不要把真实密钥提交到 Git，也不要发给不该接收的人。命令行清理时不要使用 `del /s`、`rd /s`、`rmdir /s` 等批量删除命令。

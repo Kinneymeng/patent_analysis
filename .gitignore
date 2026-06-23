@@ -4,3 +4,13 @@ CN202411182168_llm_debug/
 __pycache__/
 CN*
 00_patents/
+build/
+dist/
+build_fixed/
+dist_fixed/
+build_modern/
+dist_modern/
+build_palette/
+dist_palette/
+*.spec.log
+*.egg-info/

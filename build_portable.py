@@ -1,0 +1,43 @@
+from __future__ import annotations
+
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parent
+DIST_APP = ROOT / "dist" / "PatentSummarizer"
+SPEC_FILE = ROOT / "PatentSummarizer.spec"
+
+
+def main() -> int:
+    if DIST_APP.exists():
+        print(f"Output already exists: {DIST_APP}")
+        print("Move or remove that folder explicitly before rebuilding.")
+        return 2
+
+    subprocess.run([sys.executable, "-m", "PyInstaller", str(SPEC_FILE)], cwd=ROOT, check=True)
+    copy_runtime_files(DIST_APP)
+    print(f"Portable build ready: {DIST_APP}")
+    return 0
+
+
+def copy_runtime_files(dist_app: Path) -> None:
+    class_file = ROOT / "class.xlsx"
+    if not class_file.exists():
+        raise FileNotFoundError(f"Missing required class table: {class_file}")
+    shutil.copy2(class_file, dist_app / "class.xlsx")
+
+    env_file = ROOT / ".env"
+    if env_file.exists():
+        shutil.copy2(env_file, dist_app / ".env")
+        return
+
+    env_example = ROOT / ".env.example"
+    if env_example.exists():
+        shutil.copy2(env_example, dist_app / ".env.example")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

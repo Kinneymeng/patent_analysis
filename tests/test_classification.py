@@ -231,6 +231,16 @@ class ClassificationPipelineTests(unittest.TestCase):
         self.assertEqual([item.source.name for item in found], ["a.pdf", "b.docx"])
         self.assertEqual([item.output.name for item in found], ["a.md", "b.md"])
 
+    def test_discover_classification_documents_can_limit_to_docx(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "a.pdf").write_bytes(b"%PDF")
+            (root / "b.docx").write_bytes(b"docx")
+
+            found = list(discover_classification_documents(root, recursive=False, suffixes={".docx"}))
+
+        self.assertEqual([item.source.name for item in found], ["b.docx"])
+
     def test_pipeline_reuses_existing_markdown_summary(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -318,6 +328,8 @@ class CliTests(unittest.TestCase):
                 "10",
                 "--dry-run",
                 "--refresh-summaries",
+                "--file-type",
+                "docx",
             ]
         )
 
@@ -329,6 +341,18 @@ class CliTests(unittest.TestCase):
         self.assertEqual(args.limit, 10)
         self.assertTrue(args.dry_run)
         self.assertTrue(args.refresh_summaries)
+        self.assertEqual(args.file_type, "docx")
+
+    def test_parser_defaults_file_type_to_all_for_existing_cli_behavior(self):
+        parser = build_parser()
+
+        run_args = parser.parse_args(["run", "--input", "D:/patents"])
+        classify_args = parser.parse_args(
+            ["classify", "--input", "D:/patents", "--classes", "class.xlsx", "--output", "result.xlsx"]
+        )
+
+        self.assertEqual(run_args.file_type, "all")
+        self.assertEqual(classify_args.file_type, "all")
 
     def test_parser_accepts_analyze_command_arguments(self):
         parser = build_parser()

@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Iterable, Protocol
 
 from .classifier import ChatClient, classify_summary
-from .discovery import DocumentItem, SUPPORTED_SUFFIXES
+from .discovery import DocumentItem, normalize_suffixes
 from .excel_export import ClassificationExportRow
 from .markdown_summary import parse_summary_sections
 from .metadata import parse_bibliographic_metadata
@@ -106,15 +106,20 @@ class CheckpointStore:
             handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
-def discover_classification_documents(root: Path, recursive: bool) -> Iterable[DocumentItem]:
+def discover_classification_documents(
+    root: Path,
+    recursive: bool,
+    suffixes: Iterable[str] | None = None,
+) -> Iterable[DocumentItem]:
     if not root.exists():
         raise FileNotFoundError(f"Input path does not exist: {root}")
     if not root.is_dir():
         raise NotADirectoryError(f"Input path is not a directory: {root}")
 
+    allowed_suffixes = normalize_suffixes(suffixes)
     paths = root.rglob("*") if recursive else root.iterdir()
     for source in sorted(paths, key=lambda item: str(item).lower()):
-        if not source.is_file() or source.suffix.lower() not in SUPPORTED_SUFFIXES:
+        if not source.is_file() or source.suffix.lower() not in allowed_suffixes:
             continue
         yield DocumentItem(source=source, output=source.with_suffix(".md"), status="pending")
 

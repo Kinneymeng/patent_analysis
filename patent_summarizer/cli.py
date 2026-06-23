@@ -41,6 +41,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--limit", type=int, help="Process only the first N pending files")
     run_parser.add_argument("--api-rpm", type=int, help="Override PATENT_API_RPM")
     run_parser.add_argument("--env-file", type=Path, default=Path(".env"), help="Path to .env config file")
+    run_parser.add_argument("--file-type", choices=["all", "pdf", "docx"], default="all", help="Document type to scan")
 
     classify_parser = subparsers.add_parser("classify", help="Classify documents into a two-level Excel taxonomy")
     classify_parser.add_argument("--input", required=True, type=Path, help="Folder containing PDF/DOCX documents")
@@ -52,6 +53,7 @@ def build_parser() -> argparse.ArgumentParser:
     classify_parser.add_argument("--api-rpm", type=int, help="Override PATENT_API_RPM")
     classify_parser.add_argument("--env-file", type=Path, default=Path(".env"), help="Path to .env config file")
     classify_parser.add_argument("--refresh-summaries", action="store_true", help="Regenerate Markdown summaries before classifying")
+    classify_parser.add_argument("--file-type", choices=["all", "pdf", "docx"], default="all", help="Document type to scan")
 
     analyze_parser = subparsers.add_parser("analyze", help="Analyze patent trends from a classification workbook")
     analyze_parser.add_argument("--classification", required=True, type=Path, help="Input XLSX classification report")
@@ -66,7 +68,14 @@ def build_parser() -> argparse.ArgumentParser:
 def run(args: argparse.Namespace) -> int:
     input_root = args.input.resolve()
     try:
-        items = list(discover_documents(input_root, recursive=args.recursive, overwrite=args.overwrite))
+        items = list(
+            discover_documents(
+                input_root,
+                recursive=args.recursive,
+                overwrite=args.overwrite,
+                suffixes=_suffixes_for_file_type(args.file_type),
+            )
+        )
     except (FileNotFoundError, NotADirectoryError) as exc:
         print(f"Input error: {exc}")
         return 2
@@ -126,7 +135,13 @@ def run(args: argparse.Namespace) -> int:
 def classify(args: argparse.Namespace) -> int:
     input_root = args.input.resolve()
     try:
-        items = list(discover_classification_documents(input_root, recursive=args.recursive))
+        items = list(
+            discover_classification_documents(
+                input_root,
+                recursive=args.recursive,
+                suffixes=_suffixes_for_file_type(args.file_type),
+            )
+        )
     except (FileNotFoundError, NotADirectoryError) as exc:
         print(f"Input error: {exc}")
         return 2
@@ -220,3 +235,11 @@ def analyze(args: argparse.Namespace) -> int:
     write_trend_workbook(result, args.output)
     print(f"Done. trend_groups={len(result.reports)}, patents={len(records)}, output={args.output}")
     return 0
+
+
+def _suffixes_for_file_type(file_type: str) -> set[str] | None:
+    if file_type == "pdf":
+        return {".pdf"}
+    if file_type == "docx":
+        return {".docx"}
+    return None
