@@ -75,6 +75,32 @@ python -m patent_summarizer analyze --classification patent_classification.xlsx 
 - `--batch-size N`：单个标签下每批送入模型的专利数量，默认 40。
 - `--api-rpm N`：覆盖 `.env` 中的请求上限。
 
+## A vs 外部专利组合对比
+
+如果已经为 A/B/C/D 等专利目录生成同名 Markdown 摘要，可用 `compare` 对比 A 与一个或多个外部组合：
+
+```powershell
+python -m patent_summarizer compare `
+  --target "D:\path\to\A" `
+  --target-label A `
+  --baseline "B=D:\path\to\B" `
+  --baseline "C=D:\path\to\C" `
+  --classes class.xlsx `
+  --output "D:\path\to\a_vs_external.xlsx" `
+  --recursive
+```
+
+每个目录会优先读取目录下的 `patent_classification.xlsx`。如果不存在，会扫描 `.md` 摘要并使用 `--classes` 指定的分类表自动生成该目录的 `patent_classification.xlsx` 后再对比；如需强制重建分类结果，可加 `--refresh-classification`。当提供多个 `--baseline` 时，报告会同时包含 A vs 每个外部目录，以及 A vs `外部总体`。
+
+输出工作簿包含 `对比总览`、`标签对比`、`布局建议`、`年度对比`、`专利明细`、`数据来源` 六个 Sheet，用于查看 A 的布局概况、相对优势/短板、差异化程度、是否贴近外部主流布局，以及按优先级排序的建议布局点。
+
+常用参数：
+
+- `--baseline LABEL=PATH`：可重复传入多个外部组合；不写 `LABEL=` 时默认使用文件夹名。
+- `--dry-run`：只列出各目录的分类来源、数量和计划对比对象，不调用 API。
+- `--classes PATH`：当某个目录缺少 `patent_classification.xlsx` 或使用 `--refresh-classification` 时必填。
+- `--api-rpm N`：覆盖 `.env` 中的请求上限。
+
 ## 便携 GUI EXE
 
 Windows 便携版只处理 DOCX 文件，不处理 PDF/OCR。GUI 使用 CustomTkinter，并内置 `pypandoc-binary` 提供的 Pandoc。

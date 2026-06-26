@@ -4,6 +4,8 @@ import argparse
 from pathlib import Path
 
 from .classification_pipeline import CheckpointStore, PatentClassificationPipeline, discover_classification_documents
+from .comparison import ComparisonAnalyzer, load_or_build_portfolio
+from .comparison_excel_export import write_comparison_workbook
 from .config import ConfigError, load_config
 from .discovery import discover_documents
 from .extractors import TextExtractor
@@ -26,6 +28,8 @@ def main(argv: list[str] | None = None) -> int:
         return classify(args)
     if args.command == "analyze":
         return analyze(args)
+    if args.command == "compare":
+        return compare(args)
     parser.print_help()
     return 2
 
@@ -62,6 +66,23 @@ def build_parser() -> argparse.ArgumentParser:
     analyze_parser.add_argument("--env-file", type=Path, default=Path(".env"), help="Path to .env config file")
     analyze_parser.add_argument("--batch-size", type=int, default=40, help="Patents per LLM trend-analysis batch")
     analyze_parser.add_argument("--dry-run", action="store_true", help="List trend groups without calling the API")
+
+    compare_parser = subparsers.add_parser("compare", help="Compare a target patent portfolio against external folders")
+    compare_parser.add_argument("--target", required=True, type=Path, help="Target portfolio folder, usually A")
+    compare_parser.add_argument("--target-label", help="Display label for target portfolio")
+    compare_parser.add_argument(
+        "--baseline",
+        required=True,
+        action="append",
+        help="External portfolio folder, optionally as LABEL=PATH. Repeat for B/C/D.",
+    )
+    compare_parser.add_argument("--classes", type=Path, help="XLSX taxonomy used when a folder needs MD classification")
+    compare_parser.add_argument("--output", required=True, type=Path, help="Output XLSX comparison report")
+    compare_parser.add_argument("--recursive", action="store_true", help="Scan Markdown summaries recursively when classifying")
+    compare_parser.add_argument("--refresh-classification", action="store_true", help="Rebuild classification workbooks from Markdown summaries")
+    compare_parser.add_argument("--api-rpm", type=int, help="Override PATENT_API_RPM")
+    compare_parser.add_argument("--env-file", type=Path, default=Path(".env"), help="Path to .env config file")
+    compare_parser.add_argument("--dry-run", action="store_true", help="List portfolios and planned comparisons without calling the API")
     return parser
 
 
@@ -237,9 +258,110 @@ def analyze(args: argparse.Namespace) -> int:
     return 0
 
 
+def compare(args: argparse.Namespace) -> int:
+    target_root = args.target.resolve()
+    baseline_specs = [_parse_baseline_spec(value) for value in args.baseline]
+    target_label = args.target_label or target_root.name or "A"
+    portfolio_specs = [(target_label, target_root), *baseline_specs]
+
+    if args.dry_run:
+        for label, root in portfolio_specs:
+            try:
+                source, count = _portfolio_dry_run_status(root, args.recursive, args.refresh_classification)
+            except (FileNotFoundError, NotADirectoryError) as exc:
+                print(f"Input error: {exc}")
+                return 2
+            print(f"PORTFOLIO\t{label}\t{root}\tclassification={source}\titems={count}")
+        for baseline_label, _baseline_root in baseline_specs:
+            print(f"COMPARE\t{target_label}\tvs\t{baseline_label}")
+        if len(baseline_specs) > 1:
+            print(f"COMPARE\t{target_label}\tvs\t外部总体")
+        return 0
+
+    needs_taxonomy = args.refresh_classification or any(
+        not (root / "patent_classification.xlsx").exists()
+        for _label, root in portfolio_specs
+    )
+    if needs_taxonomy and args.classes is None:
+        print("Config error: --classes is required when classification workbooks are missing or refreshed")
+        return 2
+
+    try:
+        taxonomy = load_taxonomy(args.classes) if needs_taxonomy and args.classes is not None else None
+        config = load_config(env_path=args.env_file, api_rpm=args.api_rpm)
+    except (ConfigError, RuntimeError, FileNotFoundError) as exc:
+        print(f"Config error: {exc}")
+        return 2
+
+    client = RateLimitedOpenAIClient(
+        base_url=config.base_url,
+        api_key=config.api_key,
+        model=config.model,
+        rpm=config.api_rpm,
+        max_retries=config.max_retries,
+    )
+
+    try:
+        target = load_or_build_portfolio(
+            target_root,
+            label=target_label,
+            client=client,
+            taxonomy=taxonomy,
+            recursive=args.recursive,
+            refresh_classification=args.refresh_classification,
+        )
+        baselines = [
+            load_or_build_portfolio(
+                root,
+                label=label,
+                client=client,
+                taxonomy=taxonomy,
+                recursive=args.recursive,
+                refresh_classification=args.refresh_classification,
+            )
+            for label, root in baseline_specs
+        ]
+    except (RuntimeError, FileNotFoundError, NotADirectoryError, ValueError) as exc:
+        print(f"Input error: {exc}")
+        return 2
+
+    analyzer = ComparisonAnalyzer(client)
+    result = analyzer.analyze(target, baselines)
+    write_comparison_workbook(result, args.output)
+    print(
+        f"Done. comparisons={len(result.reports)}, "
+        f"target_patents={len(target.records)}, "
+        f"baseline_patents={sum(len(item.records) for item in baselines)}, "
+        f"output={args.output}"
+    )
+    return 0
+
+
 def _suffixes_for_file_type(file_type: str) -> set[str] | None:
     if file_type == "pdf":
         return {".pdf"}
     if file_type == "docx":
         return {".docx"}
     return None
+
+
+def _parse_baseline_spec(value: str) -> tuple[str, Path]:
+    if "=" in value:
+        label, raw_path = value.split("=", 1)
+        path = Path(raw_path).resolve()
+        return (label.strip() or path.name or str(path), path)
+    path = Path(value).resolve()
+    return (path.name or str(path), path)
+
+
+def _portfolio_dry_run_status(root: Path, recursive: bool, refresh_classification: bool) -> tuple[str, int]:
+    if not root.exists():
+        raise FileNotFoundError(f"Input path does not exist: {root}")
+    if not root.is_dir():
+        raise NotADirectoryError(f"Input path is not a directory: {root}")
+    classification = root / "patent_classification.xlsx"
+    if classification.exists() and not refresh_classification:
+        return "existing", len(load_classification_workbook(classification))
+    paths = root.rglob("*.md") if recursive else root.glob("*.md")
+    count = sum(1 for path in paths if ".patent_summary_logs" not in path.parts)
+    return "needs-md-classification", count
