@@ -14,3 +14,4 @@ build_palette/
 dist_palette/
 *.spec.log
 *.egg-info/
+tests/

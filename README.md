@@ -4,7 +4,13 @@
 
 ## 安装依赖
 
-核心 CLI 只使用 Python 标准库。实际处理文档时建议安装：
+先安装项目本身。分类、趋势分析和 DOCX 报告所需的 `openpyxl`、`python-docx` 会一并安装：
+
+```powershell
+pip install -e .
+```
+
+实际处理 PDF 或 OCR 时建议再安装：
 
 ```powershell
 pip install pdfplumber pypdf pdf2image pytesseract
@@ -99,6 +105,94 @@ python -m patent_summarizer compare `
 - `--baseline LABEL=PATH`：可重复传入多个外部组合；不写 `LABEL=` 时默认使用文件夹名。
 - `--dry-run`：只列出各目录的分类来源、数量和计划对比对象，不调用 API。
 - `--classes PATH`：当某个目录缺少 `patent_classification.xlsx` 或使用 `--refresh-classification` 时必填。
+- `--api-rpm N`：覆盖 `.env` 中的请求上限。
+
+## 生成 DOCX 专利布局报告
+
+`report` 从各企业目录中的结构化 Markdown 摘要开始，自动复用分类结果、生成趋势分析和组合对比，并在现有 DOCX 模板基础上生成正式的专利布局分析报告。目前只提供 CLI，不包含 GUI/EXE 入口。
+
+### 前提条件
+
+1. 使用 Python 3.10 或更高版本并执行 `pip install -e .`。
+2. 已在 `.env` 中配置可用的 OpenAI 协议兼容接口。
+3. 已准备两列分类表，例如项目根目录下的 `class.xlsx`。
+4. 长安汽车和每家竞争对手必须分别存放在独立目录中。
+5. 每个企业目录中应已经通过 `run` 生成同名 `.md` 摘要。报告阶段以 MD 和分类结果为证据，不重新读取原始专利全文。
+6. DOCX 模板必须存在，默认路径为 `output\doc\汽车底盘领域专利布局分析报告模板.docx`。
+7. 目标企业和各竞争对手的显示标签不能重复。
+
+建议的目录结构：
+
+```text
+D:\底盘专利\
+├─ 长安汽车\
+│  ├─ 专利A.pdf
+│  └─ 专利A.md
+├─ 理想汽车\
+│  ├─ 专利B.pdf
+│  └─ 专利B.md
+├─ 比亚迪\
+└─ 吉利汽车\
+```
+
+### 第一步：为各企业生成 Markdown 摘要
+
+对每个企业目录分别执行：
+
+```powershell
+python -m patent_summarizer run --input "D:\底盘专利\长安汽车" --recursive
+python -m patent_summarizer run --input "D:\底盘专利\理想汽车" --recursive
+python -m patent_summarizer run --input "D:\底盘专利\比亚迪" --recursive
+python -m patent_summarizer run --input "D:\底盘专利\吉利汽车" --recursive
+```
+
+### 第二步：执行报告预检查
+
+预检查不会调用 API，也不会生成分类表或 DOCX：
+
+```powershell
+python -m patent_summarizer report --dry-run `
+  --target "D:\底盘专利\长安汽车" `
+  --target-label "长安汽车" `
+  --baseline "理想汽车=D:\底盘专利\理想汽车" `
+  --baseline "比亚迪=D:\底盘专利\比亚迪" `
+  --baseline "吉利汽车=D:\底盘专利\吉利汽车" `
+  --classes "class.xlsx" `
+  --template "output\doc\汽车底盘领域专利布局分析报告模板.docx" `
+  --output "output\doc\汽车底盘领域专利布局分析报告.docx" `
+  --recursive
+```
+
+### 第三步：生成正式 DOCX
+
+去掉 `--dry-run` 后运行相同命令：
+
+```powershell
+python -m patent_summarizer report `
+  --target "D:\底盘专利\长安汽车" `
+  --target-label "长安汽车" `
+  --baseline "理想汽车=D:\底盘专利\理想汽车" `
+  --baseline "比亚迪=D:\底盘专利\比亚迪" `
+  --baseline "吉利汽车=D:\底盘专利\吉利汽车" `
+  --classes "class.xlsx" `
+  --template "output\doc\汽车底盘领域专利布局分析报告模板.docx" `
+  --output "output\doc\汽车底盘领域专利布局分析报告.docx" `
+  --recursive
+```
+
+每个企业目录会优先读取已有的 `patent_classification.xlsx`。如果不存在，程序会扫描 `.md`，使用 `--classes` 指定的分类表自动生成该目录的 `patent_classification.xlsx`。当 MD 已更新且需要重建分类时，增加 `--refresh-classification`。
+
+报告默认拒绝覆盖已有 DOCX；确认需要重建时增加 `--overwrite`。分析检查点保存在输出目录下的 `.patent_summary_logs`，相同输入和提示词再次运行时会复用已完成的模型响应。
+
+报告包含样本行业布局、各竞争对手布局与策略、竞争趋势研判、长安汽车优劣势、长安布局策略、待布局点、组合专利策略和证据附录。报告中的“行业”只代表本次上传并完成摘要、分类的样本范围，不等同于完整行业数据库结论。
+
+常用参数：
+
+- `--baseline LABEL=PATH`：可重复指定竞争对手。
+- `--batch-size N`：控制每批趋势分析的专利数量，默认 40。
+- `--refresh-classification`：忽略已有分类工作簿，从 MD 重建。
+- `--overwrite`：覆盖已有输出 DOCX。
+- `--dry-run`：仅检查输入和计划。
 - `--api-rpm N`：覆盖 `.env` 中的请求上限。
 
 ## 便携 GUI EXE

@@ -13,6 +13,8 @@ from .excel_export import write_classification_workbook
 from .llm import RateLimitedOpenAIClient
 from .logging_utils import RunLogger
 from .processor import PatentProcessor, ProcessingResult
+from .report_analysis import PatentLayoutReport, ReportCheckpointingClient, ReportSynthesisAnalyzer, combine_portfolios
+from .report_docx import write_patent_layout_report
 from .summarizer import PatentSummarizer
 from .taxonomy import load_taxonomy
 from .trend_analysis import TrendAnalyzer, TrendCheckpointStore, build_trend_groups, load_classification_workbook
@@ -30,6 +32,8 @@ def main(argv: list[str] | None = None) -> int:
         return analyze(args)
     if args.command == "compare":
         return compare(args)
+    if args.command == "report":
+        return report(args)
     parser.print_help()
     return 2
 
@@ -83,7 +87,154 @@ def build_parser() -> argparse.ArgumentParser:
     compare_parser.add_argument("--api-rpm", type=int, help="Override PATENT_API_RPM")
     compare_parser.add_argument("--env-file", type=Path, default=Path(".env"), help="Path to .env config file")
     compare_parser.add_argument("--dry-run", action="store_true", help="List portfolios and planned comparisons without calling the API")
+
+    report_parser = subparsers.add_parser("report", help="Generate a DOCX patent-layout report from portfolio folders")
+    report_parser.add_argument("--target", required=True, type=Path, help="Target portfolio folder")
+    report_parser.add_argument("--target-label", help="Display label for target portfolio")
+    report_parser.add_argument(
+        "--baseline",
+        required=True,
+        action="append",
+        help="Competitor portfolio folder, optionally as LABEL=PATH. Repeat for each competitor.",
+    )
+    report_parser.add_argument("--classes", required=True, type=Path, help="XLSX taxonomy used for classification and the report appendix")
+    report_parser.add_argument(
+        "--template",
+        type=Path,
+        default=Path("output/doc/汽车底盘领域专利布局分析报告模板.docx"),
+        help="DOCX template used for cover and document styles",
+    )
+    report_parser.add_argument("--output", required=True, type=Path, help="Output DOCX report")
+    report_parser.add_argument("--recursive", action="store_true", help="Scan Markdown summaries recursively when classifying")
+    report_parser.add_argument("--refresh-classification", action="store_true", help="Rebuild classification workbooks from Markdown summaries")
+    report_parser.add_argument("--batch-size", type=int, default=40, help="Patents per LLM trend-analysis batch")
+    report_parser.add_argument("--api-rpm", type=int, help="Override PATENT_API_RPM")
+    report_parser.add_argument("--env-file", type=Path, default=Path(".env"), help="Path to .env config file")
+    report_parser.add_argument("--overwrite", action="store_true", help="Overwrite an existing DOCX report")
+    report_parser.add_argument("--dry-run", action="store_true", help="Validate report inputs without calling the API or writing files")
     return parser
+
+
+def report(args: argparse.Namespace) -> int:
+    target_root = args.target.resolve()
+    target_label = args.target_label or target_root.name or "目标企业"
+    baseline_specs = [_parse_baseline_spec(value) for value in args.baseline]
+    labels = [target_label, *[label for label, _root in baseline_specs]]
+    if len(labels) != len(set(labels)):
+        print("Input error: target and competitor labels must be unique")
+        return 2
+    if args.batch_size <= 0:
+        print("Input error: --batch-size must be positive")
+        return 2
+    if args.output.suffix.lower() != ".docx":
+        print("Input error: --output must use the .docx extension")
+        return 2
+    if not args.classes.exists():
+        print(f"Input error: taxonomy workbook does not exist: {args.classes}")
+        return 2
+    if not args.template.exists():
+        print(f"Input error: DOCX template does not exist: {args.template}")
+        return 2
+    if args.output.exists() and not args.overwrite:
+        print(f"Input error: output already exists: {args.output}; use --overwrite to replace it")
+        return 2
+
+    portfolio_specs = [(target_label, target_root), *baseline_specs]
+    if args.dry_run:
+        for label, root in portfolio_specs:
+            try:
+                source, count = _portfolio_dry_run_status(root, args.recursive, args.refresh_classification)
+            except (FileNotFoundError, NotADirectoryError, RuntimeError) as exc:
+                print(f"Input error: {exc}")
+                return 2
+            print(f"PORTFOLIO\t{label}\t{root}\tclassification={source}\titems={count}")
+        print(f"TEMPLATE\t{args.template.resolve()}")
+        print(f"OUTPUT\t{args.output.resolve()}")
+        print(f"REPORT\ttarget={target_label}\tcompetitors={len(baseline_specs)}\tbatch_size={args.batch_size}")
+        return 0
+
+    try:
+        taxonomy = load_taxonomy(args.classes)
+        config = load_config(env_path=args.env_file, api_rpm=args.api_rpm)
+    except (ConfigError, RuntimeError, FileNotFoundError) as exc:
+        print(f"Config error: {exc}")
+        return 2
+
+    base_client = RateLimitedOpenAIClient(
+        base_url=config.base_url,
+        api_key=config.api_key,
+        model=config.model,
+        rpm=config.api_rpm,
+        max_retries=config.max_retries,
+    )
+    log_dir = args.output.parent / ".patent_summary_logs"
+    client = ReportCheckpointingClient(base_client, log_dir / f"{args.output.stem}.report.jsonl")
+
+    try:
+        target = load_or_build_portfolio(
+            target_root,
+            label=target_label,
+            client=client,
+            taxonomy=taxonomy,
+            recursive=args.recursive,
+            refresh_classification=args.refresh_classification,
+        )
+        print(f"PORTFOLIO\t{target.label}\tpatents={len(target.records)}\tclassification={target.classification_source}")
+        baselines = []
+        for label, root in baseline_specs:
+            portfolio = load_or_build_portfolio(
+                root,
+                label=label,
+                client=client,
+                taxonomy=taxonomy,
+                recursive=args.recursive,
+                refresh_classification=args.refresh_classification,
+            )
+            baselines.append(portfolio)
+            print(f"PORTFOLIO\t{portfolio.label}\tpatents={len(portfolio.records)}\tclassification={portfolio.classification_source}")
+
+        industry = combine_portfolios("全部样本", [target, *baselines])
+        trend_analyzer = TrendAnalyzer(client, batch_size=args.batch_size)
+        trends = {}
+        for index, portfolio in enumerate([target, *baselines, industry], start=1):
+            checkpoint = TrendCheckpointStore(log_dir / f"{args.output.stem}.trend-{index}.jsonl")
+            trends[portfolio.label] = trend_analyzer.analyze(portfolio.records, checkpoint=checkpoint)
+            print(f"TREND\t{portfolio.label}\tgroups={len(trends[portfolio.label].reports)}")
+
+        comparison = ComparisonAnalyzer(client).analyze(target, baselines)
+        print(f"COMPARE\treports={len(comparison.reports)}")
+        competitor_analysis, target_analysis, executive_summary = ReportSynthesisAnalyzer(client).analyze(
+            target,
+            baselines,
+            trends,
+            comparison,
+        )
+        layout_report = PatentLayoutReport(
+            target=target,
+            baselines=baselines,
+            industry=industry,
+            trends=trends,
+            comparison=comparison,
+            competitor_analysis=competitor_analysis,
+            target_analysis=target_analysis,
+            executive_summary=executive_summary,
+            taxonomy=[(item.first_level, item.second_level) for item in taxonomy.items],
+        )
+        write_patent_layout_report(
+            layout_report,
+            args.template,
+            args.output,
+            overwrite=args.overwrite,
+        )
+    except (RuntimeError, FileNotFoundError, NotADirectoryError, ValueError, FileExistsError) as exc:
+        print(f"Report error: {exc}")
+        return 1
+
+    print(
+        f"Done. report={args.output}, target_patents={len(target.records)}, "
+        f"competitor_patents={sum(len(item.records) for item in baselines)}"
+    )
+    return 0
 
 
 def run(args: argparse.Namespace) -> int:
