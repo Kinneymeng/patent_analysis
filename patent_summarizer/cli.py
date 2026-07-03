@@ -7,7 +7,7 @@ from .classification_pipeline import CheckpointStore, PatentClassificationPipeli
 from .comparison import ComparisonAnalyzer, load_or_build_portfolio
 from .comparison_excel_export import write_comparison_workbook
 from .config import ConfigError, load_config
-from .discovery import discover_documents
+from .discovery import discover_documents, inspect_summary_coverage
 from .extractors import TextExtractor
 from .excel_export import write_classification_workbook
 from .llm import RateLimitedOpenAIClient
@@ -122,6 +122,8 @@ def report(args: argparse.Namespace) -> int:
     labels = [target_label, *[label for label, _root in baseline_specs]]
     if len(labels) != len(set(labels)):
         print("Input error: target and competitor labels must be unique")
+        return 2
+    if not _validate_portfolio_summaries([(target_label, target_root), *baseline_specs]):
         return 2
     if args.batch_size <= 0:
         print("Input error: --batch-size must be positive")
@@ -415,6 +417,13 @@ def compare(args: argparse.Namespace) -> int:
     target_label = args.target_label or target_root.name or "A"
     portfolio_specs = [(target_label, target_root), *baseline_specs]
 
+    labels = [label for label, _root in portfolio_specs]
+    if len(labels) != len(set(labels)):
+        print("Input error: target and competitor labels must be unique")
+        return 2
+    if not _validate_portfolio_summaries(portfolio_specs):
+        return 2
+
     if args.dry_run:
         for label, root in portfolio_specs:
             try:
@@ -503,6 +512,30 @@ def _parse_baseline_spec(value: str) -> tuple[str, Path]:
         return (label.strip() or path.name or str(path), path)
     path = Path(value).resolve()
     return (path.name or str(path), path)
+
+
+def _validate_portfolio_summaries(portfolio_specs: list[tuple[str, Path]]) -> bool:
+    failures: list[str] = []
+    for label, root in portfolio_specs:
+        try:
+            coverage = inspect_summary_coverage(root, recursive=True)
+        except (FileNotFoundError, NotADirectoryError) as exc:
+            failures.append(f"{label}: {exc}")
+            continue
+        if coverage.document_count == 0:
+            failures.append(f"{label}: 未发现 DOCX 专利文件（{root}）")
+            continue
+        if coverage.missing_summaries:
+            missing = ", ".join(str(path) for path in coverage.missing_summaries[:10])
+            remaining = len(coverage.missing_summaries) - 10
+            suffix = f"，另有 {remaining} 篇" if remaining > 0 else ""
+            failures.append(f"{label}: 缺少 {len(coverage.missing_summaries)} 篇摘要：{missing}{suffix}")
+    if not failures:
+        return True
+    print("Input error: 专利目录摘要不完整，请先对所有专利目录运行“批量总结”后再继续。")
+    for failure in failures:
+        print(f"SUMMARY\t{failure}")
+    return False
 
 
 def _portfolio_dry_run_status(root: Path, recursive: bool, refresh_classification: bool) -> tuple[str, int]:

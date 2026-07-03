@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from patent_summarizer.discovery import discover_documents
+from patent_summarizer.discovery import discover_documents, inspect_summary_coverage
 
 
 class DiscoveryTests(unittest.TestCase):
@@ -52,6 +52,36 @@ class DiscoveryTests(unittest.TestCase):
             found = list(discover_documents(root, recursive=False, overwrite=False, suffixes={".docx"}))
 
         self.assertEqual([item.source.name for item in found], ["b.docx"])
+
+
+class SummaryCoverageTests(unittest.TestCase):
+    def test_reports_recursive_docx_coverage_and_missing_markdown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            nested = root / "nested"
+            nested.mkdir()
+            (root / "ready.docx").write_bytes(b"docx")
+            (root / "ready.md").write_text("summary", encoding="utf-8")
+            (nested / "missing.docx").write_bytes(b"docx")
+
+            coverage = inspect_summary_coverage(root, recursive=True)
+
+        self.assertEqual(coverage.document_count, 2)
+        self.assertEqual(coverage.summary_count, 1)
+        self.assertEqual(coverage.missing_summaries, (nested / "missing.md",))
+        self.assertFalse(coverage.is_ready)
+
+    def test_rejects_directory_without_docx_patents(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "orphan.md").write_text("summary", encoding="utf-8")
+
+            coverage = inspect_summary_coverage(root, recursive=True)
+
+        self.assertEqual(coverage.document_count, 0)
+        self.assertEqual(coverage.summary_count, 0)
+        self.assertEqual(coverage.missing_summaries, ())
+        self.assertFalse(coverage.is_ready)
 
 
 if __name__ == "__main__":

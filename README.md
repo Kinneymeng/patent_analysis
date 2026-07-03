@@ -98,6 +98,8 @@ python -m patent_summarizer compare `
 
 每个目录会优先读取目录下的 `patent_classification.xlsx`。如果不存在，会扫描 `.md` 摘要并使用 `--classes` 指定的分类表自动生成该目录的 `patent_classification.xlsx` 后再对比；如需强制重建分类结果，可加 `--refresh-classification`。当提供多个 `--baseline` 时，报告会同时包含 A vs 每个外部目录，以及 A vs `外部总体`。
 
+运行前会递归检查每个目标/外部目录中的 DOCX：每个 `专利.docx` 必须在同一目录存在 `专利.md`，且目录中至少包含一篇 DOCX。任一目录不完整时命令会停止，并提示先对所有专利目录执行 `run`/“批量总结”。
+
 输出工作簿包含 `对比总览`、`标签对比`、`布局建议`、`年度对比`、`专利明细`、`数据来源` 六个 Sheet，用于查看 A 的布局概况、相对优势/短板、差异化程度、是否贴近外部主流布局，以及按优先级排序的建议布局点。
 
 常用参数：
@@ -109,7 +111,7 @@ python -m patent_summarizer compare `
 
 ## 生成 DOCX 专利布局报告
 
-`report` 从各企业目录中的结构化 Markdown 摘要开始，自动复用分类结果、生成趋势分析和组合对比，并在现有 DOCX 模板基础上生成正式的专利布局分析报告。目前只提供 CLI，不包含 GUI/EXE 入口。
+`report` 从各企业目录中的结构化 Markdown 摘要开始，自动复用分类结果、生成趋势分析和组合对比，并在现有 DOCX 模板基础上生成正式的专利布局分析报告。CLI 和便携 GUI 均可使用该功能。
 
 ### 前提条件
 
@@ -126,10 +128,10 @@ python -m patent_summarizer compare `
 ```text
 D:\底盘专利\
 ├─ 长安汽车\
-│  ├─ 专利A.pdf
+│  ├─ 专利A.docx
 │  └─ 专利A.md
 ├─ 理想汽车\
-│  ├─ 专利B.pdf
+│  ├─ 专利B.docx
 │  └─ 专利B.md
 ├─ 比亚迪\
 └─ 吉利汽车\
@@ -214,9 +216,21 @@ conda run -n temp python build_portable.py
 - `PatentSummarizer.exe`：主程序。
 - `.env`：API 配置。若项目根目录没有 `.env`，构建脚本会复制 `.env.example` 作为模板。
 - `class.xlsx`：分类表。
+- `汽车底盘领域专利布局分析报告模板.docx`：报告功能使用的内置模板。
+- `patent-summarizer.ico`：程序窗口和便携包使用的自定义图标。
+- `使用说明.md`：面向普通使用人员的完整操作指南。
 - `_internal\`：EXE 运行依赖，包含 CustomTkinter、Python 运行库和 Pandoc 等文件。
 
-使用时把整个 `dist\PatentSummarizer\` 文件夹复制给使用者，不要只复制 EXE。打开 EXE 后选择专利目录，再选择“批量总结”“分类”或“趋势分析”运行。
+使用时把整个 `dist\PatentSummarizer\` 文件夹复制给使用者，不要只复制 EXE。GUI 提供五项任务：
+
+- “批量总结”“分类”“趋势分析”继续使用单个专利目录。
+- “对比”和“报告”使用一个目标组合及一个或多个对比组合。名称默认取文件夹名，也可以改成报告中使用的正式名称；所有名称必须非空且不能重复。
+- GUI 会递归检查每个目录的 DOCX/MD 配对并显示摘要状态。目录没有 DOCX 或缺少任意同名 MD 时不能启动，需先分别对这些目录运行“批量总结”。
+- 每个组合目录中的 `patent_classification.xlsx` 相互独立；已有文件会被复用，缺失时使用 EXE 同目录的 `class.xlsx` 自动生成。
+- “对比”默认输出 `<目标名称>_专利组合对比.xlsx`，“报告”默认输出 `<目标名称>_专利布局分析报告.docx`，均保存到目标目录并可通过“另存为”修改。
+- “报告”固定使用便携包内置的 `汽车底盘领域专利布局分析报告模板.docx`。
+
+完整的逐步说明、前置条件和常见问题请查看根目录的 [使用说明.md](使用说明.md)。
 
 如果 `dist\PatentSummarizer\` 已存在，`build_portable.py` 会停止，避免覆盖已有便携包。需要重新打包时，先手动备份、改名或清理旧的构建输出，再重新运行打包命令。
 
@@ -242,6 +256,9 @@ conda run -n temp python build_portable.py
 - `dist\PatentSummarizer\_internal\`：EXE 运行依赖。
 - `dist\PatentSummarizer\.env`：EXE 运行配置。
 - `dist\PatentSummarizer\class.xlsx`：EXE 分类功能需要的分类表。
+- `dist\PatentSummarizer\汽车底盘领域专利布局分析报告模板.docx`：EXE 报告功能需要的内置模板。
+- `dist\PatentSummarizer\patent-summarizer.ico`：EXE 的自定义图标文件。
+- `dist\PatentSummarizer\使用说明.md`：随便携包交付的用户操作指南。
 - `patent_summarizer\`、`tests\`、`pyproject.toml`、`PatentSummarizer.spec`、`build_portable.py`：源码、测试和打包配置。
 
 安全提醒：`.env` 可能包含 API Key，不要把真实密钥提交到 Git，也不要发给不该接收的人。命令行清理时不要使用 `del /s`、`rd /s`、`rmdir /s` 等批量删除命令。

@@ -1,10 +1,14 @@
 import tempfile
 import unittest
+from argparse import Namespace
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
+from unittest.mock import patch
 
 from openpyxl import load_workbook
 
-from patent_summarizer.cli import build_parser
+from patent_summarizer.cli import build_parser, compare as run_compare
 from patent_summarizer.comparison import (
     ComparisonAnalyzer,
     PortfolioDataset,
@@ -154,6 +158,69 @@ class CompareCliTests(unittest.TestCase):
         self.assertTrue(args.recursive)
         self.assertTrue(args.refresh_classification)
         self.assertTrue(args.dry_run)
+
+    def test_compare_stops_before_config_when_a_docx_summary_is_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "target"
+            baseline = root / "baseline"
+            target.mkdir()
+            baseline.mkdir()
+            (target / "a.docx").write_bytes(b"docx")
+            (baseline / "b.docx").write_bytes(b"docx")
+            (baseline / "b.md").write_text("summary", encoding="utf-8")
+            args = Namespace(
+                target=target,
+                target_label="A",
+                baseline=[f"B={baseline}"],
+                classes=root / "class.xlsx",
+                output=root / "comparison.xlsx",
+                recursive=True,
+                refresh_classification=False,
+                api_rpm=None,
+                env_file=root / ".env",
+                dry_run=False,
+            )
+            stdout = StringIO()
+
+            with patch("patent_summarizer.cli.load_config") as load_config, redirect_stdout(stdout):
+                exit_code = run_compare(args)
+
+        self.assertEqual(exit_code, 2)
+        self.assertIn("a.md", stdout.getvalue())
+        self.assertIn("批量总结", stdout.getvalue())
+        load_config.assert_not_called()
+
+    def test_compare_rejects_duplicate_portfolio_labels(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "target"
+            baseline = root / "baseline"
+            target.mkdir()
+            baseline.mkdir()
+            for folder, stem in [(target, "a"), (baseline, "b")]:
+                (folder / f"{stem}.docx").write_bytes(b"docx")
+                (folder / f"{stem}.md").write_text("summary", encoding="utf-8")
+            args = Namespace(
+                target=target,
+                target_label="同名组合",
+                baseline=[f"同名组合={baseline}"],
+                classes=root / "class.xlsx",
+                output=root / "comparison.xlsx",
+                recursive=True,
+                refresh_classification=False,
+                api_rpm=None,
+                env_file=root / ".env",
+                dry_run=False,
+            )
+            stdout = StringIO()
+
+            with patch("patent_summarizer.cli.load_config") as load_config, redirect_stdout(stdout):
+                exit_code = run_compare(args)
+
+        self.assertEqual(exit_code, 2)
+        self.assertIn("labels must be unique", stdout.getvalue())
+        load_config.assert_not_called()
 
 
 class PortfolioLoadingTests(unittest.TestCase):
