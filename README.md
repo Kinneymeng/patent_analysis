@@ -262,3 +262,14 @@ conda run -n temp python build_portable.py
 - `patent_summarizer\`、`tests\`、`pyproject.toml`、`PatentSummarizer.spec`、`build_portable.py`：源码、测试和打包配置。
 
 安全提醒：`.env` 可能包含 API Key，不要把真实密钥提交到 Git，也不要发给不该接收的人。命令行清理时不要使用 `del /s`、`rd /s`、`rmdir /s` 等批量删除命令。
+
+## GitHub Actions CI/CD
+
+仓库包含两条自动化工作流：
+
+- `.github/workflows/ci.yml`：推送到 `master` 或创建 Pull Request 时，在 Ubuntu/Windows 和 Python 3.10/3.13 上运行完整测试。
+- `.github/workflows/release.yml`：支持手动构建 Windows 便携 ZIP；推送 `v*` 标签时还会自动创建 GitHub Release。
+
+工作流不会调用专利分析接口，也不需要上传 API Key。CI 构建使用 `.env.example` 生成便携包中的待填写 `.env`。
+
+第一次上传 GitHub、查看 CI、下载 Artifact 和发布 `v0.1.0` 的完整步骤见 [CI-CD实验指南.md](CI-CD实验指南.md)。

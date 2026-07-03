@@ -198,6 +198,8 @@ class PortableRuntimeFilesTests(unittest.TestCase):
             self.assertEqual((dist / build_portable.REPORT_TEMPLATE_NAME).read_bytes(), b"template")
             self.assertEqual((dist / build_portable.APP_ICON_NAME).read_bytes(), b"icon")
             self.assertEqual((dist / build_portable.USER_GUIDE_NAME).read_text(encoding="utf-8"), "guide")
+            self.assertEqual((dist / ".env").read_text(encoding="utf-8"), "OPENAI_API_KEY=")
+            self.assertFalse((dist / ".env.example").exists())
 
     def test_missing_report_template_stops_portable_build(self):
         with tempfile.TemporaryDirectory() as tmp:

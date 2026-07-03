@@ -1,0 +1,72 @@
+name: Build Windows portable package
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    name: Build and package Windows EXE
+    runs-on: windows-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[portable]"
+
+      - name: Run unit tests before packaging
+        run: python -m unittest discover
+
+      - name: Build portable application
+        run: python build_portable.py
+
+      - name: Create ZIP archive
+        id: package
+        shell: pwsh
+        run: |
+          if ("${{ github.ref_type }}" -eq "tag") {
+            $version = "${{ github.ref_name }}"
+          } else {
+            $version = "manual-${{ github.run_number }}"
+          }
+          $archive = "PatentSummarizer-windows-x64-$version.zip"
+          Compress-Archive -Path "dist\PatentSummarizer" -DestinationPath $archive -Force
+          "archive=$archive" >> $env:GITHUB_OUTPUT
+
+      - name: Upload portable package artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: PatentSummarizer-windows-x64
+          path: ${{ steps.package.outputs.archive }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Create GitHub Release for version tag
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" "${{ steps.package.outputs.archive }}" `
+            --verify-tag `
+            --title "PatentSummarizer ${{ github.ref_name }}" `
+            --generate-notes

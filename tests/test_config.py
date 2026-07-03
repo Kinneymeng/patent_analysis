@@ -73,5 +73,44 @@ class ConfigTests(unittest.TestCase):
         self.assertIn("OPENAI_MODEL", str(ctx.exception))
 
 
+class GitHubActionsWorkflowTests(unittest.TestCase):
+    def test_ci_workflow_tests_pushes_and_pull_requests_on_two_operating_systems(self):
+        workflow = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
+
+        self.assertIn("push:", workflow)
+        self.assertIn("pull_request:", workflow)
+        self.assertIn("master", workflow)
+        self.assertIn("ubuntu-latest", workflow)
+        self.assertIn("windows-latest", workflow)
+        self.assertIn('"3.10"', workflow)
+        self.assertIn('"3.13"', workflow)
+        self.assertIn('actions/checkout@v6', workflow)
+        self.assertIn('actions/setup-python@v6', workflow)
+        self.assertIn('python -m unittest discover', workflow)
+
+    def test_release_workflow_builds_and_publishes_windows_portable_package(self):
+        workflow = Path(".github/workflows/release.yml").read_text(encoding="utf-8")
+
+        self.assertIn("workflow_dispatch:", workflow)
+        self.assertIn('"v*"', workflow)
+        self.assertIn("windows-latest", workflow)
+        self.assertIn("python build_portable.py", workflow)
+        self.assertIn("Compress-Archive", workflow)
+        self.assertIn("actions/upload-artifact@v7", workflow)
+        self.assertIn("gh release create", workflow)
+        self.assertIn("contents: write", workflow)
+
+    def test_portable_build_uses_env_example_as_editable_env_when_secret_is_absent(self):
+        build_script = Path("build_portable.py").read_text(encoding="utf-8")
+
+        self.assertIn('shutil.copy2(env_example, dist_app / ".env")', build_script)
+
+    def test_ci_cd_guide_explains_the_first_experiment(self):
+        guide = Path("CI-CD实验指南.md").read_text(encoding="utf-8")
+
+        for phrase in ["什么是 CI/CD", "第一次上传", "查看 CI", "手动构建", "发布一个版本", "v0.1.0"]:
+            self.assertIn(phrase, guide)
+
+
 if __name__ == "__main__":
     unittest.main()

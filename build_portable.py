@@ -54,7 +54,7 @@ def copy_runtime_files(dist_app: Path) -> None:
 
     env_example = ROOT / ".env.example"
     if env_example.exists():
-        shutil.copy2(env_example, dist_app / ".env.example")
+        shutil.copy2(env_example, dist_app / ".env")
 
 
 if __name__ == "__main__":
