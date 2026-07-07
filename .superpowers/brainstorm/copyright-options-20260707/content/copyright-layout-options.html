@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>版权信息位置方案</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #f3eef7; color: #201a24; font-family: "Microsoft YaHei UI", "Segoe UI", sans-serif; }
+    .page { max-width: 1480px; margin: 0 auto; padding: 30px; }
+    h1 { margin: 0 0 8px; font-size: 28px; }
+    .lead { margin: 0 0 24px; color: #6c6371; font-size: 15px; }
+    .grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 20px; }
+    .option { position: relative; overflow: hidden; border: 2px solid transparent; border-radius: 20px; background: #fff; box-shadow: 0 10px 30px rgba(49, 38, 57, .08); cursor: pointer; transition: .18s ease; }
+    .option:hover { transform: translateY(-3px); box-shadow: 0 14px 34px rgba(49, 38, 57, .14); }
+    .option.selected { border-color: #7057b1; box-shadow: 0 0 0 4px rgba(112, 87, 177, .14); }
+    .choice { position: absolute; z-index: 5; top: 14px; left: 14px; width: 34px; height: 34px; display: grid; place-items: center; border-radius: 50%; color: #fff; background: #7057b1; font-weight: 800; }
+    .recommended { position: absolute; z-index: 5; top: 16px; right: 16px; padding: 6px 10px; border-radius: 999px; background: #eee7ff; color: #6247a6; font-size: 12px; font-weight: 700; }
+    .preview { padding: 16px; background: #eee9f2; }
+    .window { height: 490px; display: flex; flex-direction: column; overflow: hidden; border-radius: 12px; background: #f7f3fa; border: 1px solid #d8d0dc; }
+    .titlebar { height: 24px; flex: 0 0 auto; display: flex; align-items: center; padding: 0 9px; background: #fff; color: #756c79; font-size: 8px; }
+    .dots { margin-left: auto; letter-spacing: 4px; }
+    .app { min-height: 0; flex: 1; display: flex; flex-direction: column; padding: 14px 16px 10px; }
+    .top { display: flex; justify-content: space-between; align-items: flex-start; min-height: 50px; }
+    .app-title { font-size: 15px; font-weight: 800; color: #111; }
+    .subtitle { margin-top: 5px; color: #594e60; font-size: 7px; }
+    .panel { min-height: 0; flex: 1; display: flex; flex-direction: column; gap: 9px; padding: 12px; border: 1px solid #d7ceda; border-radius: 12px; background: #fff; }
+    .tabs { display: flex; align-items: center; gap: 4px; color: #332a39; font-size: 7px; font-weight: 700; }
+    .tabs b { margin-right: 5px; }
+    .tab { min-width: 50px; padding: 7px 8px; text-align: center; border-radius: 6px; background: #e3dce7; }
+    .tab.active { color: #fff; background: #7057b1; }
+    .directory { height: 31px; display: flex; align-items: center; gap: 7px; font-size: 7px; font-weight: 700; }
+    .input { height: 24px; flex: 1; border: 1px solid #cfc3d2; border-radius: 6px; }
+    .button { padding: 7px 14px; border-radius: 6px; color: #fff; background: #665e75; }
+    .action { display: flex; align-items: center; padding: 7px 10px; border-radius: 7px; background: #f5f0f8; color: #7057b1; font-size: 7px; }
+    .action .run { margin-left: auto; padding: 7px 17px; border-radius: 7px; color: #fff; background: #87576a; font-weight: 700; }
+    .log { min-height: 0; flex: 1; display: flex; flex-direction: column; padding: 10px; border-radius: 9px; background: #211a28; color: #efc9d6; font-size: 7px; font-weight: 700; }
+    .logbox { min-height: 0; flex: 1; margin-top: 7px; border-radius: 6px; background: #1c1b1f; }
+    .footer { min-height: 24px; display: flex; align-items: center; justify-content: center; gap: 6px; color: #736a78; font-size: 7px; }
+    .copyright-label { padding: 3px 6px; border: 1px solid #d3c8d8; border-radius: 999px; color: #655a6b; background: #fff; font-weight: 700; }
+    .header-copyright { max-width: 180px; text-align: right; color: #746979; font-size: 7px; line-height: 1.45; }
+    .header-copyright strong { display: inline-block; margin-bottom: 3px; padding: 2px 6px; border-radius: 999px; color: #6247a6; background: #ebe3f7; }
+    .log-copyright { display: flex; align-items: center; justify-content: center; gap: 5px; margin-top: 7px; padding-top: 7px; border-top: 1px solid #44394c; color: #d9cbdc; font-size: 7px; font-weight: 400; }
+    .log-copyright strong { color: #efc9d6; }
+    .body { padding: 18px 20px 20px; }
+    .body h2 { margin: 0 0 8px; font-size: 18px; }
+    .body p { min-height: 42px; margin: 0 0 12px; color: #6c6371; font-size: 13px; line-height: 1.6; }
+    .tags { display: flex; gap: 7px; flex-wrap: wrap; }
+    .tag { padding: 5px 8px; border-radius: 999px; background: #f2edf5; color: #685e6e; font-size: 11px; }
+    .hint { margin-top: 22px; padding: 13px 16px; border-radius: 12px; background: #e8e0f0; color: #584d61; font-size: 13px; }
+    @media (max-width: 1100px) { .grid { grid-template-columns: 1fr; } .window { height: 500px; } }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <h1>版权信息放在哪里最自然？</h1>
+    <p class="lead">三种方案都能一眼识别为版权信息，同时尽量不打断“选择目录 → 开始运行 → 查看日志”的主流程。点击卡片即可选择。</p>
+    <section class="grid">
+      <article class="option" data-choice="a-footer" onclick="toggleSelect(this)">
+        <span class="choice">A</span><span class="recommended">推荐</span>
+        <div class="preview"><div class="window">
+          <div class="titlebar">▣　专利 DOCX 处理工具 <span class="dots">— □ ×</span></div>
+          <div class="app">
+            <div class="top"><div><div class="app-title">专利 DOCX 处理工具</div><div class="subtitle">选择目录和任务后开始运行；EXE 会使用同目录下的 .env 和 class.xlsx。</div></div></div>
+            <div class="panel">
+              <div class="tabs"><b>处理任务</b><span class="tab active">批量总结</span><span class="tab">分类</span><span class="tab">趋势分析</span><span class="tab">对比</span><span class="tab">报告</span></div>
+              <div class="directory">专利目录 <span class="input"></span><span class="button">选择</span></div>
+              <div class="action">请选择专利 DOCX 目录 <span class="run">开始运行</span></div>
+              <div class="log">运行日志<div class="logbox"></div></div>
+            </div>
+            <div class="footer"><span class="copyright-label">版权信息</span><span>© 2026 平台及模组开发部 · 线控底盘所 版权所有</span></div>
+          </div>
+        </div></div>
+        <div class="body"><h2>底部独立页脚</h2><p>放在白色主面板之外、窗口最下方。始终可见，归属清晰，又不会和业务内容抢注意力。</p><div class="tags"><span class="tag">最稳妥</span><span class="tag">正式</span><span class="tag">不干扰操作</span></div></div>
+      </article>
+
+      <article class="option" data-choice="b-header" onclick="toggleSelect(this)">
+        <span class="choice">B</span>
+        <div class="preview"><div class="window">
+          <div class="titlebar">▣　专利 DOCX 处理工具 <span class="dots">— □ ×</span></div>
+          <div class="app">
+            <div class="top"><div><div class="app-title">专利 DOCX 处理工具</div><div class="subtitle">选择目录和任务后开始运行；EXE 会使用同目录下的 .env 和 class.xlsx。</div></div><div class="header-copyright"><strong>版权信息</strong><br>© 2026 平台及模组开发部<br>· 线控底盘所 版权所有</div></div>
+            <div class="panel">
+              <div class="tabs"><b>处理任务</b><span class="tab active">批量总结</span><span class="tab">分类</span><span class="tab">趋势分析</span><span class="tab">对比</span><span class="tab">报告</span></div>
+              <div class="directory">专利目录 <span class="input"></span><span class="button">选择</span></div>
+              <div class="action">请选择专利 DOCX 目录 <span class="run">开始运行</span></div>
+              <div class="log">运行日志<div class="logbox"></div></div>
+            </div>
+          </div>
+        </div></div>
+        <div class="body"><h2>标题区右上角</h2><p>打开软件第一眼就能看到，识别性最强；但标题区信息会更密，窗口缩小时也更容易拥挤。</p><div class="tags"><span class="tag">最醒目</span><span class="tag">品牌感</span><span class="tag">略占标题空间</span></div></div>
+      </article>
+
+      <article class="option" data-choice="c-log-footer" onclick="toggleSelect(this)">
+        <span class="choice">C</span>
+        <div class="preview"><div class="window">
+          <div class="titlebar">▣　专利 DOCX 处理工具 <span class="dots">— □ ×</span></div>
+          <div class="app">
+            <div class="top"><div><div class="app-title">专利 DOCX 处理工具</div><div class="subtitle">选择目录和任务后开始运行；EXE 会使用同目录下的 .env 和 class.xlsx。</div></div></div>
+            <div class="panel">
+              <div class="tabs"><b>处理任务</b><span class="tab active">批量总结</span><span class="tab">分类</span><span class="tab">趋势分析</span><span class="tab">对比</span><span class="tab">报告</span></div>
+              <div class="directory">专利目录 <span class="input"></span><span class="button">选择</span></div>
+              <div class="action">请选择专利 DOCX 目录 <span class="run">开始运行</span></div>
+              <div class="log">运行日志<div class="logbox"></div><div class="log-copyright"><strong>版权信息</strong><span>© 2026 平台及模组开发部 · 线控底盘所 版权所有</span></div></div>
+            </div>
+          </div>
+        </div></div>
+        <div class="body"><h2>日志面板底部</h2><p>利用深色区域形成清楚对比，版权文字很容易被发现；不过视觉上会和“运行日志”产生关联。</p><div class="tags"><span class="tag">对比鲜明</span><span class="tag">布局紧凑</span><span class="tag">略像日志状态栏</span></div></div>
+      </article>
+    </section>
+    <div class="hint">我的建议：优先选 A。它最符合桌面工具的常见信息层级，也最不容易在后续新增功能时显得拥挤。</div>
+  </main>
+</body>
+</html>

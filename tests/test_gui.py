@@ -7,6 +7,7 @@ from unittest.mock import patch
 import build_portable
 
 from patent_summarizer.gui import (
+    COPYRIGHT_TEXT,
     GOOGLE_MATERIAL_PALETTE,
     MODE_ANALYZE,
     MODE_CLASSIFY,
@@ -26,6 +27,12 @@ from patent_summarizer.gui import (
 
 
 class GuiCommandTests(unittest.TestCase):
+    def test_copyright_text_uses_approved_owner_and_year(self):
+        self.assertEqual(
+            COPYRIGHT_TEXT,
+            "© 2026 平台及模组开发部 · 线控底盘所 版权所有",
+        )
+
     def test_builds_summarize_command_for_docx_only_portable_run(self):
         with tempfile.TemporaryDirectory() as tmp:
             app_dir = Path(tmp) / "app"

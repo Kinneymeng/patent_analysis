@@ -31,6 +31,7 @@ MODE_LABELS = {
 }
 REPORT_TEMPLATE_NAME = "汽车底盘领域专利布局分析报告模板.docx"
 APP_ICON_NAME = "patent-summarizer.ico"
+COPYRIGHT_TEXT = "© 2026 平台及模组开发部 · 线控底盘所 版权所有"
 
 
 @dataclass(frozen=True)
@@ -242,9 +243,17 @@ class PatentSummarizerApp(ctk.CTk):
             border_width=1,
             border_color=GOOGLE_MATERIAL_PALETTE["outline_variant"],
         )
-        panel.grid(row=1, column=0, sticky="nsew", padx=28, pady=(0, 18))
+        panel.grid(row=1, column=0, sticky="nsew", padx=28, pady=(0, 6))
         panel.grid_columnconfigure(0, weight=1)
         panel.grid_rowconfigure(3, weight=1)
+
+        copyright_label = ctk.CTkLabel(
+            self,
+            text=COPYRIGHT_TEXT,
+            font=ctk.CTkFont(family="Microsoft YaHei UI", size=11),
+            text_color=GOOGLE_MATERIAL_PALETTE["on_surface_variant"],
+        )
+        copyright_label.grid(row=2, column=0, sticky="ew", padx=28, pady=(0, 8))
 
         mode_row = ctk.CTkFrame(panel, fg_color="transparent")
         mode_row.grid(row=0, column=0, sticky="ew", padx=22, pady=(22, 14))
