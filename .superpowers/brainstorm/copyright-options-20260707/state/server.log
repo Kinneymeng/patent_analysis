@@ -1,3 +1,4 @@
 {"type":"server-started","port":52684,"host":"127.0.0.1","url_host":"localhost","url":"http://localhost:52684","screen_dir":"D:\\03_Proj\\02_AI兼职\\03_projects\\07_专利分类\\.superpowers\\brainstorm\\copyright-options-20260707\\content","state_dir":"D:\\03_Proj\\02_AI兼职\\03_projects\\07_专利分类\\.superpowers\\brainstorm\\copyright-options-20260707\\state"}
 {"type":"screen-added","file":"D:\\03_Proj\\02_AI兼职\\03_projects\\07_专利分类\\.superpowers\\brainstorm\\copyright-options-20260707\\content\\copyright-layout-options.html"}
 {"type":"screen-added","file":"D:\\03_Proj\\02_AI兼职\\03_projects\\07_专利分类\\.superpowers\\brainstorm\\copyright-options-20260707\\content\\waiting-copyright-implementation.html"}
+{"type":"server-stopped","reason":"idle timeout"}
