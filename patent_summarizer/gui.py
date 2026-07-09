@@ -47,24 +47,36 @@ class PortfolioDraft:
 MODE_OPTIONS = list(MODE_LABELS.values())
 MODERN_APPEARANCE_MODE = "light"
 MODERN_COLOR_THEME = "green"
-GOOGLE_MATERIAL_PALETTE = {
-    "primary": "#6750A4",
-    "primary_hover": "#5B4596",
-    "primary_container": "#EADDFF",
-    "secondary": "#625B71",
-    "secondary_container": "#E8DEF8",
-    "tertiary": "#7D5260",
-    "tertiary_hover": "#6F4654",
-    "tertiary_container": "#FFD8E4",
-    "background": "#FFFBFE",
+DESKTOP_EDITORIAL_PALETTE = {
+    "primary": "#CC785C",
+    "primary_hover": "#B86950",
+    "primary_pressed": "#A9583E",
+    "primary_disabled": "#E6DFD8",
+    "ink": "#141413",
+    "body": "#3D3D3A",
+    "body_strong": "#252523",
+    "muted": "#6C6A64",
+    "muted_soft": "#8E8B82",
+    "canvas": "#FAF9F5",
     "surface": "#FFFFFF",
-    "surface_dim": "#F7F2FA",
-    "surface_variant": "#E7E0EC",
-    "outline": "#79747E",
-    "outline_variant": "#CAC4D0",
+    "surface_soft": "#F5F0E8",
+    "surface_card": "#EFE9DE",
+    "surface_input": "#FFFEFA",
+    "surface_selected": "#E8E0D2",
+    "hairline": "#E6DFD8",
+    "hairline_soft": "#EBE6DF",
+    "dark": "#181715",
+    "dark_elevated": "#252320",
+    "dark_soft": "#1F1E1B",
     "on_primary": "#FFFFFF",
-    "on_surface": "#1C1B1F",
-    "on_surface_variant": "#49454F",
+    "on_dark": "#FAF9F5",
+    "on_dark_soft": "#B8B2AA",
+    "success": "#4F9D67",
+    "success_surface": "#E4F5E9",
+    "warning": "#B88918",
+    "warning_surface": "#FFF4D6",
+    "error": "#C64545",
+    "error_surface": "#FDE8E7",
 }
 
 
@@ -78,16 +90,16 @@ def mode_from_label(label: str) -> str:
 def mode_button_style(selected: bool) -> dict[str, str]:
     if selected:
         return {
-            "fg_color": GOOGLE_MATERIAL_PALETTE["primary"],
-            "hover_color": GOOGLE_MATERIAL_PALETTE["primary_hover"],
-            "border_color": GOOGLE_MATERIAL_PALETTE["primary"],
-            "text_color": GOOGLE_MATERIAL_PALETTE["on_primary"],
+            "fg_color": DESKTOP_EDITORIAL_PALETTE["primary"],
+            "hover_color": DESKTOP_EDITORIAL_PALETTE["primary_hover"],
+            "border_color": DESKTOP_EDITORIAL_PALETTE["primary"],
+            "text_color": DESKTOP_EDITORIAL_PALETTE["on_primary"],
         }
     return {
-        "fg_color": GOOGLE_MATERIAL_PALETTE["surface_variant"],
-        "hover_color": GOOGLE_MATERIAL_PALETTE["secondary_container"],
-        "border_color": GOOGLE_MATERIAL_PALETTE["outline_variant"],
-        "text_color": GOOGLE_MATERIAL_PALETTE["on_surface"],
+        "fg_color": DESKTOP_EDITORIAL_PALETTE["surface_card"],
+        "hover_color": DESKTOP_EDITORIAL_PALETTE["surface_selected"],
+        "border_color": DESKTOP_EDITORIAL_PALETTE["hairline"],
+        "text_color": DESKTOP_EDITORIAL_PALETTE["ink"],
     }
 
 
@@ -207,7 +219,7 @@ class PatentSummarizerApp(ctk.CTk):
             self.iconbitmap(get_app_dir() / APP_ICON_NAME)
         self.geometry("980x720")
         self.minsize(860, 620)
-        self.configure(fg_color=GOOGLE_MATERIAL_PALETTE["surface_dim"])
+        self.configure(fg_color=DESKTOP_EDITORIAL_PALETTE["canvas"])
 
         self._build_layout()
         self.after(120, self._drain_queue)
@@ -224,7 +236,7 @@ class PatentSummarizerApp(ctk.CTk):
             header,
             text="专利 DOCX 处理工具",
             font=ctk.CTkFont(family="Microsoft YaHei UI", size=24, weight="bold"),
-            text_color=GOOGLE_MATERIAL_PALETTE["on_surface"],
+            text_color=DESKTOP_EDITORIAL_PALETTE["ink"],
         )
         title.grid(row=0, column=0, sticky="w")
 
@@ -232,16 +244,16 @@ class PatentSummarizerApp(ctk.CTk):
             header,
             text="选择目录和任务后开始运行；EXE 会使用同目录下的 .env 和 class.xlsx。",
             font=ctk.CTkFont(family="Microsoft YaHei UI", size=13),
-            text_color=GOOGLE_MATERIAL_PALETTE["on_surface_variant"],
+            text_color=DESKTOP_EDITORIAL_PALETTE["body"],
         )
         subtitle.grid(row=1, column=0, sticky="w", pady=(6, 0))
 
         panel = ctk.CTkFrame(
             self,
             corner_radius=18,
-            fg_color=GOOGLE_MATERIAL_PALETTE["surface"],
+            fg_color=DESKTOP_EDITORIAL_PALETTE["surface"],
             border_width=1,
-            border_color=GOOGLE_MATERIAL_PALETTE["outline_variant"],
+            border_color=DESKTOP_EDITORIAL_PALETTE["hairline"],
         )
         panel.grid(row=1, column=0, sticky="nsew", padx=28, pady=(0, 6))
         panel.grid_columnconfigure(0, weight=1)
@@ -251,7 +263,7 @@ class PatentSummarizerApp(ctk.CTk):
             self,
             text=COPYRIGHT_TEXT,
             font=ctk.CTkFont(family="Microsoft YaHei UI", size=11),
-            text_color=GOOGLE_MATERIAL_PALETTE["on_surface_variant"],
+            text_color=DESKTOP_EDITORIAL_PALETTE["muted"],
         )
         copyright_label.grid(row=2, column=0, sticky="ew", padx=28, pady=(0, 8))
 
@@ -262,11 +274,11 @@ class PatentSummarizerApp(ctk.CTk):
             mode_row,
             text="处理任务",
             font=ctk.CTkFont(family="Microsoft YaHei UI", size=13, weight="bold"),
-            text_color=GOOGLE_MATERIAL_PALETTE["on_surface_variant"],
+            text_color=DESKTOP_EDITORIAL_PALETTE["body_strong"],
         ).grid(row=0, column=0, sticky="w", padx=(0, 14))
         self.mode_group = ctk.CTkFrame(
             mode_row,
-            fg_color=GOOGLE_MATERIAL_PALETTE["outline_variant"],
+            fg_color=DESKTOP_EDITORIAL_PALETTE["hairline"],
             corner_radius=12,
         )
         self.mode_group.grid(row=0, column=1, sticky="w")
@@ -289,14 +301,14 @@ class PatentSummarizerApp(ctk.CTk):
         self.config_frame.grid(row=1, column=0, sticky="ew", padx=22, pady=(0, 14))
         self.config_frame.grid_columnconfigure(0, weight=1)
 
-        action_row = ctk.CTkFrame(panel, fg_color=GOOGLE_MATERIAL_PALETTE["surface_dim"], corner_radius=14)
+        action_row = ctk.CTkFrame(panel, fg_color=DESKTOP_EDITORIAL_PALETTE["surface_soft"], corner_radius=14)
         action_row.grid(row=2, column=0, sticky="ew", padx=22, pady=(0, 16))
         action_row.grid_columnconfigure(0, weight=1)
         self.status_label = ctk.CTkLabel(
             action_row,
             textvariable=self.status_var,
             font=ctk.CTkFont(family="Microsoft YaHei UI", size=13),
-            text_color=GOOGLE_MATERIAL_PALETTE["primary"],
+            text_color=DESKTOP_EDITORIAL_PALETTE["primary_pressed"],
         )
         self.status_label.grid(row=0, column=0, sticky="w", padx=16, pady=12)
         self.start_button = ctk.CTkButton(
@@ -306,14 +318,14 @@ class PatentSummarizerApp(ctk.CTk):
             height=42,
             corner_radius=12,
             command=self._start,
-            fg_color=GOOGLE_MATERIAL_PALETTE["tertiary"],
-            hover_color=GOOGLE_MATERIAL_PALETTE["tertiary_hover"],
-            text_color=GOOGLE_MATERIAL_PALETTE["on_primary"],
+            fg_color=DESKTOP_EDITORIAL_PALETTE["primary"],
+            hover_color=DESKTOP_EDITORIAL_PALETTE["primary_hover"],
+            text_color=DESKTOP_EDITORIAL_PALETTE["on_primary"],
             font=ctk.CTkFont(family="Microsoft YaHei UI", size=14, weight="bold"),
         )
         self.start_button.grid(row=0, column=1, sticky="e", padx=12, pady=10)
 
-        log_panel = ctk.CTkFrame(panel, corner_radius=14, fg_color="#211A28")
+        log_panel = ctk.CTkFrame(panel, corner_radius=14, fg_color=DESKTOP_EDITORIAL_PALETTE["dark"])
         log_panel.grid(row=3, column=0, sticky="nsew", padx=22, pady=(0, 22))
         log_panel.grid_columnconfigure(0, weight=1)
         log_panel.grid_rowconfigure(1, weight=1)
@@ -322,7 +334,7 @@ class PatentSummarizerApp(ctk.CTk):
             log_panel,
             text="运行日志",
             font=ctk.CTkFont(family="Microsoft YaHei UI", size=13, weight="bold"),
-            text_color=GOOGLE_MATERIAL_PALETTE["tertiary_container"],
+            text_color=DESKTOP_EDITORIAL_PALETTE["on_dark"],
         ).grid(row=0, column=0, sticky="w", padx=16, pady=(14, 6))
 
         self.log_text = ctk.CTkTextbox(
@@ -330,10 +342,10 @@ class PatentSummarizerApp(ctk.CTk):
             wrap="word",
             corner_radius=10,
             border_width=0,
-            fg_color="#1C1B1F",
-            text_color="#F5EFF7",
-            scrollbar_button_color=GOOGLE_MATERIAL_PALETTE["secondary"],
-            scrollbar_button_hover_color=GOOGLE_MATERIAL_PALETTE["tertiary"],
+            fg_color=DESKTOP_EDITORIAL_PALETTE["dark_soft"],
+            text_color=DESKTOP_EDITORIAL_PALETTE["on_dark"],
+            scrollbar_button_color=DESKTOP_EDITORIAL_PALETTE["dark_elevated"],
+            scrollbar_button_hover_color=DESKTOP_EDITORIAL_PALETTE["primary_pressed"],
             font=ctk.CTkFont(family="Consolas", size=12),
         )
         self.log_text.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 12))
@@ -392,8 +404,8 @@ class PatentSummarizerApp(ctk.CTk):
             self.config_frame,
             height=116,
             corner_radius=12,
-            fg_color=GOOGLE_MATERIAL_PALETTE["surface_dim"],
-            scrollbar_button_color=GOOGLE_MATERIAL_PALETTE["outline_variant"],
+            fg_color=DESKTOP_EDITORIAL_PALETTE["surface_soft"],
+            scrollbar_button_color=DESKTOP_EDITORIAL_PALETTE["hairline"],
         )
         baseline_list.grid(row=2, column=0, sticky="ew")
         baseline_list.grid_columnconfigure(1, weight=1)
@@ -407,9 +419,9 @@ class PatentSummarizerApp(ctk.CTk):
                 baseline_list,
                 height=36,
                 corner_radius=9,
-                fg_color=GOOGLE_MATERIAL_PALETTE["background"],
-                border_color=GOOGLE_MATERIAL_PALETTE["outline_variant"],
-                text_color=GOOGLE_MATERIAL_PALETTE["on_surface_variant"],
+                fg_color=DESKTOP_EDITORIAL_PALETTE["surface_input"],
+                border_color=DESKTOP_EDITORIAL_PALETTE["hairline"],
+                text_color=DESKTOP_EDITORIAL_PALETTE["body"],
             )
             path_entry.insert(0, str(draft.root))
             path_entry.configure(state="disabled")
@@ -505,14 +517,14 @@ class PatentSummarizerApp(ctk.CTk):
         coverage = self._coverage(root)
         classification = bool(root and (root / "patent_classification.xlsx").exists())
         if coverage is None:
-            text, color = "请选择目录", GOOGLE_MATERIAL_PALETTE["surface_variant"]
+            text, color = "请选择目录", DESKTOP_EDITORIAL_PALETTE["surface_card"]
         elif coverage.document_count == 0:
-            text, color = "未发现 DOCX", "#FDE8E7"
+            text, color = "未发现 DOCX", DESKTOP_EDITORIAL_PALETTE["error_surface"]
         elif coverage.missing_summaries:
-            text, color = f"缺少 {len(coverage.missing_summaries)} 篇", "#FDE8E7"
+            text, color = f"缺少 {len(coverage.missing_summaries)} 篇", DESKTOP_EDITORIAL_PALETTE["error_surface"]
         else:
             class_text = "分类已有" if classification else "分类将自动生成"
-            text, color = f"{coverage.summary_count}/{coverage.document_count} 已就绪 · {class_text}", "#E4F5E9"
+            text, color = f"{coverage.summary_count}/{coverage.document_count} 已就绪 · {class_text}", DESKTOP_EDITORIAL_PALETTE["success_surface"]
         return ctk.CTkButton(
             parent,
             text=text,
@@ -520,7 +532,7 @@ class PatentSummarizerApp(ctk.CTk):
             corner_radius=9,
             fg_color=color,
             hover_color=color,
-            text_color=GOOGLE_MATERIAL_PALETTE["on_surface_variant"],
+            text_color=DESKTOP_EDITORIAL_PALETTE["body"],
             font=ctk.CTkFont(family="Microsoft YaHei UI", size=11),
             command=lambda selected=root: self._show_coverage_details(selected),
         )
@@ -716,15 +728,15 @@ class PatentSummarizerApp(ctk.CTk):
             width=width or 120,
             height=38,
             corner_radius=10,
-            border_color=GOOGLE_MATERIAL_PALETTE["outline_variant"],
-            fg_color=GOOGLE_MATERIAL_PALETTE["background"],
-            text_color=GOOGLE_MATERIAL_PALETTE["on_surface"],
+            border_color=DESKTOP_EDITORIAL_PALETTE["hairline"],
+            fg_color=DESKTOP_EDITORIAL_PALETTE["surface_input"],
+            text_color=DESKTOP_EDITORIAL_PALETTE["ink"],
             font=ctk.CTkFont(family="Microsoft YaHei UI", size=12),
         )
 
     def _button(self, parent, text: str, command, width: int, secondary: bool = False) -> ctk.CTkButton:
-        color = GOOGLE_MATERIAL_PALETTE["surface_variant"] if secondary else GOOGLE_MATERIAL_PALETTE["secondary"]
-        text_color = GOOGLE_MATERIAL_PALETTE["on_surface"] if secondary else GOOGLE_MATERIAL_PALETTE["on_primary"]
+        color = DESKTOP_EDITORIAL_PALETTE["surface_card"] if secondary else DESKTOP_EDITORIAL_PALETTE["dark_elevated"]
+        text_color = DESKTOP_EDITORIAL_PALETTE["ink"] if secondary else DESKTOP_EDITORIAL_PALETTE["on_dark"]
         return ctk.CTkButton(
             parent,
             text=text,
@@ -733,7 +745,7 @@ class PatentSummarizerApp(ctk.CTk):
             corner_radius=10,
             command=command,
             fg_color=color,
-            hover_color=GOOGLE_MATERIAL_PALETTE["secondary_container"] if secondary else GOOGLE_MATERIAL_PALETTE["primary"],
+            hover_color=DESKTOP_EDITORIAL_PALETTE["surface_selected"] if secondary else DESKTOP_EDITORIAL_PALETTE["dark_soft"],
             text_color=text_color,
             font=ctk.CTkFont(family="Microsoft YaHei UI", size=12, weight="bold"),
         )
@@ -743,7 +755,7 @@ class PatentSummarizerApp(ctk.CTk):
             parent,
             text=text,
             font=ctk.CTkFont(family="Microsoft YaHei UI", size=13, weight="bold"),
-            text_color=GOOGLE_MATERIAL_PALETTE["on_surface_variant"],
+            text_color=DESKTOP_EDITORIAL_PALETTE["body_strong"],
         )
 
     def _small_label(self, parent, text: str) -> ctk.CTkLabel:
@@ -751,7 +763,7 @@ class PatentSummarizerApp(ctk.CTk):
             parent,
             text=text,
             font=ctk.CTkFont(family="Microsoft YaHei UI", size=11),
-            text_color=GOOGLE_MATERIAL_PALETTE["on_surface_variant"],
+            text_color=DESKTOP_EDITORIAL_PALETTE["muted"],
         )
 
 

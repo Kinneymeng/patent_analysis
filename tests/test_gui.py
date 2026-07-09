@@ -8,7 +8,7 @@ import build_portable
 
 from patent_summarizer.gui import (
     COPYRIGHT_TEXT,
-    GOOGLE_MATERIAL_PALETTE,
+    DESKTOP_EDITORIAL_PALETTE,
     MODE_ANALYZE,
     MODE_CLASSIFY,
     MODE_COMPARE,
@@ -161,19 +161,21 @@ class GuiCommandTests(unittest.TestCase):
         self.assertEqual(MODERN_APPEARANCE_MODE, "light")
         self.assertEqual(MODERN_COLOR_THEME, "green")
 
-    def test_google_material_palette_uses_primary_secondary_tertiary_roles(self):
-        self.assertEqual(GOOGLE_MATERIAL_PALETTE["primary"], "#6750A4")
-        self.assertEqual(GOOGLE_MATERIAL_PALETTE["secondary"], "#625B71")
-        self.assertEqual(GOOGLE_MATERIAL_PALETTE["tertiary"], "#7D5260")
-        self.assertNotIn("#2563eb", GOOGLE_MATERIAL_PALETTE.values())
-        self.assertNotIn("#1d4ed8", GOOGLE_MATERIAL_PALETTE.values())
+    def test_desktop_editorial_palette_matches_design_tokens(self):
+        self.assertEqual(DESKTOP_EDITORIAL_PALETTE["primary"], "#CC785C")
+        self.assertEqual(DESKTOP_EDITORIAL_PALETTE["canvas"], "#FAF9F5")
+        self.assertEqual(DESKTOP_EDITORIAL_PALETTE["dark"], "#181715")
+        self.assertNotIn("#6750A4", DESKTOP_EDITORIAL_PALETTE.values())
+        self.assertNotIn("#7D5260", DESKTOP_EDITORIAL_PALETTE.values())
 
     def test_unselected_mode_button_has_dark_readable_text(self):
         selected = mode_button_style(True)
         unselected = mode_button_style(False)
 
         self.assertEqual(selected["text_color"], "#FFFFFF")
-        self.assertEqual(unselected["text_color"], GOOGLE_MATERIAL_PALETTE["on_surface"])
+        self.assertEqual(selected["fg_color"], DESKTOP_EDITORIAL_PALETTE["primary"])
+        self.assertEqual(unselected["fg_color"], DESKTOP_EDITORIAL_PALETTE["surface_card"])
+        self.assertEqual(unselected["text_color"], DESKTOP_EDITORIAL_PALETTE["ink"])
         self.assertNotEqual(unselected["text_color"], unselected["fg_color"])
 
     def test_gui_module_can_be_loaded_as_pyinstaller_script_entry(self):
