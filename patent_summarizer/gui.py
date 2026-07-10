@@ -14,6 +14,7 @@ import customtkinter as ctk
 
 from patent_summarizer.cli import main
 from patent_summarizer.discovery import SummaryCoverage, inspect_summary_coverage
+from patent_summarizer.progress import ProgressUpdate
 
 
 MODE_SUMMARIZE = "summarize"
@@ -103,6 +104,25 @@ def mode_button_style(selected: bool) -> dict[str, str]:
     }
 
 
+def progress_display(update: ProgressUpdate) -> tuple[str, float, str]:
+    """Return the user-facing detail, fill value, and color for a progress event."""
+
+    if update.state == "preparing":
+        return (update.detail or "正在计算任务规模", 0.0, DESKTOP_EDITORIAL_PALETTE["primary"])
+    if update.total is None or update.total == 0:
+        value = 1.0 if update.state == "success" else 0.0
+        count = "100%" if update.state == "success" else ""
+    else:
+        value = min(1.0, max(0.0, (update.completed or 0) / update.total))
+        count = f"{update.completed or 0} / {update.total}（{round(value * 100)}%）"
+    detail = " · ".join(part for part in (update.detail, count) if part)
+    color = {
+        "success": DESKTOP_EDITORIAL_PALETTE["success"],
+        "error": DESKTOP_EDITORIAL_PALETTE["error"],
+    }.get(update.state, DESKTOP_EDITORIAL_PALETTE["primary"])
+    return (detail, value, color)
+
+
 def get_app_dir() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
@@ -190,7 +210,7 @@ class QueueWriter:
 
     def write(self, text: str) -> int:
         if text:
-            self.output_queue.put(text)
+            self.output_queue.put(("log", text))
         return len(text)
 
     def flush(self) -> None:
@@ -212,7 +232,11 @@ class PatentSummarizerApp(ctk.CTk):
         self.output_customized = False
         self.mode_var = ctk.StringVar(value=MODE_SUMMARIZE)
         self.status_var = ctk.StringVar(value="请选择专利 DOCX 目录")
+        self.progress_stage_var = ctk.StringVar(value="等待运行")
+        self.progress_detail_var = ctk.StringVar(value="")
         self.mode_buttons: dict[str, ctk.CTkButton] = {}
+        self.progress_state = "idle"
+        self.last_progress_update: ProgressUpdate | None = None
 
         self.title("专利 DOCX 处理工具")
         with contextlib.suppress(Exception):
@@ -257,7 +281,7 @@ class PatentSummarizerApp(ctk.CTk):
         )
         panel.grid(row=1, column=0, sticky="nsew", padx=28, pady=(0, 6))
         panel.grid_columnconfigure(0, weight=1)
-        panel.grid_rowconfigure(3, weight=1)
+        panel.grid_rowconfigure(4, weight=1)
 
         copyright_label = ctk.CTkLabel(
             self,
@@ -325,8 +349,37 @@ class PatentSummarizerApp(ctk.CTk):
         )
         self.start_button.grid(row=0, column=1, sticky="e", padx=12, pady=10)
 
+        progress_row = ctk.CTkFrame(panel, fg_color="transparent")
+        progress_row.grid(row=3, column=0, sticky="ew", padx=22, pady=(0, 12))
+        progress_row.grid_columnconfigure(0, weight=1)
+        progress_meta = ctk.CTkFrame(progress_row, fg_color="transparent")
+        progress_meta.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        progress_meta.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(
+            progress_meta,
+            textvariable=self.progress_stage_var,
+            font=ctk.CTkFont(family="Microsoft YaHei UI", size=12, weight="bold"),
+            text_color=DESKTOP_EDITORIAL_PALETTE["body_strong"],
+        ).grid(row=0, column=0, sticky="w")
+        ctk.CTkLabel(
+            progress_meta,
+            textvariable=self.progress_detail_var,
+            font=ctk.CTkFont(family="Microsoft YaHei UI", size=12),
+            text_color=DESKTOP_EDITORIAL_PALETTE["muted"],
+        ).grid(row=0, column=1, sticky="e")
+        self.progress_bar = ctk.CTkProgressBar(
+            progress_row,
+            height=9,
+            corner_radius=5,
+            border_width=0,
+            fg_color=DESKTOP_EDITORIAL_PALETTE["hairline"],
+            progress_color=DESKTOP_EDITORIAL_PALETTE["primary"],
+        )
+        self.progress_bar.grid(row=1, column=0, sticky="ew")
+        self.progress_bar.set(0)
+
         log_panel = ctk.CTkFrame(panel, corner_radius=14, fg_color=DESKTOP_EDITORIAL_PALETTE["dark"])
-        log_panel.grid(row=3, column=0, sticky="nsew", padx=22, pady=(0, 22))
+        log_panel.grid(row=4, column=0, sticky="nsew", padx=22, pady=(0, 22))
         log_panel.grid_columnconfigure(0, weight=1)
         log_panel.grid_rowconfigure(1, weight=1)
 
@@ -666,9 +719,9 @@ class PatentSummarizerApp(ctk.CTk):
         exit_code = 1
         try:
             with contextlib.redirect_stdout(writer), contextlib.redirect_stderr(writer):
-                exit_code = main(argv)
+                exit_code = main(argv, progress=lambda update: self.output_queue.put(("progress", update)))
         except BaseException:
-            self.output_queue.put(traceback.format_exc())
+            self.output_queue.put(("log", traceback.format_exc()))
         finally:
             self.output_queue.put(("done", exit_code))
 
@@ -676,10 +729,14 @@ class PatentSummarizerApp(ctk.CTk):
         try:
             while True:
                 item = self.output_queue.get_nowait()
-                if isinstance(item, tuple) and item[0] == "done":
-                    self._finish(int(item[1]))
-                else:
+                if not isinstance(item, tuple):
                     self._append_log(str(item))
+                elif item[0] == "log":
+                    self._append_log(str(item[1]))
+                elif item[0] == "progress":
+                    self._apply_progress(item[1])
+                elif item[0] == "done":
+                    self._finish(int(item[1]))
         except queue.Empty:
             pass
         self.after(120, self._drain_queue)
@@ -698,6 +755,7 @@ class PatentSummarizerApp(ctk.CTk):
         if running:
             self.start_button.configure(state="disabled")
             self.status_var.set("正在运行，请等待...")
+            self._set_progress_preparing("正在准备任务", "正在计算任务规模")
         else:
             self._refresh_start_state()
 
@@ -715,11 +773,59 @@ class PatentSummarizerApp(ctk.CTk):
     def _finish(self, exit_code: int) -> None:
         self._set_running(False)
         if exit_code == 0:
+            if self.progress_state != "success":
+                self._apply_progress(
+                    ProgressUpdate(
+                        mode=self._selected_mode(),
+                        state="success",
+                        stage="运行完成",
+                        detail="任务已完成",
+                        completed=1,
+                        total=1,
+                    )
+                )
             self.status_var.set("运行完成")
             self._append_log("\n完成。\n")
         else:
+            previous = self.last_progress_update
+            self._apply_progress(
+                ProgressUpdate(
+                    mode=self._selected_mode(),
+                    state="error",
+                    stage="运行异常结束",
+                    detail=f"退出码 {exit_code}",
+                    completed=previous.completed if previous else None,
+                    total=previous.total if previous else None,
+                )
+            )
             self.status_var.set(f"运行结束，退出码 {exit_code}")
             self._append_log(f"\n运行结束，退出码 {exit_code}。\n")
+
+    def _set_progress_preparing(self, stage: str, detail: str) -> None:
+        self._apply_progress(
+            ProgressUpdate(
+                mode=self._selected_mode(),
+                state="preparing",
+                stage=stage,
+                detail=detail,
+            )
+        )
+
+    def _apply_progress(self, update: ProgressUpdate) -> None:
+        self.last_progress_update = update
+        self.progress_state = update.state
+        self.progress_stage_var.set(update.stage)
+        detail, value, color = progress_display(update)
+        self.progress_detail_var.set(detail)
+        if update.state == "preparing":
+            self.progress_bar.stop()
+            self.progress_bar.configure(mode="indeterminate", progress_color=color)
+            self.progress_bar.set(0)
+            self.progress_bar.start()
+            return
+        self.progress_bar.stop()
+        self.progress_bar.configure(mode="determinate", progress_color=color)
+        self.progress_bar.set(value)
 
     def _entry(self, parent, variable: ctk.StringVar, width: int | None = None) -> ctk.CTkEntry:
         return ctk.CTkEntry(

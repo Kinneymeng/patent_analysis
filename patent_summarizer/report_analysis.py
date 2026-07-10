@@ -6,7 +6,7 @@ from collections import Counter
 from dataclasses import asdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Protocol
+from typing import Any, Callable, Mapping, Protocol
 
 from .comparison import ComparisonResult, PortfolioDataset
 from .prompts import REPORT_COMPETITOR_PROMPT, REPORT_EXECUTIVE_PROMPT, REPORT_SYSTEM_PROMPT, REPORT_TARGET_PROMPT
@@ -156,20 +156,26 @@ class ReportSynthesisAnalyzer:
         baselines: list[PortfolioDataset],
         trends: dict[str, TrendAnalysisResult],
         comparison: ComparisonResult,
+        on_stage: Callable[[str, bool], None] | None = None,
     ) -> tuple[CompetitorAnalysis, TargetAnalysis, ExecutiveSummary]:
         evidence = _report_evidence_payload(target, baselines, trends, comparison)
+        _notify_stage(on_stage, "竞争对手布局策略", started=True)
         competitor = parse_competitor_analysis(
             self.client.chat(
                 REPORT_SYSTEM_PROMPT,
                 REPORT_COMPETITOR_PROMPT.format(evidence=json.dumps(evidence, ensure_ascii=False, indent=2)),
             )
         )
+        _notify_stage(on_stage, "竞争对手布局策略", started=False)
+        _notify_stage(on_stage, f"{target.label}布局建议", started=True)
         target_analysis = parse_target_analysis(
             self.client.chat(
                 REPORT_SYSTEM_PROMPT,
                 REPORT_TARGET_PROMPT.format(evidence=json.dumps(evidence, ensure_ascii=False, indent=2)),
             )
         )
+        _notify_stage(on_stage, f"{target.label}布局建议", started=False)
+        _notify_stage(on_stage, "管理层结论", started=True)
         executive = parse_executive_summary(
             self.client.chat(
                 REPORT_SYSTEM_PROMPT,
@@ -186,7 +192,13 @@ class ReportSynthesisAnalyzer:
                 ),
             )
         )
+        _notify_stage(on_stage, "管理层结论", started=False)
         return competitor, target_analysis, executive
+
+
+def _notify_stage(callback: Callable[[str, bool], None] | None, detail: str, started: bool) -> None:
+    if callback is not None:
+        callback(detail, started)
 
 
 def combine_portfolios(label: str, portfolios: list[PortfolioDataset]) -> PortfolioDataset:

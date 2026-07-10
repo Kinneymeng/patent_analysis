@@ -272,6 +272,7 @@ EPS。
             )
             client = FakeClassificationClient()
             taxonomy = Taxonomy([TaxonomyItem("车辆运动控制内核", "横向融合控制")])
+            summary_events = []
 
             portfolio = load_or_build_portfolio(
                 folder,
@@ -280,6 +281,7 @@ EPS。
                 taxonomy=taxonomy,
                 recursive=False,
                 refresh_classification=False,
+                on_summary=lambda path, started: summary_events.append((path.name, started)),
             )
 
             workbook = folder / "patent_classification.xlsx"
@@ -290,6 +292,7 @@ EPS。
         self.assertEqual(len(portfolio.records), 1)
         self.assertEqual(portfolio.records[0].primary_second_level, "横向融合控制")
         self.assertEqual(len(client.calls), 1)
+        self.assertEqual(summary_events, [("case.md", True), ("case.md", False)])
         self.assertEqual(ws["A2"].value, "case.md")
 
 
@@ -354,10 +357,12 @@ class ComparisonAggregationTests(unittest.TestCase):
             ),
         ]
 
-        result = analyzer.analyze(target, baselines)
+        pair_events = []
+        result = analyzer.analyze(target, baselines, on_pair=lambda detail, started: pair_events.append((detail, started)))
 
         self.assertEqual([report.baseline_label for report in result.reports], ["B", "C", "外部总体"])
         self.assertEqual(len(client.calls), 3)
+        self.assertEqual([started for _detail, started in pair_events], [True, False, True, False, True, False])
         self.assertIn("A 在横向融合控制", result.reports[0].overall_conclusion)
 
 

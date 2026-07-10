@@ -5,7 +5,7 @@ from pathlib import Path
 from openpyxl import Workbook, load_workbook
 
 from patent_summarizer.metadata import infer_patent_year, normalize_patent_date, parse_bibliographic_metadata
-from patent_summarizer.trend_analysis import TrendAnalyzer, TrendPatentRecord, build_trend_groups, load_classification_workbook
+from patent_summarizer.trend_analysis import TrendAnalyzer, TrendPatentRecord, build_trend_groups, load_classification_workbook, trend_work_units
 from patent_summarizer.trend_excel_export import write_trend_workbook
 
 
@@ -191,10 +191,13 @@ class TrendAnalyzerTests(unittest.TestCase):
         client = FakeTrendClient()
         analyzer = TrendAnalyzer(client, batch_size=40)
         records = [make_record(filename=f"CN2024{index:08d}.pdf") for index in range(41)]
+        operations = []
 
-        result = analyzer.analyze(records)
+        result = analyzer.analyze(records, on_operation=lambda detail, started: operations.append((detail, started)))
 
         self.assertEqual(len(client.calls), 3)
+        self.assertEqual(trend_work_units(records, batch_size=40), 3)
+        self.assertEqual([started for _detail, started in operations], [True, False, True, False, True, False])
         self.assertEqual(result.reports[0].stats.patent_count, 41)
 
 

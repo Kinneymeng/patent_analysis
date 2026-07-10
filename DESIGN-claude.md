@@ -197,6 +197,16 @@ components:
     corner_radius: "{rounded.lg}"
     text_color: "{colors.primary_pressed}"
     note: "Shows selected path, validation message, or ready/running/completed state."
+  progress:
+    widget: "CTkProgressBar + CTkLabel"
+    location: "Between the status/action strip and the log panel."
+    track_color: "{colors.hairline}"
+    running_color: "{colors.primary}"
+    success_color: "{colors.success}"
+    error_color: "{colors.error}"
+    height: 9
+    corner_radius: 5
+    note: "Show stage, completed/total work units, and percentage. Use indeterminate motion only while the task scope is genuinely unknown."
   log_panel:
     widget: "CTkFrame"
     fg_color: "{colors.dark}"
@@ -231,6 +241,7 @@ layout:
       - "task selector row"
       - "mode-specific configuration"
       - "status/action strip"
+      - "progress strip"
       - "log panel, grows to fill remaining height"
   density:
     rule: "This is an operational desktop tool. Keep controls compact, aligned, and scannable."
@@ -253,15 +264,18 @@ state_rules:
     primary_button_state: "disabled"
     mode_buttons_state: "disabled"
     status_text: "正在运行，请等待..."
+    progress: "Use coral determinate progress after work units are known; use coral indeterminate motion while preparing the work plan."
   success:
     status_text_color: "{colors.success}"
     status_surface: "{colors.success_surface}"
+    progress: "Keep the final 100% fill and switch the indicator to success green."
   warning:
     status_text_color: "{colors.warning}"
     status_surface: "{colors.warning_surface}"
   error:
     status_text_color: "{colors.error}"
     status_surface: "{colors.error_surface}"
+    progress: "Keep the last completed value and switch the indicator to error red; never advance to 100% merely because execution stopped."
   disabled:
     fg_color: "{colors.primary_disabled}"
     text_color: "{colors.muted}"

@@ -5,7 +5,7 @@ import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Protocol
+from typing import Any, Callable, Iterable, Mapping, Protocol
 
 from .classification_pipeline import CheckpointStore
 from .classifier import ChatClient, classify_summary
@@ -120,11 +120,24 @@ class ComparisonAnalyzer:
         self.client = client
         self.max_prompt_labels = max_prompt_labels
 
-    def analyze(self, target: PortfolioDataset, baselines: list[PortfolioDataset]) -> ComparisonResult:
-        reports = [self._analyze_pair(target, baseline) for baseline in baselines]
+    def analyze(
+        self,
+        target: PortfolioDataset,
+        baselines: list[PortfolioDataset],
+        on_pair: Callable[[str, bool], None] | None = None,
+    ) -> ComparisonResult:
+        reports: list[ComparisonReport] = []
+        for baseline in baselines:
+            detail = f"{target.label} vs {baseline.label}"
+            _notify_operation(on_pair, detail, started=True)
+            reports.append(self._analyze_pair(target, baseline))
+            _notify_operation(on_pair, detail, started=False)
         combined = _combined_baseline(baselines) if len(baselines) > 1 else None
         if combined is not None:
+            detail = f"{target.label} vs {combined.label}"
+            _notify_operation(on_pair, detail, started=True)
             reports.append(self._analyze_pair(target, combined))
+            _notify_operation(on_pair, detail, started=False)
         return ComparisonResult(target=target, baselines=baselines, combined_baseline=combined, reports=reports)
 
     def _analyze_pair(self, target: PortfolioDataset, baseline: PortfolioDataset) -> ComparisonReport:
@@ -169,6 +182,7 @@ def load_or_build_portfolio(
     recursive: bool,
     refresh_classification: bool,
     classification_filename: str = "patent_classification.xlsx",
+    on_summary: Callable[[Path, bool], None] | None = None,
 ) -> PortfolioDataset:
     root = Path(root)
     portfolio_label = label or root.name or str(root)
@@ -185,7 +199,7 @@ def load_or_build_portfolio(
     if client is None or taxonomy is None:
         raise ValueError("client and taxonomy are required when classification workbook is missing or refreshed")
 
-    rows = _classify_markdown_summaries(root, client, taxonomy, recursive, refresh_classification)
+    rows = _classify_markdown_summaries(root, client, taxonomy, recursive, refresh_classification, on_summary)
     write_classification_workbook(rows, classification_path)
     return PortfolioDataset(
         label=portfolio_label,
@@ -250,18 +264,25 @@ def _classify_markdown_summaries(
     taxonomy: Taxonomy,
     recursive: bool,
     refresh_classification: bool,
+    on_summary: Callable[[Path, bool], None] | None = None,
 ) -> list[ClassificationExportRow]:
     checkpoint = CheckpointStore(root / ".patent_summary_logs" / "markdown_classifications.jsonl")
     successes = {} if refresh_classification else checkpoint.load_successes()
     rows: list[ClassificationExportRow] = []
     for summary_path in _discover_markdown_summaries(root, recursive):
+        if on_summary is not None:
+            on_summary(summary_path, True)
         key = str(summary_path)
         if key in successes:
             rows.append(successes[key])
+            if on_summary is not None:
+                on_summary(summary_path, False)
             continue
         row = _classify_markdown_summary(summary_path, client, taxonomy)
         checkpoint.record_success(row)
         rows.append(row)
+        if on_summary is not None:
+            on_summary(summary_path, False)
     return rows
 
 
@@ -296,6 +317,11 @@ def _classify_markdown_summary(summary_path: Path, client: ChatClient, taxonomy:
         sections=sections,
         metadata=metadata,
     )
+
+
+def _notify_operation(callback: Callable[[str, bool], None] | None, detail: str, started: bool) -> None:
+    if callback is not None:
+        callback(detail, started)
 
 
 def _label_stats(records: Iterable[TrendPatentRecord]) -> dict[tuple[str, str], _LabelStats]:

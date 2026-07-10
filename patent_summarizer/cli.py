@@ -13,27 +13,28 @@ from .excel_export import write_classification_workbook
 from .llm import RateLimitedOpenAIClient
 from .logging_utils import RunLogger
 from .processor import PatentProcessor, ProcessingResult
+from .progress import ProgressCallback, ProgressTracker
 from .report_analysis import PatentLayoutReport, ReportCheckpointingClient, ReportSynthesisAnalyzer, combine_portfolios
 from .report_docx import write_patent_layout_report
 from .summarizer import PatentSummarizer
 from .taxonomy import load_taxonomy
-from .trend_analysis import TrendAnalyzer, TrendCheckpointStore, build_trend_groups, load_classification_workbook
+from .trend_analysis import TrendAnalyzer, TrendCheckpointStore, build_trend_groups, load_classification_workbook, trend_work_units
 from .trend_excel_export import write_trend_workbook
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, progress: ProgressCallback | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.command == "run":
-        return run(args)
+        return run(args, progress=progress)
     if args.command == "classify":
-        return classify(args)
+        return classify(args, progress=progress)
     if args.command == "analyze":
-        return analyze(args)
+        return analyze(args, progress=progress)
     if args.command == "compare":
-        return compare(args)
+        return compare(args, progress=progress)
     if args.command == "report":
-        return report(args)
+        return report(args, progress=progress)
     parser.print_help()
     return 2
 
@@ -115,7 +116,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def report(args: argparse.Namespace) -> int:
+def report(args: argparse.Namespace, progress: ProgressCallback | None = None) -> int:
     target_root = args.target.resolve()
     target_label = args.target_label or target_root.name or "目标企业"
     baseline_specs = [_parse_baseline_spec(value) for value in args.baseline]
@@ -155,6 +156,9 @@ def report(args: argparse.Namespace) -> int:
         print(f"REPORT\ttarget={target_label}\tcompetitors={len(baseline_specs)}\tbatch_size={args.batch_size}")
         return 0
 
+    tracker = ProgressTracker("report", progress)
+    tracker.preparing("正在准备报告", "正在检查分类结果")
+
     try:
         taxonomy = load_taxonomy(args.classes)
         config = load_config(env_path=args.env_file, api_rpm=args.api_rpm)
@@ -172,6 +176,17 @@ def report(args: argparse.Namespace) -> int:
     log_dir = args.output.parent / ".patent_summary_logs"
     client = ReportCheckpointingClient(base_client, log_dir / f"{args.output.stem}.report.jsonl")
 
+    classification_total = _portfolio_classification_units(portfolio_specs, args.recursive, args.refresh_classification)
+    classified = 0
+
+    def on_summary(summary_path: Path, started: bool) -> None:
+        nonlocal classified
+        if started:
+            tracker.preparing("正在准备报告", f"正在分类：{classified} / {classification_total}")
+        else:
+            classified += 1
+            tracker.preparing("正在准备报告", f"正在分类：{classified} / {classification_total}")
+
     try:
         target = load_or_build_portfolio(
             target_root,
@@ -180,6 +195,7 @@ def report(args: argparse.Namespace) -> int:
             taxonomy=taxonomy,
             recursive=args.recursive,
             refresh_classification=args.refresh_classification,
+            on_summary=on_summary,
         )
         print(f"PORTFOLIO\t{target.label}\tpatents={len(target.records)}\tclassification={target.classification_source}")
         baselines = []
@@ -191,6 +207,7 @@ def report(args: argparse.Namespace) -> int:
                 taxonomy=taxonomy,
                 recursive=args.recursive,
                 refresh_classification=args.refresh_classification,
+                on_summary=on_summary,
             )
             baselines.append(portfolio)
             print(f"PORTFOLIO\t{portfolio.label}\tpatents={len(portfolio.records)}\tclassification={portfolio.classification_source}")
@@ -198,19 +215,69 @@ def report(args: argparse.Namespace) -> int:
         industry = combine_portfolios("全部样本", [target, *baselines])
         trend_analyzer = TrendAnalyzer(client, batch_size=args.batch_size)
         trends = {}
-        for index, portfolio in enumerate([target, *baselines, industry], start=1):
-            checkpoint = TrendCheckpointStore(log_dir / f"{args.output.stem}.trend-{index}.jsonl")
-            trends[portfolio.label] = trend_analyzer.analyze(portfolio.records, checkpoint=checkpoint)
+        portfolios = [target, *baselines, industry]
+        checkpoints = [TrendCheckpointStore(log_dir / f"{args.output.stem}.trend-{index}.jsonl") for index in range(1, len(portfolios) + 1)]
+        trend_units = sum(
+            trend_work_units(portfolio.records, args.batch_size, checkpoint)
+            for portfolio, checkpoint in zip(portfolios, checkpoints)
+        )
+        comparison_units = len(baselines) + (1 if len(baselines) > 1 else 0)
+        tracker.start(
+            trend_units + comparison_units + 3 + 1,
+            "正在分析趋势",
+            f"0 / {trend_units} 个趋势分析单元",
+        )
+
+        def on_trend_operation(detail: str, started: bool) -> None:
+            if started:
+                tracker.set_stage("正在分析趋势", detail)
+            else:
+                tracker.advance("正在分析趋势", detail)
+
+        for portfolio, checkpoint in zip(portfolios, checkpoints):
+            if progress is None:
+                trends[portfolio.label] = trend_analyzer.analyze(portfolio.records, checkpoint=checkpoint)
+            else:
+                trends[portfolio.label] = trend_analyzer.analyze(
+                    portfolio.records,
+                    checkpoint=checkpoint,
+                    on_operation=on_trend_operation,
+                )
             print(f"TREND\t{portfolio.label}\tgroups={len(trends[portfolio.label].reports)}")
 
-        comparison = ComparisonAnalyzer(client).analyze(target, baselines)
+        def on_pair(detail: str, started: bool) -> None:
+            if started:
+                tracker.set_stage("正在进行组合对比", detail)
+            else:
+                tracker.advance("正在进行组合对比", detail)
+
+        if progress is None:
+            comparison = ComparisonAnalyzer(client).analyze(target, baselines)
+        else:
+            comparison = ComparisonAnalyzer(client).analyze(target, baselines, on_pair=on_pair)
         print(f"COMPARE\treports={len(comparison.reports)}")
-        competitor_analysis, target_analysis, executive_summary = ReportSynthesisAnalyzer(client).analyze(
-            target,
-            baselines,
-            trends,
-            comparison,
-        )
+
+        def on_report_stage(detail: str, started: bool) -> None:
+            if started:
+                tracker.set_stage("正在生成报告", detail)
+            else:
+                tracker.advance("正在生成报告", detail)
+
+        if progress is None:
+            competitor_analysis, target_analysis, executive_summary = ReportSynthesisAnalyzer(client).analyze(
+                target,
+                baselines,
+                trends,
+                comparison,
+            )
+        else:
+            competitor_analysis, target_analysis, executive_summary = ReportSynthesisAnalyzer(client).analyze(
+                target,
+                baselines,
+                trends,
+                comparison,
+                on_stage=on_report_stage,
+            )
         layout_report = PatentLayoutReport(
             target=target,
             baselines=baselines,
@@ -222,12 +289,15 @@ def report(args: argparse.Namespace) -> int:
             executive_summary=executive_summary,
             taxonomy=[(item.first_level, item.second_level) for item in taxonomy.items],
         )
+        tracker.set_stage("正在写入报告", "正在生成 DOCX 文件")
         write_patent_layout_report(
             layout_report,
             args.template,
             args.output,
             overwrite=args.overwrite,
         )
+        tracker.advance("正在写入报告", "报告已写入 DOCX")
+        tracker.succeed("报告生成完成", f"已生成 {args.output.name}")
     except (RuntimeError, FileNotFoundError, NotADirectoryError, ValueError, FileExistsError) as exc:
         print(f"Report error: {exc}")
         return 1
@@ -239,7 +309,7 @@ def report(args: argparse.Namespace) -> int:
     return 0
 
 
-def run(args: argparse.Namespace) -> int:
+def run(args: argparse.Namespace, progress: ProgressCallback | None = None) -> int:
     input_root = args.input.resolve()
     try:
         items = list(
@@ -263,6 +333,9 @@ def run(args: argparse.Namespace) -> int:
         print(f"Pending files: {len(items)}")
         print(f"Minimum API requests: {len(items)}")
         return 0
+
+    tracker = ProgressTracker("summarize", progress)
+    tracker.start(len(items), "正在总结专利", f"0 / {len(items)}")
 
     try:
         config = load_config(env_path=args.env_file, api_rpm=args.api_rpm)
@@ -301,12 +374,17 @@ def run(args: argparse.Namespace) -> int:
             failed += 1
             logger.failure(item.source, exc.__class__.__name__, str(exc))
             print(f"FAIL\t{item.source}\t{exc}")
+        finally:
+            tracker.advance("正在总结专利", f"{success + failed} / {len(items)}")
 
     print(f"Done. success={success}, failed={failed}, pending={len(items)}")
-    return 0 if failed == 0 else 1
+    exit_code = 0 if failed == 0 else 1
+    if exit_code == 0:
+        tracker.succeed("批量总结完成", f"已完成 {success} 篇")
+    return exit_code
 
 
-def classify(args: argparse.Namespace) -> int:
+def classify(args: argparse.Namespace, progress: ProgressCallback | None = None) -> int:
     input_root = args.input.resolve()
     try:
         items = list(
@@ -328,6 +406,9 @@ def classify(args: argparse.Namespace) -> int:
             print(f"CLASSIFY\t{item.source}\t(summary: {item.output})")
         print(f"Files: {len(items)}")
         return 0
+
+    tracker = ProgressTracker("classify", progress)
+    tracker.start(len(items) + 1, "正在分类专利", f"0 / {len(items)}")
 
     try:
         taxonomy = load_taxonomy(args.classes)
@@ -360,6 +441,7 @@ def classify(args: argparse.Namespace) -> int:
         if key in successes:
             rows.append(successes[key])
             print(f"SKIP\t{item.source}")
+            tracker.advance("正在分类专利", f"{len(rows) + failed} / {len(items)}")
             continue
         try:
             row = pipeline.process(item.source, item.output)
@@ -370,13 +452,23 @@ def classify(args: argparse.Namespace) -> int:
             failed += 1
             checkpoint.record_failure(item.source, exc.__class__.__name__, str(exc))
             print(f"FAIL\t{item.source}\t{exc}")
+        finally:
+            if key not in successes:
+                tracker.advance("正在分类专利", f"{len(rows) + failed} / {len(items)}")
 
+    tracker.set_stage("正在写入分类结果", "正在生成 Excel 文件")
     write_classification_workbook(rows, args.output)
+    tracker.advance("正在写入分类结果", "分类结果已写入 Excel")
     print(f"Done. rows={len(rows)}, failed={failed}, output={args.output}")
-    return 0 if failed == 0 else 1
+    exit_code = 0 if failed == 0 else 1
+    if exit_code == 0:
+        tracker.succeed("分类完成", f"已分类 {len(rows)} 篇")
+    return exit_code
 
 
-def analyze(args: argparse.Namespace) -> int:
+def analyze(args: argparse.Namespace, progress: ProgressCallback | None = None) -> int:
+    tracker = ProgressTracker("analyze", progress)
+    tracker.preparing("正在准备趋势分析", "正在读取分类结果")
     try:
         records = load_classification_workbook(args.classification)
     except (RuntimeError, FileNotFoundError) as exc:
@@ -405,13 +497,28 @@ def analyze(args: argparse.Namespace) -> int:
     )
     analyzer = TrendAnalyzer(client, batch_size=args.batch_size)
     checkpoint = TrendCheckpointStore(args.output.parent / ".patent_summary_logs" / f"{args.output.stem}.jsonl")
-    result = analyzer.analyze(records, checkpoint=checkpoint)
+    model_units = trend_work_units(records, args.batch_size, checkpoint)
+    tracker.start(model_units + 1, "正在分析趋势", f"0 / {model_units} 个分析单元")
+
+    def on_trend_operation(detail: str, started: bool) -> None:
+        if started:
+            tracker.set_stage("正在分析趋势", detail)
+        else:
+            tracker.advance("正在分析趋势", detail)
+
+    if progress is None:
+        result = analyzer.analyze(records, checkpoint=checkpoint)
+    else:
+        result = analyzer.analyze(records, checkpoint=checkpoint, on_operation=on_trend_operation)
+    tracker.set_stage("正在写入趋势结果", "正在生成 Excel 文件")
     write_trend_workbook(result, args.output)
+    tracker.advance("正在写入趋势结果", "趋势结果已写入 Excel")
+    tracker.succeed("趋势分析完成", f"已分析 {len(result.reports)} 个标签")
     print(f"Done. trend_groups={len(result.reports)}, patents={len(records)}, output={args.output}")
     return 0
 
 
-def compare(args: argparse.Namespace) -> int:
+def compare(args: argparse.Namespace, progress: ProgressCallback | None = None) -> int:
     target_root = args.target.resolve()
     baseline_specs = [_parse_baseline_spec(value) for value in args.baseline]
     target_label = args.target_label or target_root.name or "A"
@@ -438,6 +545,9 @@ def compare(args: argparse.Namespace) -> int:
             print(f"COMPARE\t{target_label}\tvs\t外部总体")
         return 0
 
+    tracker = ProgressTracker("compare", progress)
+    tracker.preparing("正在准备对比组合", "正在检查分类结果")
+
     needs_taxonomy = args.refresh_classification or any(
         not (root / "patent_classification.xlsx").exists()
         for _label, root in portfolio_specs
@@ -461,6 +571,17 @@ def compare(args: argparse.Namespace) -> int:
         max_retries=config.max_retries,
     )
 
+    classification_total = _portfolio_classification_units(portfolio_specs, args.recursive, args.refresh_classification)
+    classified = 0
+
+    def on_summary(summary_path: Path, started: bool) -> None:
+        nonlocal classified
+        if started:
+            tracker.preparing("正在准备对比组合", f"正在分类：{classified} / {classification_total}")
+        else:
+            classified += 1
+            tracker.preparing("正在准备对比组合", f"正在分类：{classified} / {classification_total}")
+
     try:
         target = load_or_build_portfolio(
             target_root,
@@ -469,25 +590,42 @@ def compare(args: argparse.Namespace) -> int:
             taxonomy=taxonomy,
             recursive=args.recursive,
             refresh_classification=args.refresh_classification,
+            on_summary=on_summary,
         )
-        baselines = [
-            load_or_build_portfolio(
+        baselines = []
+        for label, root in baseline_specs:
+            baselines.append(load_or_build_portfolio(
                 root,
                 label=label,
                 client=client,
                 taxonomy=taxonomy,
                 recursive=args.recursive,
                 refresh_classification=args.refresh_classification,
+                on_summary=on_summary,
             )
-            for label, root in baseline_specs
-        ]
+            )
     except (RuntimeError, FileNotFoundError, NotADirectoryError, ValueError) as exc:
         print(f"Input error: {exc}")
         return 2
 
+    comparison_units = len(baselines) + (1 if len(baselines) > 1 else 0)
+    tracker.start(comparison_units + 1, "正在进行组合对比", f"0 / {comparison_units} 个对比对象")
+
+    def on_pair(detail: str, started: bool) -> None:
+        if started:
+            tracker.set_stage("正在进行组合对比", detail)
+        else:
+            tracker.advance("正在进行组合对比", detail)
+
     analyzer = ComparisonAnalyzer(client)
-    result = analyzer.analyze(target, baselines)
+    if progress is None:
+        result = analyzer.analyze(target, baselines)
+    else:
+        result = analyzer.analyze(target, baselines, on_pair=on_pair)
+    tracker.set_stage("正在写入对比结果", "正在生成 Excel 文件")
     write_comparison_workbook(result, args.output)
+    tracker.advance("正在写入对比结果", "对比结果已写入 Excel")
+    tracker.succeed("组合对比完成", f"已生成 {len(result.reports)} 份对比结果")
     print(
         f"Done. comparisons={len(result.reports)}, "
         f"target_patents={len(target.records)}, "
@@ -549,3 +687,20 @@ def _portfolio_dry_run_status(root: Path, recursive: bool, refresh_classificatio
     paths = root.rglob("*.md") if recursive else root.glob("*.md")
     count = sum(1 for path in paths if ".patent_summary_logs" not in path.parts)
     return "needs-md-classification", count
+
+
+def _portfolio_classification_units(
+    portfolio_specs: list[tuple[str, Path]],
+    recursive: bool,
+    refresh_classification: bool,
+) -> int:
+    """Count summaries that must be visited before portfolio work can be planned."""
+
+    total = 0
+    for _label, root in portfolio_specs:
+        classification = root / "patent_classification.xlsx"
+        if classification.exists() and not refresh_classification:
+            continue
+        paths = root.rglob("*.md") if recursive else root.glob("*.md")
+        total += sum(1 for path in paths if ".patent_summary_logs" not in path.parts)
+    return total

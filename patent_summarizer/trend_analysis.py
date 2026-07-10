@@ -5,7 +5,7 @@ import re
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Protocol
+from typing import Any, Callable, Iterable, Mapping, Protocol
 
 from .markdown_summary import SUMMARY_SECTION_NAMES
 from .metadata import BIBLIOGRAPHIC_FIELD_NAMES, infer_patent_year, parse_bibliographic_metadata
@@ -94,6 +94,7 @@ class TrendAnalyzer:
         self,
         records: Iterable[TrendPatentRecord],
         checkpoint: TrendCheckpointStore | None = None,
+        on_operation: Callable[[str, bool], None] | None = None,
     ) -> TrendAnalysisResult:
         all_records = list(records)
         cached = checkpoint.load_successes() if checkpoint else {}
@@ -103,23 +104,43 @@ class TrendAnalyzer:
             if key in cached:
                 reports.append(cached[key])
                 continue
-            report = self._analyze_group(stats, group_records)
+            report = self._analyze_group(stats, group_records, on_operation)
             if checkpoint:
                 checkpoint.record_success(report)
             reports.append(report)
         return TrendAnalysisResult(reports=reports, records=all_records)
 
-    def _analyze_group(self, stats: TrendGroupStats, records: list[TrendPatentRecord]) -> TrendReport:
+    def _analyze_group(
+        self,
+        stats: TrendGroupStats,
+        records: list[TrendPatentRecord],
+        on_operation: Callable[[str, bool], None] | None,
+    ) -> TrendReport:
         if len(records) <= self.batch_size:
-            return self._call_trend_model(stats, records, scope="完整标签")
+            return self._call_trend_model(stats, records, scope="完整标签", on_operation=on_operation)
 
         batch_reports: list[TrendReport] = []
         for start in range(0, len(records), self.batch_size):
             chunk = records[start : start + self.batch_size]
-            batch_reports.append(self._call_trend_model(stats, chunk, scope=f"批次 {start // self.batch_size + 1}"))
-        return self._merge_batch_reports(stats, batch_reports)
+            batch_reports.append(
+                self._call_trend_model(
+                    stats,
+                    chunk,
+                    scope=f"批次 {start // self.batch_size + 1}",
+                    on_operation=on_operation,
+                )
+            )
+        return self._merge_batch_reports(stats, batch_reports, on_operation)
 
-    def _call_trend_model(self, stats: TrendGroupStats, records: list[TrendPatentRecord], scope: str) -> TrendReport:
+    def _call_trend_model(
+        self,
+        stats: TrendGroupStats,
+        records: list[TrendPatentRecord],
+        scope: str,
+        on_operation: Callable[[str, bool], None] | None,
+    ) -> TrendReport:
+        detail = f"{stats.first_level} / {stats.second_level}（{scope}）"
+        _notify_operation(on_operation, detail, started=True)
         response = self.client.chat(
             TREND_SYSTEM_PROMPT,
             TREND_ANALYSIS_PROMPT.format(
@@ -130,9 +151,18 @@ class TrendAnalyzer:
                 patents=_patent_digest(records),
             ),
         )
-        return _report_from_payload(stats, parse_trend_response(response))
+        report = _report_from_payload(stats, parse_trend_response(response))
+        _notify_operation(on_operation, detail, started=False)
+        return report
 
-    def _merge_batch_reports(self, stats: TrendGroupStats, batch_reports: list[TrendReport]) -> TrendReport:
+    def _merge_batch_reports(
+        self,
+        stats: TrendGroupStats,
+        batch_reports: list[TrendReport],
+        on_operation: Callable[[str, bool], None] | None,
+    ) -> TrendReport:
+        detail = f"{stats.first_level} / {stats.second_level}（合并批次）"
+        _notify_operation(on_operation, detail, started=True)
         response = self.client.chat(
             TREND_SYSTEM_PROMPT,
             TREND_MERGE_PROMPT.format(
@@ -142,7 +172,9 @@ class TrendAnalyzer:
                 batch_reports=json.dumps([_report_payload(report) for report in batch_reports], ensure_ascii=False, indent=2),
             ),
         )
-        return _report_from_payload(stats, parse_trend_response(response))
+        report = _report_from_payload(stats, parse_trend_response(response))
+        _notify_operation(on_operation, detail, started=False)
+        return report
 
 
 class TrendCheckpointStore:
@@ -171,6 +203,30 @@ class TrendCheckpointStore:
         payload = {"status": "success", "key": report.key, "report": asdict(report)}
         with self.path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+def trend_work_units(
+    records: Iterable[TrendPatentRecord],
+    batch_size: int,
+    checkpoint: TrendCheckpointStore | None = None,
+) -> int:
+    """Return the exact number of uncached trend-model operations still required."""
+
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    cached = checkpoint.load_successes() if checkpoint else {}
+    units = 0
+    for stats, group_records in build_trend_groups(records):
+        if trend_key(stats.first_level, stats.second_level) in cached:
+            continue
+        batch_count = (len(group_records) + batch_size - 1) // batch_size
+        units += batch_count if batch_count == 1 else batch_count + 1
+    return units
+
+
+def _notify_operation(callback: Callable[[str, bool], None] | None, detail: str, started: bool) -> None:
+    if callback is not None:
+        callback(detail, started)
 
 
 def load_classification_workbook(path: Path) -> list[TrendPatentRecord]:
