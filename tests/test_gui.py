@@ -181,7 +181,7 @@ class GuiCommandTests(unittest.TestCase):
         self.assertNotEqual(unselected["text_color"], unselected["fg_color"])
 
     def test_progress_display_uses_running_success_and_error_colors(self):
-        running = ProgressUpdate("summarize", "running", "正在总结专利", "2 / 4", 2, 4)
+        running = ProgressUpdate("summarize", "running", "正在总结专利", "", 2, 4)
         success = ProgressUpdate("summarize", "success", "批量总结完成", "已完成 4 篇", 4, 4)
         error = ProgressUpdate("summarize", "error", "运行异常结束", "退出码 1", 2, 4)
 
@@ -189,7 +189,7 @@ class GuiCommandTests(unittest.TestCase):
         success_detail, success_value, success_color = progress_display(success)
         error_detail, error_value, error_color = progress_display(error)
 
-        self.assertIn("2 / 4（50%）", running_detail)
+        self.assertEqual(running_detail, "2 / 4（50%）")
         self.assertEqual(running_value, 0.5)
         self.assertEqual(running_color, DESKTOP_EDITORIAL_PALETTE["primary"])
         self.assertEqual(success_value, 1.0)

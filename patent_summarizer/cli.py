@@ -225,7 +225,7 @@ def report(args: argparse.Namespace, progress: ProgressCallback | None = None) -
         tracker.start(
             trend_units + comparison_units + 3 + 1,
             "正在分析趋势",
-            f"0 / {trend_units} 个趋势分析单元",
+            "已完成准备，开始分析",
         )
 
         def on_trend_operation(detail: str, started: bool) -> None:
@@ -297,7 +297,7 @@ def report(args: argparse.Namespace, progress: ProgressCallback | None = None) -
             overwrite=args.overwrite,
         )
         tracker.advance("正在写入报告", "报告已写入 DOCX")
-        tracker.succeed("报告生成完成", f"已生成 {args.output.name}")
+        tracker.succeed("报告生成完成", "结果已保存")
     except (RuntimeError, FileNotFoundError, NotADirectoryError, ValueError, FileExistsError) as exc:
         print(f"Report error: {exc}")
         return 1
@@ -335,7 +335,7 @@ def run(args: argparse.Namespace, progress: ProgressCallback | None = None) -> i
         return 0
 
     tracker = ProgressTracker("summarize", progress)
-    tracker.start(len(items), "正在总结专利", f"0 / {len(items)}")
+    tracker.start(len(items), "正在总结专利")
 
     try:
         config = load_config(env_path=args.env_file, api_rpm=args.api_rpm)
@@ -375,12 +375,12 @@ def run(args: argparse.Namespace, progress: ProgressCallback | None = None) -> i
             logger.failure(item.source, exc.__class__.__name__, str(exc))
             print(f"FAIL\t{item.source}\t{exc}")
         finally:
-            tracker.advance("正在总结专利", f"{success + failed} / {len(items)}")
+            tracker.advance("正在总结专利")
 
     print(f"Done. success={success}, failed={failed}, pending={len(items)}")
     exit_code = 0 if failed == 0 else 1
     if exit_code == 0:
-        tracker.succeed("批量总结完成", f"已完成 {success} 篇")
+        tracker.succeed("批量总结完成", "结果已保存")
     return exit_code
 
 
@@ -408,7 +408,7 @@ def classify(args: argparse.Namespace, progress: ProgressCallback | None = None)
         return 0
 
     tracker = ProgressTracker("classify", progress)
-    tracker.start(len(items) + 1, "正在分类专利", f"0 / {len(items)}")
+    tracker.start(len(items) + 1, "正在分类专利")
 
     try:
         taxonomy = load_taxonomy(args.classes)
@@ -441,7 +441,7 @@ def classify(args: argparse.Namespace, progress: ProgressCallback | None = None)
         if key in successes:
             rows.append(successes[key])
             print(f"SKIP\t{item.source}")
-            tracker.advance("正在分类专利", f"{len(rows) + failed} / {len(items)}")
+            tracker.advance("正在分类专利")
             continue
         try:
             row = pipeline.process(item.source, item.output)
@@ -454,7 +454,7 @@ def classify(args: argparse.Namespace, progress: ProgressCallback | None = None)
             print(f"FAIL\t{item.source}\t{exc}")
         finally:
             if key not in successes:
-                tracker.advance("正在分类专利", f"{len(rows) + failed} / {len(items)}")
+                tracker.advance("正在分类专利")
 
     tracker.set_stage("正在写入分类结果", "正在生成 Excel 文件")
     write_classification_workbook(rows, args.output)
@@ -462,7 +462,7 @@ def classify(args: argparse.Namespace, progress: ProgressCallback | None = None)
     print(f"Done. rows={len(rows)}, failed={failed}, output={args.output}")
     exit_code = 0 if failed == 0 else 1
     if exit_code == 0:
-        tracker.succeed("分类完成", f"已分类 {len(rows)} 篇")
+        tracker.succeed("分类完成", "结果已保存")
     return exit_code
 
 
@@ -498,7 +498,7 @@ def analyze(args: argparse.Namespace, progress: ProgressCallback | None = None) 
     analyzer = TrendAnalyzer(client, batch_size=args.batch_size)
     checkpoint = TrendCheckpointStore(args.output.parent / ".patent_summary_logs" / f"{args.output.stem}.jsonl")
     model_units = trend_work_units(records, args.batch_size, checkpoint)
-    tracker.start(model_units + 1, "正在分析趋势", f"0 / {model_units} 个分析单元")
+    tracker.start(model_units + 1, "正在分析趋势", "已完成准备，开始分析")
 
     def on_trend_operation(detail: str, started: bool) -> None:
         if started:
@@ -513,7 +513,7 @@ def analyze(args: argparse.Namespace, progress: ProgressCallback | None = None) 
     tracker.set_stage("正在写入趋势结果", "正在生成 Excel 文件")
     write_trend_workbook(result, args.output)
     tracker.advance("正在写入趋势结果", "趋势结果已写入 Excel")
-    tracker.succeed("趋势分析完成", f"已分析 {len(result.reports)} 个标签")
+    tracker.succeed("趋势分析完成", "结果已保存")
     print(f"Done. trend_groups={len(result.reports)}, patents={len(records)}, output={args.output}")
     return 0
 
@@ -609,7 +609,7 @@ def compare(args: argparse.Namespace, progress: ProgressCallback | None = None) 
         return 2
 
     comparison_units = len(baselines) + (1 if len(baselines) > 1 else 0)
-    tracker.start(comparison_units + 1, "正在进行组合对比", f"0 / {comparison_units} 个对比对象")
+    tracker.start(comparison_units + 1, "正在进行组合对比", "已完成准备，开始对比")
 
     def on_pair(detail: str, started: bool) -> None:
         if started:
@@ -625,7 +625,7 @@ def compare(args: argparse.Namespace, progress: ProgressCallback | None = None) 
     tracker.set_stage("正在写入对比结果", "正在生成 Excel 文件")
     write_comparison_workbook(result, args.output)
     tracker.advance("正在写入对比结果", "对比结果已写入 Excel")
-    tracker.succeed("组合对比完成", f"已生成 {len(result.reports)} 份对比结果")
+    tracker.succeed("组合对比完成", "结果已保存")
     print(
         f"Done. comparisons={len(result.reports)}, "
         f"target_patents={len(target.records)}, "
