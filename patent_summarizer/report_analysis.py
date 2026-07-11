@@ -111,6 +111,8 @@ class PatentLayoutReport:
     target_analysis: TargetAnalysis
     executive_summary: ExecutiveSummary
     taxonomy: list[tuple[str, str]]
+    domain: str = ""
+    domain_context: str = ""
 
 
 class ReportCheckpointingClient:
@@ -156,13 +158,20 @@ class ReportSynthesisAnalyzer:
         baselines: list[PortfolioDataset],
         trends: dict[str, TrendAnalysisResult],
         comparison: ComparisonResult,
+        domain: str = "未指定领域",
+        domain_context: str = "未提供",
         on_stage: Callable[[str, bool], None] | None = None,
     ) -> tuple[CompetitorAnalysis, TargetAnalysis, ExecutiveSummary]:
-        evidence = _report_evidence_payload(target, baselines, trends, comparison)
+        evidence = _report_evidence_payload(target, baselines, trends, comparison, domain, domain_context)
+        system_prompt = REPORT_SYSTEM_PROMPT.format(
+            domain=domain,
+            domain_context=domain_context or "未提供",
+            target_label=target.label,
+        )
         _notify_stage(on_stage, "竞争对手布局策略", started=True)
         competitor = parse_competitor_analysis(
             self.client.chat(
-                REPORT_SYSTEM_PROMPT,
+                system_prompt,
                 REPORT_COMPETITOR_PROMPT.format(evidence=json.dumps(evidence, ensure_ascii=False, indent=2)),
             )
         )
@@ -170,7 +179,7 @@ class ReportSynthesisAnalyzer:
         _notify_stage(on_stage, f"{target.label}布局建议", started=True)
         target_analysis = parse_target_analysis(
             self.client.chat(
-                REPORT_SYSTEM_PROMPT,
+                system_prompt,
                 REPORT_TARGET_PROMPT.format(evidence=json.dumps(evidence, ensure_ascii=False, indent=2)),
             )
         )
@@ -178,7 +187,7 @@ class ReportSynthesisAnalyzer:
         _notify_stage(on_stage, "管理层结论", started=True)
         executive = parse_executive_summary(
             self.client.chat(
-                REPORT_SYSTEM_PROMPT,
+                system_prompt,
                 REPORT_EXECUTIVE_PROMPT.format(
                     evidence=json.dumps(
                         {
@@ -228,10 +237,10 @@ def parse_competitor_analysis(response: str | Mapping[str, Any]) -> CompetitorAn
 
 def parse_target_analysis(response: str | Mapping[str, Any]) -> TargetAnalysis:
     payload = _mapping_payload(response)
-    _require_fields(payload, ["长安总体策略", "待布局建议点", "专利组合策略", "证据局限"])
+    _require_fields(payload, ["目标总体策略", "待布局建议点", "专利组合策略", "证据局限"])
     _reject_forbidden(payload)
     return TargetAnalysis(
-        strategies=[_parse_target_strategy(item) for item in _mapping_list(payload["长安总体策略"], "长安总体策略")],
+        strategies=[_parse_target_strategy(item) for item in _mapping_list(payload["目标总体策略"], "目标总体策略")],
         layout_points=[_parse_layout_point(item) for item in _mapping_list(payload["待布局建议点"], "待布局建议点")],
         portfolio_plans=[_parse_portfolio_plan(item) for item in _mapping_list(payload["专利组合策略"], "专利组合策略")],
         evidence_limits=_required_text(payload, "证据局限"),
@@ -289,7 +298,7 @@ def _parse_target_strategy(payload: Mapping[str, Any]) -> TargetStrategyItem:
 
 
 def _parse_layout_point(payload: Mapping[str, Any]) -> LayoutPoint:
-    fields = ["名称", "一级分类", "二级分类", "主要技术问题", "竞争对手布局", "长安现有布局及缺口", "优先级", "建议理由", "证据专利"]
+    fields = ["名称", "一级分类", "二级分类", "主要技术问题", "竞争对手布局", "目标现有布局及缺口", "优先级", "建议理由", "证据专利"]
     _require_fields(payload, fields)
     return LayoutPoint(
         _required_text(payload, "名称"),
@@ -297,7 +306,7 @@ def _parse_layout_point(payload: Mapping[str, Any]) -> LayoutPoint:
         _required_text(payload, "二级分类"),
         _required_text(payload, "主要技术问题"),
         _required_text(payload, "竞争对手布局"),
-        _required_text(payload, "长安现有布局及缺口"),
+        _required_text(payload, "目标现有布局及缺口"),
         _required_text(payload, "优先级"),
         _required_text(payload, "建议理由"),
         _text_list(payload["证据专利"], "证据专利"),
@@ -380,8 +389,12 @@ def _report_evidence_payload(
     baselines: list[PortfolioDataset],
     trends: dict[str, TrendAnalysisResult],
     comparison: ComparisonResult,
+    domain: str,
+    domain_context: str,
 ) -> dict[str, Any]:
     return {
+        "分析领域": domain,
+        "领域说明": domain_context or "未提供",
         "分析口径": "仅基于用户上传并完成摘要、分类的专利样本",
         "目标企业": _portfolio_digest(target),
         "竞争对手": [_portfolio_digest(item) for item in baselines],

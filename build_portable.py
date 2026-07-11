@@ -9,7 +9,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 DIST_APP = ROOT / "dist" / "PatentSummarizer"
 SPEC_FILE = ROOT / "PatentSummarizer.spec"
-REPORT_TEMPLATE_NAME = "汽车底盘领域专利布局分析报告模板.docx"
+REPORT_TEMPLATE_NAME = "专利领域专利布局分析报告模板.docx"
 APP_ICON_NAME = "patent-summarizer.ico"
 USER_GUIDE_NAME = "使用说明.md"
 

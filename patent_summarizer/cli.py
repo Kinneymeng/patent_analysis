@@ -102,9 +102,11 @@ def build_parser() -> argparse.ArgumentParser:
     report_parser.add_argument(
         "--template",
         type=Path,
-        default=Path("output/doc/汽车底盘领域专利布局分析报告模板.docx"),
+        default=Path("output/doc/专利领域专利布局分析报告模板.docx"),
         help="DOCX template used for cover and document styles",
     )
+    report_parser.add_argument("--domain", required=True, help="Analysis domain shown in the report")
+    report_parser.add_argument("--domain-context", default="", help="Optional domain scope or focus description")
     report_parser.add_argument("--output", required=True, type=Path, help="Output DOCX report")
     report_parser.add_argument("--recursive", action="store_true", help="Scan Markdown summaries recursively when classifying")
     report_parser.add_argument("--refresh-classification", action="store_true", help="Rebuild classification workbooks from Markdown summaries")
@@ -117,6 +119,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def report(args: argparse.Namespace, progress: ProgressCallback | None = None) -> int:
+    domain = args.domain.strip()
+    domain_context = args.domain_context.strip()
+    if not domain:
+        print("Input error: --domain must not be empty")
+        return 2
     target_root = args.target.resolve()
     target_label = args.target_label or target_root.name or "目标企业"
     baseline_specs = [_parse_baseline_spec(value) for value in args.baseline]
@@ -153,7 +160,7 @@ def report(args: argparse.Namespace, progress: ProgressCallback | None = None) -
             print(f"PORTFOLIO\t{label}\t{root}\tclassification={source}\titems={count}")
         print(f"TEMPLATE\t{args.template.resolve()}")
         print(f"OUTPUT\t{args.output.resolve()}")
-        print(f"REPORT\ttarget={target_label}\tcompetitors={len(baseline_specs)}\tbatch_size={args.batch_size}")
+        print(f"REPORT\tdomain={domain}\ttarget={target_label}\tcompetitors={len(baseline_specs)}\tbatch_size={args.batch_size}")
         return 0
 
     tracker = ProgressTracker("report", progress)
@@ -269,6 +276,8 @@ def report(args: argparse.Namespace, progress: ProgressCallback | None = None) -
                 baselines,
                 trends,
                 comparison,
+                domain=domain,
+                domain_context=domain_context,
             )
         else:
             competitor_analysis, target_analysis, executive_summary = ReportSynthesisAnalyzer(client).analyze(
@@ -276,6 +285,8 @@ def report(args: argparse.Namespace, progress: ProgressCallback | None = None) -
                 baselines,
                 trends,
                 comparison,
+                domain=domain,
+                domain_context=domain_context,
                 on_stage=on_report_stage,
             )
         layout_report = PatentLayoutReport(
@@ -288,6 +299,8 @@ def report(args: argparse.Namespace, progress: ProgressCallback | None = None) -
             target_analysis=target_analysis,
             executive_summary=executive_summary,
             taxonomy=[(item.first_level, item.second_level) for item in taxonomy.items],
+            domain=domain,
+            domain_context=domain_context,
         )
         tracker.set_stage("正在写入报告", "正在生成 DOCX 文件")
         write_patent_layout_report(

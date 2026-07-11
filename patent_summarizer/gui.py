@@ -30,9 +30,11 @@ MODE_LABELS = {
     MODE_COMPARE: "对比",
     MODE_REPORT: "报告",
 }
-REPORT_TEMPLATE_NAME = "汽车底盘领域专利布局分析报告模板.docx"
+REPORT_TEMPLATE_NAME = "专利领域专利布局分析报告模板.docx"
 APP_ICON_NAME = "patent-summarizer.ico"
 COPYRIGHT_TEXT = "© 2026 平台及模组开发部 · 线控底盘所 版权所有"
+REPORT_DOMAIN_EXAMPLE = "例如：汽车底盘域"
+REPORT_DOMAIN_CONTEXT_EXAMPLE = "例如：线控底盘与底盘域协同控制"
 
 
 @dataclass(frozen=True)
@@ -179,6 +181,8 @@ def build_portfolio_cli_argv(
     output: Path,
     app_dir: Path,
     overwrite: bool = False,
+    domain: str = "",
+    domain_context: str = "",
 ) -> list[str]:
     if mode not in {MODE_COMPARE, MODE_REPORT}:
         raise ValueError(f"Unknown portfolio mode: {mode}")
@@ -188,7 +192,14 @@ def build_portfolio_cli_argv(
         argv.extend(["--baseline", f"{baseline.label}={baseline.root}"])
     argv.extend(["--classes", str(Path(app_dir) / "class.xlsx")])
     if mode == MODE_REPORT:
-        argv.extend(["--template", str(Path(app_dir) / REPORT_TEMPLATE_NAME)])
+        if not domain.strip():
+            raise ValueError("Analysis domain is required for report generation")
+        argv.extend([
+            "--template", str(Path(app_dir) / REPORT_TEMPLATE_NAME),
+            "--domain", domain.strip(),
+        ])
+        if domain_context.strip():
+            argv.extend(["--domain-context", domain_context.strip()])
     argv.extend(["--output", str(Path(output)), "--recursive", "--env-file", str(Path(app_dir) / ".env")])
     if mode == MODE_REPORT and overwrite:
         argv.append("--overwrite")
@@ -202,6 +213,25 @@ def default_output_path(mode: str, target_root: Path, target_label: str) -> Path
     if mode == MODE_REPORT:
         return Path(target_root) / f"{safe_label}_专利布局分析报告.docx"
     raise ValueError(f"Unknown portfolio mode: {mode}")
+
+
+def report_scope_confirmation_message(
+    domain: str,
+    domain_context: str,
+    target: PortfolioInput,
+    baselines: list[PortfolioInput],
+) -> str:
+    competitors = "\n".join(f"- {item.label}: {item.root}" for item in baselines)
+    context_line = f"\n领域说明：{domain_context}" if domain_context else ""
+    return (
+        f"分析领域：{domain}{context_line}\n\n"
+        f"目标企业：{target.label}\n"
+        f"目录：{target.root}\n\n"
+        f"竞争对手：\n{competitors}\n\n"
+        "本报告仅基于上述目录中已完成摘要和分类的专利样本生成。"
+        "系统不会验证样本是否完全属于所填写领域，相关结论不代表完整行业事实。\n\n"
+        "确认按此范围生成报告吗？"
+    )
 
 
 class QueueWriter:
@@ -226,7 +256,9 @@ class PatentSummarizerApp(ctk.CTk):
 
         self.input_dir_var = ctk.StringVar()
         self.target_dir_var = ctk.StringVar()
-        self.target_label_var = ctk.StringVar()
+        self.target_label_var = ctk.StringVar(value="长安汽车")
+        self.report_domain_var = ctk.StringVar(value=REPORT_DOMAIN_EXAMPLE)
+        self.report_domain_context_var = ctk.StringVar(value=REPORT_DOMAIN_CONTEXT_EXAMPLE)
         self.output_file_var = ctk.StringVar()
         self.baselines: list[PortfolioDraft] = []
         self.output_customized = False
@@ -488,8 +520,31 @@ class PatentSummarizerApp(ctk.CTk):
                 secondary=True,
             ).grid(row=index, column=3, padx=(4, 8), pady=5)
 
+        output_row = 3
+        if self._selected_mode() == MODE_REPORT:
+            domain_section = ctk.CTkFrame(self.config_frame, fg_color="transparent")
+            domain_section.grid(row=3, column=0, sticky="ew", pady=(14, 0))
+            domain_section.grid_columnconfigure(0, weight=1)
+            domain_section.grid_columnconfigure(1, weight=1)
+            self._section_label(domain_section, "报告领域").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 7))
+            self._small_label(domain_section, "分析领域").grid(row=1, column=0, sticky="w")
+            self._small_label(domain_section, "领域说明（可选）").grid(row=1, column=1, sticky="w", padx=(10, 0))
+            domain_entry = self._example_entry(
+                domain_section,
+                self.report_domain_var,
+                REPORT_DOMAIN_EXAMPLE,
+            )
+            domain_entry.grid(row=2, column=0, sticky="ew", pady=(4, 0))
+            context_entry = self._example_entry(
+                domain_section,
+                self.report_domain_context_var,
+                REPORT_DOMAIN_CONTEXT_EXAMPLE,
+            )
+            context_entry.grid(row=2, column=1, sticky="ew", padx=(10, 0), pady=(4, 0))
+            output_row = 4
+
         output_section = ctk.CTkFrame(self.config_frame, fg_color="transparent")
-        output_section.grid(row=3, column=0, sticky="ew", pady=(14, 0))
+        output_section.grid(row=output_row, column=0, sticky="ew", pady=(14, 0))
         output_section.grid_columnconfigure(0, weight=1)
         title = "输出文件"
         if self._selected_mode() == MODE_REPORT:
@@ -663,8 +718,22 @@ class PatentSummarizerApp(ctk.CTk):
             overwrite = self._selected_mode() == MODE_REPORT
         target = PortfolioInput(self.target_label_var.get().strip(), self._target_root())
         baselines = [PortfolioInput(item.label_var.get().strip(), item.root) for item in self.baselines]
+        domain = self._report_domain_value()
+        domain_context = self._report_domain_context_value()
+        if self._selected_mode() == MODE_REPORT and not messagebox.askyesno(
+            "确认分析范围",
+            report_scope_confirmation_message(domain, domain_context, target, baselines),
+        ):
+            return
         argv = build_portfolio_cli_argv(
-            self._selected_mode(), target, baselines, output, app_dir, overwrite=overwrite
+            self._selected_mode(),
+            target,
+            baselines,
+            output,
+            app_dir,
+            overwrite=overwrite,
+            domain=domain,
+            domain_context=domain_context,
         )
         self._set_running(True)
         self._clear_log()
@@ -681,6 +750,8 @@ class PatentSummarizerApp(ctk.CTk):
         labels = [self.target_label_var.get().strip(), *[item.label_var.get().strip() for item in self.baselines]]
         if any(not label for label in labels):
             return "目标和对比组合名称不能为空。"
+        if self._selected_mode() == MODE_REPORT and not self._report_domain_value():
+            return "请填写报告的分析领域。"
         if len(labels) != len(set(labels)):
             return "目标和对比组合名称不能重复。"
         for item_root in [root, *[item.root for item in self.baselines]]:
@@ -827,10 +898,18 @@ class PatentSummarizerApp(ctk.CTk):
         self.progress_bar.configure(mode="determinate", progress_color=color)
         self.progress_bar.set(value)
 
-    def _entry(self, parent, variable: ctk.StringVar, width: int | None = None) -> ctk.CTkEntry:
+    def _entry(
+        self,
+        parent,
+        variable: ctk.StringVar,
+        width: int | None = None,
+        placeholder_text: str = "",
+    ) -> ctk.CTkEntry:
         return ctk.CTkEntry(
             parent,
             textvariable=variable,
+            placeholder_text=placeholder_text,
+            placeholder_text_color=DESKTOP_EDITORIAL_PALETTE["muted_soft"],
             width=width or 120,
             height=38,
             corner_radius=10,
@@ -839,6 +918,41 @@ class PatentSummarizerApp(ctk.CTk):
             text_color=DESKTOP_EDITORIAL_PALETTE["ink"],
             font=ctk.CTkFont(family="Microsoft YaHei UI", size=12),
         )
+
+    def _example_entry(self, parent, variable: ctk.StringVar, example: str) -> ctk.CTkEntry:
+        entry = self._entry(parent, variable)
+
+        def on_focus_in(_event) -> None:
+            if variable.get() == example:
+                variable.set("")
+            entry.configure(text_color=DESKTOP_EDITORIAL_PALETTE["ink"])
+
+        def on_focus_out(_event) -> None:
+            if not variable.get().strip():
+                variable.set(example)
+                entry.configure(text_color=DESKTOP_EDITORIAL_PALETTE["muted_soft"])
+            else:
+                entry.configure(text_color=DESKTOP_EDITORIAL_PALETTE["ink"])
+            self._refresh_start_state()
+
+        entry.configure(
+            text_color=(
+                DESKTOP_EDITORIAL_PALETTE["muted_soft"]
+                if variable.get() == example
+                else DESKTOP_EDITORIAL_PALETTE["ink"]
+            )
+        )
+        entry.bind("<FocusIn>", on_focus_in)
+        entry.bind("<FocusOut>", on_focus_out)
+        return entry
+
+    def _report_domain_value(self) -> str:
+        value = self.report_domain_var.get().strip()
+        return "" if value == REPORT_DOMAIN_EXAMPLE else value
+
+    def _report_domain_context_value(self) -> str:
+        value = self.report_domain_context_var.get().strip()
+        return "" if value == REPORT_DOMAIN_CONTEXT_EXAMPLE else value
 
     def _button(self, parent, text: str, command, width: int, secondary: bool = False) -> ctk.CTkButton:
         color = DESKTOP_EDITORIAL_PALETTE["surface_card"] if secondary else DESKTOP_EDITORIAL_PALETTE["dark_elevated"]

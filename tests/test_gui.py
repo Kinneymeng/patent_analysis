@@ -24,6 +24,7 @@ from patent_summarizer.gui import (
     mode_from_label,
     mode_button_style,
     progress_display,
+    report_scope_confirmation_message,
 )
 from patent_summarizer.progress import ProgressUpdate
 
@@ -144,11 +145,41 @@ class GuiCommandTests(unittest.TestCase):
         baseline = PortfolioInput("理想汽车", Path("D:/patents/理想"))
         output = Path("D:/out/report.docx")
 
-        argv = build_portfolio_cli_argv(MODE_REPORT, target, [baseline], output, app_dir, overwrite=True)
+        argv = build_portfolio_cli_argv(
+            MODE_REPORT,
+            target,
+            [baseline],
+            output,
+            app_dir,
+            overwrite=True,
+            domain="工业机器人",
+            domain_context="协作机器人末端执行与运动控制",
+        )
 
         self.assertEqual(argv[0], "report")
-        self.assertIn(str(app_dir / "汽车底盘领域专利布局分析报告模板.docx"), argv)
+        self.assertIn(str(app_dir / "专利领域专利布局分析报告模板.docx"), argv)
+        self.assertIn("--domain", argv)
+        self.assertIn("工业机器人", argv)
+        self.assertIn("--domain-context", argv)
         self.assertIn("--overwrite", argv)
+
+    def test_report_command_requires_domain(self):
+        target = PortfolioInput("长安汽车", Path("D:/patents/长安"))
+        baseline = PortfolioInput("竞争对手", Path("D:/patents/竞争对手"))
+
+        with self.assertRaisesRegex(ValueError, "Analysis domain"):
+            build_portfolio_cli_argv(MODE_REPORT, target, [baseline], Path("D:/out/report.docx"), Path("D:/portable"))
+
+    def test_report_scope_confirmation_uses_actual_portfolios_and_sample_boundary(self):
+        target = PortfolioInput("长安汽车", Path("D:/patents/长安"))
+        baseline = PortfolioInput("竞争对手", Path("D:/patents/竞争对手"))
+
+        message = report_scope_confirmation_message("工业机器人", "协作机器人末端执行", target, [baseline])
+
+        self.assertIn("分析领域：工业机器人", message)
+        self.assertIn("目标企业：长安汽车", message)
+        self.assertIn(f"竞争对手: {baseline.root}", message)
+        self.assertIn("不会验证样本是否完全属于所填写领域", message)
 
     def test_default_output_uses_safe_target_label(self):
         root = Path("D:/patents/target")

@@ -38,7 +38,7 @@ def write_patent_layout_report(
         raise FileExistsError(f"Report output already exists: {output}; use --overwrite to replace it")
 
     document = Document(template)
-    _prepare_template(document)
+    _prepare_template(document, report)
     _build_report_body(document, report)
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.with_name(f".{output.stem}.{uuid.uuid4().hex}.tmp.docx")
@@ -50,8 +50,18 @@ def write_patent_layout_report(
             temporary.unlink()
 
 
-def _prepare_template(document: DocumentType) -> None:
-    for paragraph in document.paragraphs:
+def _prepare_template(document: DocumentType, report: PatentLayoutReport) -> None:
+    replacements = {
+        "{{分析领域}}": report.domain or "未指定领域",
+        "{{领域说明}}": report.domain_context or "未提供",
+        "{{目标企业}}": report.target.label,
+        "{{竞争对手}}": "、".join(item.label for item in report.baselines),
+    }
+    for paragraph in _template_paragraphs(document):
+        for placeholder, value in replacements.items():
+            for run in paragraph.runs:
+                if placeholder in run.text:
+                    run.text = run.text.replace(placeholder, value)
         if "DOCX 内容与章节模板" in paragraph.text:
             paragraph.text = paragraph.text.replace("DOCX 内容与章节模板", "专利布局分析报告")
 
@@ -68,6 +78,20 @@ def _prepare_template(document: DocumentType) -> None:
         if element.tag == qn("w:sectPr"):
             continue
         body.remove(element)
+
+
+def _template_paragraphs(document: DocumentType) -> Iterable:
+    yield from document.paragraphs
+    for table in document.tables:
+        yield from _table_paragraphs(table)
+
+
+def _table_paragraphs(table) -> Iterable:
+    for row in table.rows:
+        for cell in row.cells:
+            yield from cell.paragraphs
+            for nested_table in cell.tables:
+                yield from _table_paragraphs(nested_table)
 
 
 def _build_report_body(document: DocumentType, report: PatentLayoutReport) -> None:
@@ -99,6 +123,8 @@ def _build_report_body(document: DocumentType, report: PatentLayoutReport) -> No
         document,
         ["项目", "内容"],
         [
+            ["分析领域", report.domain or "未指定领域"],
+            ["领域说明", report.domain_context or "未提供"],
             ["目标组合", f"{report.target.label}（{report.target.root}）"],
             ["竞争对手", "、".join(item.label for item in report.baselines)],
             ["样本专利数", str(len(report.industry.records))],

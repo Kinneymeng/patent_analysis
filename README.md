@@ -118,9 +118,9 @@ python -m patent_summarizer compare `
 1. 使用 Python 3.10 或更高版本并执行 `pip install -e .`。
 2. 已在 `.env` 中配置可用的 OpenAI 协议兼容接口。
 3. 已准备两列分类表，例如项目根目录下的 `class.xlsx`。
-4. 长安汽车和每家竞争对手必须分别存放在独立目录中。
+4. 目标企业和每家竞争对手必须分别存放在独立目录中。
 5. 每个企业目录中应已经通过 `run` 生成同名 `.md` 摘要。报告阶段以 MD 和分类结果为证据，不重新读取原始专利全文。
-6. DOCX 模板必须存在，默认路径为 `output\doc\汽车底盘领域专利布局分析报告模板.docx`。
+6. DOCX 模板必须存在，默认路径为 `output\doc\专利领域专利布局分析报告模板.docx`。
 7. 目标企业和各竞争对手的显示标签不能重复。
 
 建议的目录结构：
@@ -160,8 +160,10 @@ python -m patent_summarizer report --dry-run `
   --baseline "比亚迪=D:\底盘专利\比亚迪" `
   --baseline "吉利汽车=D:\底盘专利\吉利汽车" `
   --classes "class.xlsx" `
-  --template "output\doc\汽车底盘领域专利布局分析报告模板.docx" `
-  --output "output\doc\汽车底盘领域专利布局分析报告.docx" `
+  --template "output\doc\专利领域专利布局分析报告模板.docx" `
+  --domain "汽车底盘域" `
+  --domain-context "线控底盘与底盘域协同控制" `
+  --output "output\doc\专利领域布局分析报告.docx" `
   --recursive
 ```
 
@@ -177,8 +179,10 @@ python -m patent_summarizer report `
   --baseline "比亚迪=D:\底盘专利\比亚迪" `
   --baseline "吉利汽车=D:\底盘专利\吉利汽车" `
   --classes "class.xlsx" `
-  --template "output\doc\汽车底盘领域专利布局分析报告模板.docx" `
-  --output "output\doc\汽车底盘领域专利布局分析报告.docx" `
+  --template "output\doc\专利领域专利布局分析报告模板.docx" `
+  --domain "汽车底盘域" `
+  --domain-context "线控底盘与底盘域协同控制" `
+  --output "output\doc\专利领域布局分析报告.docx" `
   --recursive
 ```
 
@@ -186,13 +190,15 @@ python -m patent_summarizer report `
 
 报告默认拒绝覆盖已有 DOCX；确认需要重建时增加 `--overwrite`。分析检查点保存在输出目录下的 `.patent_summary_logs`，相同输入和提示词再次运行时会复用已完成的模型响应。
 
-报告包含样本行业布局、各竞争对手布局与策略、竞争趋势研判、长安汽车优劣势、长安布局策略、待布局点、组合专利策略和证据附录。报告中的“行业”只代表本次上传并完成摘要、分类的样本范围，不等同于完整行业数据库结论。
+报告包含样本领域布局、各竞争对手布局与策略、竞争趋势研判、目标企业优劣势、目标企业布局策略、待布局点、组合专利策略和证据附录。`--domain` 用于报告语境与封面，`--domain-context` 可补充技术边界；二者均不会筛除输入专利或引入外部行业事实。报告中的“行业/领域”只代表本次上传并完成摘要、分类的样本范围，不等同于完整行业数据库结论。
 
 常用参数：
 
 - `--baseline LABEL=PATH`：可重复指定竞争对手。
 - `--batch-size N`：控制每批趋势分析的专利数量，默认 40。
 - `--refresh-classification`：忽略已有分类工作簿，从 MD 重建。
+- `--domain NAME`：必填，填写报告的分析领域。
+- `--domain-context TEXT`：可选，补充领域边界或关注方向。
 - `--overwrite`：覆盖已有输出 DOCX。
 - `--dry-run`：仅检查输入和计划。
 - `--api-rpm N`：覆盖 `.env` 中的请求上限。
@@ -216,7 +222,7 @@ conda run -n temp python build_portable.py
 - `PatentSummarizer.exe`：主程序。
 - `.env`：API 配置。若项目根目录没有 `.env`，构建脚本会复制 `.env.example` 作为模板。
 - `class.xlsx`：分类表。
-- `汽车底盘领域专利布局分析报告模板.docx`：报告功能使用的内置模板。
+- `专利领域专利布局分析报告模板.docx`：报告功能使用的内置模板。
 - `patent-summarizer.ico`：程序窗口和便携包使用的自定义图标。
 - `使用说明.md`：面向普通使用人员的完整操作指南。
 - `_internal\`：EXE 运行依赖，包含 CustomTkinter、Python 运行库和 Pandoc 等文件。
@@ -228,7 +234,7 @@ conda run -n temp python build_portable.py
 - GUI 会递归检查每个目录的 DOCX/MD 配对并显示摘要状态。目录没有 DOCX 或缺少任意同名 MD 时不能启动，需先分别对这些目录运行“批量总结”。
 - 每个组合目录中的 `patent_classification.xlsx` 相互独立；已有文件会被复用，缺失时使用 EXE 同目录的 `class.xlsx` 自动生成。
 - “对比”默认输出 `<目标名称>_专利组合对比.xlsx`，“报告”默认输出 `<目标名称>_专利布局分析报告.docx`，均保存到目标目录并可通过“另存为”修改。
-- “报告”固定使用便携包内置的 `汽车底盘领域专利布局分析报告模板.docx`。
+- “报告”需要填写分析领域，可选填写领域说明；启动前会确认目标、竞争对手及样本范围，再固定使用便携包内置的 `专利领域专利布局分析报告模板.docx`。
 
 完整的逐步说明、前置条件和常见问题请查看根目录的 [使用说明.md](使用说明.md)。
 
@@ -256,7 +262,7 @@ conda run -n temp python build_portable.py
 - `dist\PatentSummarizer\_internal\`：EXE 运行依赖。
 - `dist\PatentSummarizer\.env`：EXE 运行配置。
 - `dist\PatentSummarizer\class.xlsx`：EXE 分类功能需要的分类表。
-- `dist\PatentSummarizer\汽车底盘领域专利布局分析报告模板.docx`：EXE 报告功能需要的内置模板。
+- `dist\PatentSummarizer\专利领域专利布局分析报告模板.docx`：EXE 报告功能需要的内置模板。
 - `dist\PatentSummarizer\patent-summarizer.ico`：EXE 的自定义图标文件。
 - `dist\PatentSummarizer\使用说明.md`：随便携包交付的用户操作指南。
 - `patent_summarizer\`、`tests\`、`pyproject.toml`、`PatentSummarizer.spec`、`build_portable.py`：源码、测试和打包配置。
