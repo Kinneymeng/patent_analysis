@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections import Counter
 from dataclasses import asdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Callable, Mapping, Protocol
+from typing import Any, Callable, Mapping, Protocol, TypeVar
 
 from .comparison import ComparisonResult, PortfolioDataset
 from .prompts import REPORT_COMPETITOR_PROMPT, REPORT_EXECUTIVE_PROMPT, REPORT_SYSTEM_PROMPT, REPORT_TARGET_PROMPT
@@ -14,6 +15,19 @@ from .trend_analysis import TrendAnalysisResult
 
 
 FORBIDDEN_REPORT_PHRASES = ("能否实现", "技术可行性判断")
+REPORT_VALIDATION_RETRIES = 1
+TEXT_LIST_SEPARATOR = re.compile(r"[、，,；;\r\n]+")
+COMPANY_SUFFIXES = (
+    "集团股份有限公司",
+    "股份有限公司",
+    "有限责任公司",
+    "集团有限公司",
+    "有限公司",
+    "汽车集团",
+    "集团",
+    "汽车",
+)
+ParsedReport = TypeVar("ParsedReport")
 
 
 class ReportChatClient(Protocol):
@@ -122,7 +136,7 @@ class ReportCheckpointingClient:
         self._responses = self._load()
 
     def chat(self, system_prompt: str, user_prompt: str) -> str | Mapping[str, Any]:
-        key = hashlib.sha256(f"{system_prompt}\0{user_prompt}".encode("utf-8")).hexdigest()
+        key = _report_cache_key(system_prompt, user_prompt)
         if key in self._responses:
             return self._responses[key]
         response = self.delegate.chat(system_prompt, user_prompt)
@@ -131,6 +145,38 @@ class ReportCheckpointingClient:
             handle.write(json.dumps({"key": key, "response": response}, ensure_ascii=False) + "\n")
         self._responses[key] = response
         return response
+
+    def invalidate(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        reason: str,
+        response: str | Mapping[str, Any] | None = None,
+    ) -> None:
+        """Mark a structurally invalid response so it is not reused after restart."""
+
+        key = _report_cache_key(system_prompt, user_prompt)
+        self._responses.pop(key, None)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        record: dict[str, Any] = {"key": key, "invalid": True, "reason": reason}
+        if response is not None:
+            record["invalid_response"] = response
+        with self.path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    def store_validated(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        response: str | Mapping[str, Any],
+    ) -> None:
+        """Store a repaired response under the original prompt's cache key."""
+
+        key = _report_cache_key(system_prompt, user_prompt)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"key": key, "response": response, "validated": True}, ensure_ascii=False) + "\n")
+        self._responses[key] = response
 
     def _load(self) -> dict[str, Any]:
         if not self.path.exists():
@@ -141,14 +187,28 @@ class ReportCheckpointingClient:
                 payload = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if isinstance(payload, dict) and payload.get("key") and "response" in payload:
-                responses[str(payload["key"])] = payload["response"]
+            if not isinstance(payload, dict) or not payload.get("key"):
+                continue
+            key = str(payload["key"])
+            if payload.get("invalid") is True:
+                responses.pop(key, None)
+            elif "response" in payload:
+                responses[key] = payload["response"]
         return responses
 
 
 class ReportSynthesisAnalyzer:
-    def __init__(self, client: ReportChatClient):
+    def __init__(
+        self,
+        client: ReportChatClient,
+        validation_retries: int = REPORT_VALIDATION_RETRIES,
+        on_validation_retry: Callable[[str, int, str], None] | None = None,
+    ):
+        if validation_retries < 0:
+            raise ValueError("validation_retries must not be negative")
         self.client = client
+        self.validation_retries = validation_retries
+        self.on_validation_retry = on_validation_retry
 
     def analyze(
         self,
@@ -160,45 +220,102 @@ class ReportSynthesisAnalyzer:
     ) -> tuple[CompetitorAnalysis, TargetAnalysis, ExecutiveSummary]:
         evidence = _report_evidence_payload(target, baselines, trends, comparison)
         _notify_stage(on_stage, "竞争对手布局策略", started=True)
-        competitor = parse_competitor_analysis(
-            self.client.chat(
-                REPORT_SYSTEM_PROMPT,
-                REPORT_COMPETITOR_PROMPT.format(evidence=json.dumps(evidence, ensure_ascii=False, indent=2)),
-            )
+        competitor_labels = {item.label for item in baselines}
+        competitor = self._validated_chat(
+            "竞争对手布局策略",
+            REPORT_COMPETITOR_PROMPT.format(evidence=json.dumps(evidence, ensure_ascii=False, indent=2)),
+            lambda response: parse_competitor_analysis(response, allowed_companies=competitor_labels),
         )
         _notify_stage(on_stage, "竞争对手布局策略", started=False)
         _notify_stage(on_stage, f"{target.label}布局建议", started=True)
-        target_analysis = parse_target_analysis(
-            self.client.chat(
-                REPORT_SYSTEM_PROMPT,
-                REPORT_TARGET_PROMPT.format(evidence=json.dumps(evidence, ensure_ascii=False, indent=2)),
-            )
+        target_analysis = self._validated_chat(
+            f"{target.label}布局建议",
+            REPORT_TARGET_PROMPT.format(evidence=json.dumps(evidence, ensure_ascii=False, indent=2)),
+            parse_target_analysis,
         )
         _notify_stage(on_stage, f"{target.label}布局建议", started=False)
         _notify_stage(on_stage, "管理层结论", started=True)
-        executive = parse_executive_summary(
-            self.client.chat(
-                REPORT_SYSTEM_PROMPT,
-                REPORT_EXECUTIVE_PROMPT.format(
-                    evidence=json.dumps(
-                        {
-                            "竞争对手分析": asdict(competitor),
-                            "目标企业分析": asdict(target_analysis),
-                            "基础证据": evidence,
-                        },
-                        ensure_ascii=False,
-                        indent=2,
-                    )
-                ),
-            )
+        executive = self._validated_chat(
+            "管理层结论",
+            REPORT_EXECUTIVE_PROMPT.format(
+                evidence=json.dumps(
+                    {
+                        "竞争对手分析": asdict(competitor),
+                        "目标企业分析": asdict(target_analysis),
+                        "基础证据": evidence,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            ),
+            parse_executive_summary,
         )
         _notify_stage(on_stage, "管理层结论", started=False)
         return competitor, target_analysis, executive
+
+    def _validated_chat(
+        self,
+        stage: str,
+        user_prompt: str,
+        parser: Callable[[str | Mapping[str, Any]], ParsedReport],
+    ) -> ParsedReport:
+        prompt = user_prompt
+        for attempt in range(self.validation_retries + 1):
+            response = self.client.chat(REPORT_SYSTEM_PROMPT, prompt)
+            try:
+                result = parser(response)
+                if attempt > 0:
+                    _store_validated_response(self.client, REPORT_SYSTEM_PROMPT, user_prompt, response)
+                return result
+            except (TypeError, ValueError) as exc:
+                _invalidate_cached_response(self.client, REPORT_SYSTEM_PROMPT, prompt, str(exc), response)
+                if attempt >= self.validation_retries:
+                    raise ValueError(f"{stage}结构化响应校验失败：{exc}") from exc
+                if self.on_validation_retry is not None:
+                    self.on_validation_retry(stage, attempt + 1, str(exc))
+                prompt = _validation_repair_prompt(user_prompt, str(exc))
+
+        raise AssertionError("unreachable")
 
 
 def _notify_stage(callback: Callable[[str, bool], None] | None, detail: str, started: bool) -> None:
     if callback is not None:
         callback(detail, started)
+
+
+def _validation_repair_prompt(original_prompt: str, error: str) -> str:
+    return f"""{original_prompt}
+
+上一次输出未通过程序的 JSON 结构校验，错误为：{error}
+请重新生成完整 JSON，并严格修正该错误。所有要求为数组的字段都必须使用 JSON 数组；要求非空的数组必须至少包含 1 个非空字符串。不要解释，不要使用 Markdown 代码块，只输出修正后的完整 JSON 对象。
+"""
+
+
+def _report_cache_key(system_prompt: str, user_prompt: str) -> str:
+    return hashlib.sha256(f"{system_prompt}\0{user_prompt}".encode("utf-8")).hexdigest()
+
+
+def _invalidate_cached_response(
+    client: ReportChatClient,
+    system_prompt: str,
+    user_prompt: str,
+    reason: str,
+    response: str | Mapping[str, Any],
+) -> None:
+    invalidate = getattr(client, "invalidate", None)
+    if callable(invalidate):
+        invalidate(system_prompt, user_prompt, reason, response)
+
+
+def _store_validated_response(
+    client: ReportChatClient,
+    system_prompt: str,
+    user_prompt: str,
+    response: str | Mapping[str, Any],
+) -> None:
+    store_validated = getattr(client, "store_validated", None)
+    if callable(store_validated):
+        store_validated(system_prompt, user_prompt, response)
 
 
 def combine_portfolios(label: str, portfolios: list[PortfolioDataset]) -> PortfolioDataset:
@@ -213,17 +330,79 @@ def combine_portfolios(label: str, portfolios: list[PortfolioDataset]) -> Portfo
     )
 
 
-def parse_competitor_analysis(response: str | Mapping[str, Any]) -> CompetitorAnalysis:
+def parse_competitor_analysis(
+    response: str | Mapping[str, Any],
+    allowed_companies: set[str] | None = None,
+) -> CompetitorAnalysis:
     payload = _mapping_payload(response)
     _require_fields(payload, ["共性布局策略", "企业差异化策略", "竞争对手趋势研判", "未来竞争焦点", "证据局限"])
     _reject_forbidden(payload)
+    common_strategies = [
+        _parse_strategy(item, f"共性布局策略[{index}]")
+        for index, item in enumerate(_mapping_list(payload["共性布局策略"], "共性布局策略"), start=1)
+    ]
+    differentiated_strategies = [
+        _parse_strategy(item, f"企业差异化策略[{index}]")
+        for index, item in enumerate(_mapping_list(payload["企业差异化策略"], "企业差异化策略"), start=1)
+    ]
+    if allowed_companies is not None:
+        common_strategies = _filter_competitor_strategies(common_strategies, allowed_companies)
+        differentiated_strategies = _filter_competitor_strategies(differentiated_strategies, allowed_companies)
     return CompetitorAnalysis(
-        common_strategies=[_parse_strategy(item) for item in _mapping_list(payload["共性布局策略"], "共性布局策略")],
-        differentiated_strategies=[_parse_strategy(item) for item in _mapping_list(payload["企业差异化策略"], "企业差异化策略")],
-        forecasts=[_parse_forecast(item) for item in _mapping_list(payload["竞争对手趋势研判"], "竞争对手趋势研判")],
+        common_strategies=common_strategies,
+        differentiated_strategies=differentiated_strategies,
+        forecasts=[
+            _parse_forecast(item, f"竞争对手趋势研判[{index}]")
+            for index, item in enumerate(_mapping_list(payload["竞争对手趋势研判"], "竞争对手趋势研判"), start=1)
+        ],
         future_focus=_required_text(payload, "未来竞争焦点"),
         evidence_limits=_required_text(payload, "证据局限"),
     )
+
+
+def _filter_competitor_strategies(
+    strategies: list[StrategyItem],
+    allowed_companies: set[str],
+) -> list[StrategyItem]:
+    filtered: list[StrategyItem] = []
+    for strategy in strategies:
+        companies: list[str] = []
+        for company in strategy.companies:
+            resolved = _resolve_allowed_company(company, allowed_companies)
+            if resolved is not None and resolved not in companies:
+                companies.append(resolved)
+        if companies:
+            filtered.append(replace(strategy, companies=companies))
+    return filtered
+
+
+def _resolve_allowed_company(company: str, allowed_companies: set[str]) -> str | None:
+    if company in allowed_companies:
+        return company
+    company_key = _company_key(company)
+    if not company_key:
+        return None
+    matches = [
+        allowed
+        for allowed in sorted(allowed_companies)
+        if _company_keys_match(company_key, _company_key(allowed))
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _company_key(company: str) -> str:
+    key = re.sub(r"[^\w]+", "", company, flags=re.UNICODE).replace("_", "").casefold()
+    for suffix in COMPANY_SUFFIXES:
+        if key.endswith(suffix):
+            return key[: -len(suffix)]
+    return key
+
+
+def _company_keys_match(first: str, second: str) -> bool:
+    if first == second:
+        return True
+    shorter, longer = sorted((first, second), key=len)
+    return len(shorter) >= 2 and shorter in longer
 
 
 def parse_target_analysis(response: str | Mapping[str, Any]) -> TargetAnalysis:
@@ -231,9 +410,18 @@ def parse_target_analysis(response: str | Mapping[str, Any]) -> TargetAnalysis:
     _require_fields(payload, ["长安总体策略", "待布局建议点", "专利组合策略", "证据局限"])
     _reject_forbidden(payload)
     return TargetAnalysis(
-        strategies=[_parse_target_strategy(item) for item in _mapping_list(payload["长安总体策略"], "长安总体策略")],
-        layout_points=[_parse_layout_point(item) for item in _mapping_list(payload["待布局建议点"], "待布局建议点")],
-        portfolio_plans=[_parse_portfolio_plan(item) for item in _mapping_list(payload["专利组合策略"], "专利组合策略")],
+        strategies=[
+            _parse_target_strategy(item, f"长安总体策略[{index}]")
+            for index, item in enumerate(_mapping_list(payload["长安总体策略"], "长安总体策略"), start=1)
+        ],
+        layout_points=[
+            _parse_layout_point(item, f"待布局建议点[{index}]")
+            for index, item in enumerate(_mapping_list(payload["待布局建议点"], "待布局建议点"), start=1)
+        ],
+        portfolio_plans=[
+            _parse_portfolio_plan(item, f"专利组合策略[{index}]")
+            for index, item in enumerate(_mapping_list(payload["专利组合策略"], "专利组合策略"), start=1)
+        ],
         evidence_limits=_required_text(payload, "证据局限"),
     )
 
@@ -248,21 +436,21 @@ def parse_executive_summary(response: str | Mapping[str, Any]) -> ExecutiveSumma
     return ExecutiveSummary(conclusions, _required_text(payload, "总体证据局限"))
 
 
-def _parse_strategy(payload: Mapping[str, Any]) -> StrategyItem:
+def _parse_strategy(payload: Mapping[str, Any], context: str = "策略") -> StrategyItem:
     fields = ["策略名称", "核心特征", "适用企业", "重点技术分类", "统计及连续性证据", "代表性专利", "组合中的作用"]
     _require_fields(payload, fields)
     return StrategyItem(
         _required_text(payload, "策略名称"),
         _required_text(payload, "核心特征"),
-        _text_list(payload["适用企业"], "适用企业"),
-        _text_list(payload["重点技术分类"], "重点技术分类"),
+        _text_list(payload["适用企业"], f"{context}.适用企业"),
+        _text_list(payload["重点技术分类"], f"{context}.重点技术分类"),
         _required_text(payload, "统计及连续性证据"),
-        _text_list(payload["代表性专利"], "代表性专利"),
+        _text_list(payload["代表性专利"], f"{context}.代表性专利"),
         _required_text(payload, "组合中的作用"),
     )
 
 
-def _parse_forecast(payload: Mapping[str, Any]) -> TrendForecast:
+def _parse_forecast(payload: Mapping[str, Any], context: str = "竞争对手趋势研判") -> TrendForecast:
     fields = ["企业", "可能强化方向", "时间序列信号", "关键词及技术路线依据", "代表性专利", "证据限制"]
     _require_fields(payload, fields)
     return TrendForecast(
@@ -270,25 +458,25 @@ def _parse_forecast(payload: Mapping[str, Any]) -> TrendForecast:
         _required_text(payload, "可能强化方向"),
         _required_text(payload, "时间序列信号"),
         _required_text(payload, "关键词及技术路线依据"),
-        _text_list(payload["代表性专利"], "代表性专利"),
+        _text_list(payload["代表性专利"], f"{context}.代表性专利"),
         _required_text(payload, "证据限制"),
     )
 
 
-def _parse_target_strategy(payload: Mapping[str, Any]) -> TargetStrategyItem:
+def _parse_target_strategy(payload: Mapping[str, Any], context: str = "长安总体策略") -> TargetStrategyItem:
     fields = ["策略名称", "目标", "重点技术领域", "优先顺序", "建议理由", "关联建议点"]
     _require_fields(payload, fields)
     return TargetStrategyItem(
         _required_text(payload, "策略名称"),
         _required_text(payload, "目标"),
-        _text_list(payload["重点技术领域"], "重点技术领域"),
+        _text_list(payload["重点技术领域"], f"{context}.重点技术领域"),
         _required_text(payload, "优先顺序"),
         _required_text(payload, "建议理由"),
-        _text_list(payload["关联建议点"], "关联建议点"),
+        _text_list(payload["关联建议点"], f"{context}.关联建议点"),
     )
 
 
-def _parse_layout_point(payload: Mapping[str, Any]) -> LayoutPoint:
+def _parse_layout_point(payload: Mapping[str, Any], context: str = "待布局建议点") -> LayoutPoint:
     fields = ["名称", "一级分类", "二级分类", "主要技术问题", "竞争对手布局", "长安现有布局及缺口", "优先级", "建议理由", "证据专利"]
     _require_fields(payload, fields)
     return LayoutPoint(
@@ -300,19 +488,19 @@ def _parse_layout_point(payload: Mapping[str, Any]) -> LayoutPoint:
         _required_text(payload, "长安现有布局及缺口"),
         _required_text(payload, "优先级"),
         _required_text(payload, "建议理由"),
-        _text_list(payload["证据专利"], "证据专利"),
+        _text_list(payload["证据专利"], f"{context}.证据专利"),
     )
 
 
-def _parse_portfolio_plan(payload: Mapping[str, Any]) -> PortfolioPlan:
+def _parse_portfolio_plan(payload: Mapping[str, Any], context: str = "专利组合策略") -> PortfolioPlan:
     fields = ["对应布局点", "核心专利", "外围专利分支", "技术环节覆盖", "专利客体协同", "系列化或补充布局", "跨布局点协同", "证据依据"]
     _require_fields(payload, fields)
     return PortfolioPlan(
         _required_text(payload, "对应布局点"),
         _required_text(payload, "核心专利"),
-        _text_list(payload["外围专利分支"], "外围专利分支"),
-        _text_list(payload["技术环节覆盖"], "技术环节覆盖"),
-        _text_list(payload["专利客体协同"], "专利客体协同"),
+        _text_list(payload["外围专利分支"], f"{context}.外围专利分支"),
+        _text_list(payload["技术环节覆盖"], f"{context}.技术环节覆盖"),
+        _text_list(payload["专利客体协同"], f"{context}.专利客体协同"),
         _required_text(payload, "系列化或补充布局"),
         _required_text(payload, "跨布局点协同"),
         _required_text(payload, "证据依据"),
@@ -347,11 +535,18 @@ def _mapping_list(value: Any, field: str) -> list[Mapping[str, Any]]:
 
 
 def _text_list(value: Any, field: str) -> list[str]:
+    if isinstance(value, str):
+        result = [item.strip() for item in TEXT_LIST_SEPARATOR.split(value) if item.strip()]
+        if not result:
+            raise ValueError(f"{field} 必须包含非空文本")
+        return result
     if not isinstance(value, list) or not value:
         raise ValueError(f"{field} 必须是非空数组")
-    result = [str(item).strip() for item in value if str(item).strip()]
-    if not result:
-        raise ValueError(f"{field} 必须包含非空文本")
+    if any(not isinstance(item, str) for item in value):
+        raise ValueError(f"{field} 中的每一项必须是字符串")
+    result = [item.strip() for item in value]
+    if any(not item for item in result):
+        raise ValueError(f"{field} 中的每一项必须是非空文本")
     return result
 
 

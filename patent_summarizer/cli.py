@@ -166,15 +166,18 @@ def report(args: argparse.Namespace, progress: ProgressCallback | None = None) -
         print(f"Config error: {exc}")
         return 2
 
+    log_dir = args.output.parent / ".patent_summary_logs"
+    debug_path = log_dir / f"{args.output.stem}.llm-debug.jsonl"
     base_client = RateLimitedOpenAIClient(
         base_url=config.base_url,
         api_key=config.api_key,
         model=config.model,
         rpm=config.api_rpm,
         max_retries=config.max_retries,
+        debug_path=debug_path,
     )
-    log_dir = args.output.parent / ".patent_summary_logs"
     client = ReportCheckpointingClient(base_client, log_dir / f"{args.output.stem}.report.jsonl")
+    print(f"LLM_DEBUG\t{debug_path}")
 
     classification_total = _portfolio_classification_units(portfolio_specs, args.recursive, args.refresh_classification)
     classified = 0
@@ -263,15 +266,20 @@ def report(args: argparse.Namespace, progress: ProgressCallback | None = None) -
             else:
                 tracker.advance("正在生成报告", detail)
 
+        def on_validation_retry(stage: str, retry: int, error: str) -> None:
+            print(f"REPORT_REPAIR\t{stage}\tretry={retry}\terror={error}")
+
+        report_analyzer = ReportSynthesisAnalyzer(client, on_validation_retry=on_validation_retry)
+
         if progress is None:
-            competitor_analysis, target_analysis, executive_summary = ReportSynthesisAnalyzer(client).analyze(
+            competitor_analysis, target_analysis, executive_summary = report_analyzer.analyze(
                 target,
                 baselines,
                 trends,
                 comparison,
             )
         else:
-            competitor_analysis, target_analysis, executive_summary = ReportSynthesisAnalyzer(client).analyze(
+            competitor_analysis, target_analysis, executive_summary = report_analyzer.analyze(
                 target,
                 baselines,
                 trends,
@@ -300,6 +308,7 @@ def report(args: argparse.Namespace, progress: ProgressCallback | None = None) -
         tracker.succeed("报告生成完成", "结果已保存")
     except (RuntimeError, FileNotFoundError, NotADirectoryError, ValueError, FileExistsError) as exc:
         print(f"Report error: {exc}")
+        print(f"LLM debug: {debug_path}")
         return 1
 
     print(

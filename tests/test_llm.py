@@ -1,4 +1,7 @@
+import json
+import tempfile
 import unittest
+from pathlib import Path
 
 from patent_summarizer.llm import (
     HttpResponseError,
@@ -104,6 +107,45 @@ class LlmTests(unittest.TestCase):
 
         self.assertEqual(client.chat("system", "user"), "ok")
         self.assertEqual(clock.sleeps, [12])
+
+    def test_debug_log_records_payload_and_attempts_without_api_key(self):
+        calls = []
+
+        def transport(_url, _headers, _payload, _timeout):
+            calls.append(1)
+            if len(calls) == 1:
+                raise HttpResponseError(500, "wrapped upstream error")
+            return {
+                "model": "model-a",
+                "usage": {"prompt_tokens": 12, "completion_tokens": 3},
+                "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+            }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            debug_path = Path(temp_dir) / "llm-debug.jsonl"
+            client = RateLimitedOpenAIClient(
+                base_url="https://example.test/v1",
+                api_key="secret-key",
+                model="model-a",
+                rpm=600,
+                max_retries=1,
+                transport=transport,
+                sleeper=lambda _seconds: None,
+                jitter=lambda _attempt: 0,
+                debug_path=debug_path,
+            )
+
+            self.assertEqual(client.chat("system text", "user text"), "ok")
+            records = [json.loads(line) for line in debug_path.read_text(encoding="utf-8").splitlines()]
+
+        self.assertEqual([record["event"] for record in records], ["request", "attempt", "attempt"])
+        self.assertEqual(records[0]["payload"]["model"], "model-a")
+        self.assertEqual(records[0]["payload"]["messages"][1]["content"], "user text")
+        self.assertNotIn("secret-key", json.dumps(records, ensure_ascii=False))
+        self.assertEqual(records[1]["http_status"], 500)
+        self.assertTrue(records[1]["will_retry"])
+        self.assertEqual(records[2]["response_model"], "model-a")
+        self.assertEqual(records[2]["finish_reason"], "stop")
 
 
 if __name__ == "__main__":

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import random
 import threading
@@ -7,7 +8,10 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable
+from uuid import uuid4
 
 
 class HttpResponseError(RuntimeError):
@@ -60,6 +64,7 @@ class RateLimitedOpenAIClient:
     clock: Callable[[], float] | None = None
     sleeper: Callable[[float], None] | None = None
     jitter: Callable[[int], float] | None = None
+    debug_path: Path | None = None
 
     def __post_init__(self) -> None:
         self.base_url = self.base_url.rstrip("/")
@@ -68,6 +73,10 @@ class RateLimitedOpenAIClient:
         self._limiter = RateLimiter(self.rpm, clock=self._clock, sleeper=self._sleeper)
         self._transport = self.transport or _urllib_transport
         self._jitter = self.jitter or (lambda attempt: random.uniform(0, min(1.0, attempt * 0.25)))
+        self.debug_path = Path(self.debug_path) if self.debug_path is not None else None
+        self._debug_lock = threading.Lock()
+        self._debug_run_id = uuid4().hex
+        self._debug_sequence = 0
 
     def chat(self, system_prompt: str, user_prompt: str) -> str:
         url = f"{self.base_url}/chat/completions"
@@ -84,17 +93,94 @@ class RateLimitedOpenAIClient:
             "temperature": 0.2,
         }
 
+        request_id = self._record_debug_request(url, payload)
+
         attempt = 0
         while True:
             self._limiter.wait()
+            attempt += 1
             try:
                 response = self._transport(url, headers, payload, self.timeout)
-                return _extract_content(response)
+                content = _extract_content(response)
+                self._record_debug_event(
+                    {
+                        "event": "attempt",
+                        "request_id": request_id,
+                        "attempt": attempt,
+                        "outcome": "success",
+                        "response_model": response.get("model"),
+                        "system_fingerprint": response.get("system_fingerprint"),
+                        "usage": response.get("usage"),
+                        "finish_reason": _finish_reason(response),
+                        "content_chars": len(content),
+                    }
+                )
+                return content
             except Exception as exc:
-                attempt += 1
-                if not _is_retryable(exc) or attempt > self.max_retries:
+                retryable = _is_retryable(exc)
+                will_retry = retryable and attempt <= self.max_retries
+                retry_delay = _retry_delay(exc, attempt, self._jitter) if will_retry else None
+                self._record_debug_event(
+                    {
+                        "event": "attempt",
+                        "request_id": request_id,
+                        "attempt": attempt,
+                        "outcome": "error",
+                        "error_type": type(exc).__name__,
+                        "http_status": exc.status_code if isinstance(exc, HttpResponseError) else None,
+                        "error": str(exc),
+                        "retryable": retryable,
+                        "will_retry": will_retry,
+                        "retry_delay_seconds": retry_delay,
+                    }
+                )
+                if not will_retry:
                     raise
-                self._sleeper(_retry_delay(exc, attempt, self._jitter))
+                self._sleeper(retry_delay)
+
+    def _record_debug_request(self, url: str, payload: dict[str, Any]) -> str | None:
+        if self.debug_path is None:
+            return None
+        serialized = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        payload_hash = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+        self._debug_sequence += 1
+        request_id = f"{self._debug_run_id}-{self._debug_sequence}-{payload_hash[:12]}"
+        messages = payload.get("messages", [])
+        self._record_debug_event(
+            {
+                "event": "request",
+                "request_id": request_id,
+                "url": url,
+                "timeout_seconds": self.timeout,
+                "payload_sha256": payload_hash,
+                "payload_chars": len(serialized),
+                "payload_utf8_bytes": len(serialized.encode("utf-8")),
+                "message_chars": [
+                    {
+                        "role": message.get("role"),
+                        "chars": len(str(message.get("content", ""))),
+                        "utf8_bytes": len(str(message.get("content", "")).encode("utf-8")),
+                    }
+                    for message in messages
+                    if isinstance(message, dict)
+                ],
+                "payload": payload,
+            }
+        )
+        return request_id
+
+    def _record_debug_event(self, event: dict[str, Any]) -> None:
+        if self.debug_path is None:
+            return
+        record = {
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "run_id": self._debug_run_id,
+            **event,
+        }
+        with self._debug_lock:
+            self.debug_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.debug_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
 
 
 def _urllib_transport(url: str, headers: dict[str, str], payload: dict[str, Any], timeout: float) -> dict[str, Any]:
@@ -120,6 +206,13 @@ def _extract_content(response: dict[str, Any]) -> str:
     if not isinstance(content, str) or not content.strip():
         raise ValueError("OpenAI-compatible response did not contain text content")
     return content.strip()
+
+
+def _finish_reason(response: dict[str, Any]) -> Any:
+    try:
+        return response["choices"][0].get("finish_reason")
+    except (KeyError, IndexError, TypeError, AttributeError):
+        return None
 
 
 def _is_retryable(exc: Exception) -> bool:
