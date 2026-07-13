@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from argparse import Namespace
@@ -58,6 +59,28 @@ def make_portfolio(label, root, filename):
         classification_source="existing",
         records=[make_record(filename, label)],
     )
+
+
+def make_strategy_payload(companies):
+    return {
+        "策略名称": "持续强化",
+        "核心特征": "连续布局",
+        "适用企业": companies,
+        "重点技术分类": ["横向控制"],
+        "统计及连续性证据": "2024年1件",
+        "代表性专利": ["b.md"],
+        "组合中的作用": "形成重点方向",
+    }
+
+
+def make_competitor_payload(companies):
+    return {
+        "共性布局策略": [make_strategy_payload(companies)],
+        "企业差异化策略": [],
+        "竞争对手趋势研判": [],
+        "未来竞争焦点": "横向控制",
+        "证据局限": "仅基于上传样本",
+    }
 
 
 class FakeClient:
@@ -177,6 +200,28 @@ class ReportCheckpointTests(unittest.TestCase):
         self.assertEqual(first, {"value": "cached"})
         self.assertEqual(second, first)
         self.assertEqual(delegate.calls, 1)
+
+    def test_invalid_response_is_repaired_and_replaced_in_cache(self):
+        bad_response = json.dumps(make_competitor_payload([]), ensure_ascii=False)
+        good_response = json.dumps(make_competitor_payload(["理想汽车"]), ensure_ascii=False)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "report.jsonl"
+            delegate = SequencedClient([bad_response, good_response])
+            analyzer = ReportSynthesisAnalyzer(ReportCheckpointingClient(delegate, path))
+
+            result = analyzer._validated_chat(
+                "竞争对手布局策略",
+                "请生成竞争对手分析 JSON",
+                parse_competitor_analysis,
+            )
+
+            records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+        self.assertEqual(["理想汽车"], result.common_strategies[0].companies)
+        self.assertEqual(2, len(delegate.calls))
+        invalid_records = [record for record in records if record.get("invalid") is True]
+        self.assertEqual(1, len(invalid_records))
+        self.assertEqual(bad_response, invalid_records[0]["invalid_response"])
 
 
 class ReportAnalysisTests(unittest.TestCase):
@@ -427,6 +472,35 @@ class ReportDocumentationTests(unittest.TestCase):
 
 
 class ReportResponseTests(unittest.TestCase):
+    def test_competitor_response_normalizes_company_string_and_filters_target(self):
+        payload = make_competitor_payload("目标企业、理想、蔚来汽车")
+
+        result = parse_competitor_analysis(
+            payload,
+            allowed_companies={"理想汽车", "蔚来汽车"},
+        )
+
+        self.assertEqual(
+            ["理想汽车", "蔚来汽车"],
+            result.common_strategies[0].companies,
+        )
+
+    def test_competitor_response_drops_only_out_of_scope_differentiated_strategy(self):
+        payload = make_competitor_payload(["理想汽车"])
+        payload["共性布局策略"] = []
+        payload["企业差异化策略"] = [
+            make_strategy_payload(["理想汽车"]),
+            make_strategy_payload(["目标企业"]),
+        ]
+
+        result = parse_competitor_analysis(
+            payload,
+            allowed_companies={"理想汽车", "蔚来汽车"},
+        )
+
+        self.assertEqual(1, len(result.differentiated_strategies))
+        self.assertEqual(["理想汽车"], result.differentiated_strategies[0].companies)
+
     def test_competitor_response_requires_all_top_level_fields(self):
         with self.assertRaisesRegex(ValueError, "竞争对手趋势研判"):
             parse_competitor_analysis(

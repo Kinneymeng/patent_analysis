@@ -270,8 +270,13 @@ def report(args: argparse.Namespace, progress: ProgressCallback | None = None) -
             else:
                 tracker.advance("正在生成报告", detail)
 
+        def on_validation_retry(stage: str, retry: int, error: str) -> None:
+            print(f"REPORT_REPAIR\t{stage}\tretry={retry}\terror={error}")
+
+        report_analyzer = ReportSynthesisAnalyzer(client, on_validation_retry=on_validation_retry)
+
         if progress is None:
-            competitor_analysis, target_analysis, executive_summary = ReportSynthesisAnalyzer(client).analyze(
+            competitor_analysis, target_analysis, executive_summary = report_analyzer.analyze(
                 target,
                 baselines,
                 trends,
@@ -280,7 +285,7 @@ def report(args: argparse.Namespace, progress: ProgressCallback | None = None) -
                 domain_context=domain_context,
             )
         else:
-            competitor_analysis, target_analysis, executive_summary = ReportSynthesisAnalyzer(client).analyze(
+            competitor_analysis, target_analysis, executive_summary = report_analyzer.analyze(
                 target,
                 baselines,
                 trends,
