@@ -1,4 +1,5 @@
 import runpy
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -233,6 +234,18 @@ class GuiCommandTests(unittest.TestCase):
         module_globals = runpy.run_path(str(Path("patent_summarizer") / "gui.py"))
 
         self.assertIn("launch", module_globals)
+
+    def test_launch_does_not_create_gui_when_license_gate_rejects_startup(self):
+        with (
+            patch("patent_summarizer.gui.startup_allows_gui", return_value=False),
+            patch("patent_summarizer.gui.PatentSummarizerApp") as app_class,
+            patch.object(sys, "argv", ["PatentSummarizer.exe"]),
+        ):
+            from patent_summarizer.gui import launch
+
+            launch()
+
+        app_class.assert_not_called()
 
 
 class PortableRuntimeFilesTests(unittest.TestCase):

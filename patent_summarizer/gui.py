@@ -14,6 +14,7 @@ import customtkinter as ctk
 
 from patent_summarizer.cli import main
 from patent_summarizer.discovery import SummaryCoverage, inspect_summary_coverage
+from patent_summarizer.licensing import startup_allows_gui
 from patent_summarizer.progress import ProgressUpdate
 
 
@@ -998,6 +999,8 @@ def _format_command(argv: list[str]) -> str:
 
 
 def launch() -> None:
+    if not startup_allows_gui(sys.argv[1:]):
+        return
     ctk.set_appearance_mode(MODERN_APPEARANCE_MODE)
     ctk.set_default_color_theme(MODERN_COLOR_THEME)
     app = PatentSummarizerApp()
