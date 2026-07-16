@@ -224,6 +224,17 @@ class GuiCommandTests(unittest.TestCase):
 
         self.assertIn("launch", module_globals)
 
+    def test_main_panel_scrolls_configuration_progress_and_log_together(self):
+        source = (Path("patent_summarizer") / "gui.py").read_text(encoding="utf-8")
+
+        self.assertIn("panel = ctk.CTkScrollableFrame(", source)
+        self.assertIn("self.page_scroll = panel", source)
+        self.assertIn('self.config_frame = ctk.CTkFrame(panel, fg_color="transparent")', source)
+        self.assertIn('progress_row = ctk.CTkFrame(panel, fg_color="transparent")', source)
+        self.assertIn("log_panel = ctk.CTkFrame(panel,", source)
+        self.assertIn("baseline_list = ctk.CTkScrollableFrame(", source)
+        self.assertIn("self.log_text = ctk.CTkTextbox(", source)
+
 
 class PortableRuntimeFilesTests(unittest.TestCase):
     def test_copies_bundled_report_template_next_to_executable(self):
