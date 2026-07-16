@@ -18,6 +18,7 @@ from patent_summarizer.report_analysis import (
     ExecutiveSummary,
     LayoutPoint,
     PatentLayoutReport,
+    PortfolioOverviewAnalysis,
     PortfolioPlan,
     ReportCheckpointingClient,
     ReportSynthesisAnalyzer,
@@ -80,6 +81,13 @@ def make_competitor_payload(companies):
         "竞争对手趋势研判": [],
         "未来竞争焦点": "横向控制",
         "证据局限": "仅基于上传样本",
+    }
+
+
+def make_overview_payload(label, summary=None):
+    return {
+        "对象": label,
+        "整体布局现状": summary or f"{label}在当前样本中形成以横向控制为主的专利布局。",
     }
 
 
@@ -304,14 +312,23 @@ class ReportAnalysisTests(unittest.TestCase):
             "管理层结论": ["结论一", "结论二", "结论三"],
             "总体证据局限": "仅基于上传样本",
         }
-        client = SequencedClient([competitor_payload, target_payload, executive_payload])
+        client = SequencedClient(
+            [
+                make_overview_payload("全部样本"),
+                make_overview_payload("长安汽车"),
+                make_overview_payload("理想汽车"),
+                competitor_payload,
+                target_payload,
+                executive_payload,
+            ]
+        )
         analyzer = ReportSynthesisAnalyzer(client)
         target = make_portfolio("长安汽车", "D:/长安", "a.md")
         baseline = make_portfolio("理想汽车", "D:/理想", "b.md")
         comparison = ComparisonResult(target, [baseline], None, [])
         stages = []
 
-        competitor, target_result, executive = analyzer.analyze(
+        overviews, competitor, target_result, executive = analyzer.analyze(
             target,
             [baseline],
             {"长安汽车": TrendAnalysisResult([], target.records), "理想汽车": TrendAnalysisResult([], baseline.records)},
@@ -321,8 +338,9 @@ class ReportAnalysisTests(unittest.TestCase):
             on_stage=lambda detail, started: stages.append((detail, started)),
         )
 
-        self.assertEqual(len(client.calls), 3)
-        self.assertEqual([started for _detail, started in stages], [True, False, True, False, True, False])
+        self.assertEqual(len(client.calls), 6)
+        self.assertEqual([started for _detail, started in stages], [True, False] * 6)
+        self.assertIn("横向控制", overviews.industry_summary)
         self.assertEqual(competitor.forecasts[0].company, "理想汽车")
         self.assertEqual(target_result.layout_points[0].name, "横向协同控制")
         self.assertEqual(len(executive.conclusions), 3)
@@ -437,7 +455,16 @@ class ReportCommandTests(unittest.TestCase):
                 overwrite=False,
                 dry_run=False,
             )
-            fake_client = SequencedClient([competitor_payload, target_payload, executive_payload])
+            fake_client = SequencedClient(
+                [
+                    make_overview_payload("全部样本"),
+                    make_overview_payload("长安汽车"),
+                    make_overview_payload("理想汽车"),
+                    competitor_payload,
+                    target_payload,
+                    executive_payload,
+                ]
+            )
 
             with (
                 patch("patent_summarizer.cli.load_config", return_value=SimpleNamespace(base_url="url", api_key="key", model="model", api_rpm=10, max_retries=1, ocr_enabled=False)),
@@ -456,7 +483,7 @@ class ReportCommandTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertIn("横向协同控制", text)
         self.assertTrue(checkpoint_exists)
-        self.assertEqual(len(fake_client.calls), 3)
+        self.assertEqual(len(fake_client.calls), 6)
 
 
 class ReportDocumentationTests(unittest.TestCase):
@@ -592,6 +619,10 @@ class ReportDocxTests(unittest.TestCase):
                 "全部样本": TrendAnalysisResult(reports=[], records=industry.records),
             },
             comparison=ComparisonResult(target, [baseline], None, []),
+            portfolio_overviews=PortfolioOverviewAnalysis(
+                industry_summary="全部样本主要集中在横向控制。",
+                company_summaries={"示例公司": "示例公司主要集中在横向控制。", "同行企业": "同行企业主要集中在横向控制。"},
+            ),
             competitor_analysis=competitor_analysis,
             target_analysis=target_analysis,
             executive_summary=ExecutiveSummary(["样本主要集中在横向控制。"], "仅基于上传样本"),

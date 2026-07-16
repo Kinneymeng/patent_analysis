@@ -229,8 +229,9 @@ def report(args: argparse.Namespace, progress: ProgressCallback | None = None) -
             for portfolio, checkpoint in zip(portfolios, checkpoints)
         )
         comparison_units = len(baselines) + (1 if len(baselines) > 1 else 0)
+        overview_units = len(baselines) + 2
         tracker.start(
-            trend_units + comparison_units + 3 + 1,
+            trend_units + comparison_units + overview_units + 3 + 1,
             "正在分析趋势",
             "已完成准备，开始分析",
         )
@@ -276,20 +277,22 @@ def report(args: argparse.Namespace, progress: ProgressCallback | None = None) -
         report_analyzer = ReportSynthesisAnalyzer(client, on_validation_retry=on_validation_retry)
 
         if progress is None:
-            competitor_analysis, target_analysis, executive_summary = report_analyzer.analyze(
+            portfolio_overviews, competitor_analysis, target_analysis, executive_summary = report_analyzer.analyze(
                 target,
                 baselines,
                 trends,
                 comparison,
+                industry=industry,
                 domain=domain,
                 domain_context=domain_context,
             )
         else:
-            competitor_analysis, target_analysis, executive_summary = report_analyzer.analyze(
+            portfolio_overviews, competitor_analysis, target_analysis, executive_summary = report_analyzer.analyze(
                 target,
                 baselines,
                 trends,
                 comparison,
+                industry=industry,
                 domain=domain,
                 domain_context=domain_context,
                 on_stage=on_report_stage,
@@ -300,6 +303,7 @@ def report(args: argparse.Namespace, progress: ProgressCallback | None = None) -
             industry=industry,
             trends=trends,
             comparison=comparison,
+            portfolio_overviews=portfolio_overviews,
             competitor_analysis=competitor_analysis,
             target_analysis=target_analysis,
             executive_summary=executive_summary,

@@ -137,13 +137,17 @@ def _build_report_body(document: DocumentType, report: PatentLayoutReport) -> No
     )
 
     _chapter(document, "一、样本范围内行业整体布局现状")
-    _portfolio_overview(document, report.industry)
+    _portfolio_overview(document, report.industry, report.portfolio_overviews.industry_summary)
     _trend_sections(document, report.trends.get(report.industry.label))
 
     _chapter(document, "二、主要竞争对手的布局现状")
     for index, baseline in enumerate(report.baselines, start=1):
         document.add_heading(f"2.{index} {baseline.label}布局现状", level=2)
-        _portfolio_overview(document, baseline)
+        _portfolio_overview(
+            document,
+            baseline,
+            report.portfolio_overviews.company_summaries[baseline.label],
+        )
         _trend_sections(document, report.trends.get(baseline.label))
     document.add_heading(f"2.{len(report.baselines) + 1} 主要竞争对手横向比较", level=2)
     _competitor_matrix(document, report.baselines)
@@ -170,7 +174,11 @@ def _build_report_body(document: DocumentType, report: PatentLayoutReport) -> No
 
     _chapter(document, f"五、{report.target.label}布局现状及优劣势分析")
     document.add_heading(f"5.1 {report.target.label}布局现状", level=2)
-    _portfolio_overview(document, report.target)
+    _portfolio_overview(
+        document,
+        report.target,
+        report.portfolio_overviews.company_summaries[report.target.label],
+    )
     _trend_sections(document, report.trends.get(report.target.label))
     _comparison_sections(document, report)
 
@@ -251,7 +259,11 @@ def _chapter(document: DocumentType, title: str) -> None:
     document.add_heading(title, level=1)
 
 
-def _portfolio_overview(document: DocumentType, portfolio: PortfolioDataset) -> None:
+def _portfolio_overview(
+    document: DocumentType,
+    portfolio: PortfolioDataset,
+    overview_summary: str,
+) -> None:
     years = Counter(record.inferred_year or "未知" for record in portfolio.records)
     labels = Counter(
         (record.primary_first_level, record.primary_second_level)
@@ -263,6 +275,10 @@ def _portfolio_overview(document: DocumentType, portfolio: PortfolioDataset) -> 
         ["组合", "专利数", "有效分类数", "覆盖年份", "技术标签数"],
         [[portfolio.label, str(len(portfolio.records)), str(sum(labels.values())), _year_range(years), str(len(labels))]],
     )
+    overview = document.add_paragraph()
+    label = overview.add_run("整体布局现状：")
+    label.bold = True
+    overview.add_run(overview_summary)
     document.add_heading("年度分布", level=2)
     _add_table(document, ["年份", "专利数"], [[year, str(count)] for year, count in sorted(years.items())])
     document.add_heading("重点技术分类", level=2)
