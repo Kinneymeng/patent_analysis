@@ -305,13 +305,17 @@ class PatentSummarizerApp(ctk.CTk):
         )
         subtitle.grid(row=1, column=0, sticky="w", pady=(6, 0))
 
-        panel = ctk.CTkFrame(
+        panel = ctk.CTkScrollableFrame(
             self,
             corner_radius=18,
             fg_color=DESKTOP_EDITORIAL_PALETTE["surface"],
             border_width=1,
             border_color=DESKTOP_EDITORIAL_PALETTE["hairline"],
+            scrollbar_fg_color=DESKTOP_EDITORIAL_PALETTE["surface"],
+            scrollbar_button_color=DESKTOP_EDITORIAL_PALETTE["hairline"],
+            scrollbar_button_hover_color=DESKTOP_EDITORIAL_PALETTE["primary_pressed"],
         )
+        self.page_scroll = panel
         panel.grid(row=1, column=0, sticky="nsew", padx=28, pady=(0, 6))
         panel.grid_columnconfigure(0, weight=1)
         panel.grid_rowconfigure(4, weight=1)

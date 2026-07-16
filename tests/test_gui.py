@@ -1,4 +1,5 @@
 import json
+import inspect
 import runpy
 import sys
 import tempfile
@@ -22,6 +23,7 @@ from patent_summarizer.gui import (
     MODERN_APPEARANCE_MODE,
     MODERN_COLOR_THEME,
     MODE_OPTIONS,
+    PatentSummarizerApp,
     PortfolioInput,
     build_cli_argv,
     build_portfolio_cli_argv,
@@ -255,6 +257,14 @@ class GuiCommandTests(unittest.TestCase):
         module_globals = runpy.run_path(str(Path("patent_summarizer") / "gui.py"))
 
         self.assertIn("launch", module_globals)
+
+    def test_main_panel_scrolls_configuration_progress_and_log_together(self):
+        source = inspect.getsource(PatentSummarizerApp._build_layout)
+
+        self.assertIn("panel = ctk.CTkScrollableFrame(", source)
+        self.assertIn("self.page_scroll = panel", source)
+        self.assertIn("progress_row = ctk.CTkFrame(panel", source)
+        self.assertIn("log_panel = ctk.CTkFrame(panel", source)
 
     def test_launch_does_not_create_gui_when_license_gate_rejects_startup(self):
         with (
