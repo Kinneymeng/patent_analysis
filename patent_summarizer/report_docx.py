@@ -8,6 +8,7 @@ from typing import Iterable, Sequence
 
 from docx import Document
 from docx.document import Document as DocumentType
+from docx.enum.style import WD_STYLE_TYPE
 from docx.enum.text import WD_BREAK
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
@@ -20,6 +21,7 @@ from .trend_analysis import TrendAnalysisResult
 
 BLUE = "1F4E78"
 LIGHT_BLUE = "D9EAF7"
+REPORT_FONT = "宋体"
 
 
 def write_patent_layout_report(
@@ -40,6 +42,7 @@ def write_patent_layout_report(
     document = Document(template)
     _prepare_template(document, report)
     _build_report_body(document, report)
+    _apply_report_font(document)
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.with_name(f".{output.stem}.{uuid.uuid4().hex}.tmp.docx")
     try:
@@ -278,22 +281,23 @@ def _trend_sections(document: DocumentType, result: TrendAnalysisResult | None) 
         document.add_paragraph("该组合未形成可用的标签趋势报告。")
         return
     document.add_heading("主要技术路线、热点与机会", level=2)
-    _add_table(
-        document,
-        ["技术分类", "发展现状/阶段", "主要技术路线", "热点方向", "机会与空白", "代表专利"],
-        [
-            [
-                f"{item.stats.first_level} / {item.stats.second_level}",
-                f"{item.status_summary}\n{item.development_stage}",
-                item.technical_routes,
-                item.hot_topics,
-                item.opportunities,
-                item.representative_patents,
-            ]
-            for item in result.reports
-        ],
-        font_size=8,
-    )
+    for item in result.reports:
+        category_heading = document.add_heading(
+            f"{item.stats.first_level} / {item.stats.second_level}",
+            level=3,
+        )
+        category_heading.paragraph_format.keep_with_next = True
+        fields = [
+            ("发展现状/阶段", f"{item.status_summary}\n{item.development_stage}"),
+            ("主要技术路线", item.technical_routes),
+            ("热点方向", item.hot_topics),
+            ("机会与空白", item.opportunities),
+            ("代表专利", item.representative_patents),
+        ]
+        for label, value in fields:
+            field_heading = document.add_heading(label, level=4)
+            field_heading.paragraph_format.keep_with_next = True
+            document.add_paragraph(str(value or ""))
 
 
 def _competitor_matrix(document: DocumentType, portfolios: Sequence[PortfolioDataset]) -> None:
@@ -382,6 +386,46 @@ def _evidence_note(document: DocumentType, text: str) -> None:
     run = paragraph.add_run(f"证据边界：{text}")
     run.italic = True
     run.font.color.rgb = RGBColor(89, 89, 89)
+
+
+def _apply_report_font(document: DocumentType) -> None:
+    for style in document.styles:
+        if style.type not in {WD_STYLE_TYPE.PARAGRAPH, WD_STYLE_TYPE.CHARACTER}:
+            continue
+        style.font.name = REPORT_FONT
+        _set_run_fonts(style.element.get_or_add_rPr())
+
+    containers = [document]
+    for section in document.sections:
+        containers.extend(
+            [
+                section.header,
+                section.first_page_header,
+                section.even_page_header,
+                section.footer,
+                section.first_page_footer,
+                section.even_page_footer,
+            ]
+        )
+    for container in containers:
+        for paragraph in _iter_paragraphs(container):
+            for run in paragraph.runs:
+                run.font.name = REPORT_FONT
+                _set_run_fonts(run._element.get_or_add_rPr())
+
+
+def _iter_paragraphs(container):
+    yield from container.paragraphs
+    for table in container.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                yield from _iter_paragraphs(cell)
+
+
+def _set_run_fonts(run_properties) -> None:
+    fonts = run_properties.get_or_add_rFonts()
+    for attribute in ("ascii", "hAnsi", "eastAsia", "cs"):
+        fonts.set(qn(f"w:{attribute}"), REPORT_FONT)
 
 
 def _year_range(years: Counter[str]) -> str:

@@ -6,6 +6,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 import build_portable
+from docx import Document
+from docx.oxml.ns import qn
 
 from patent_summarizer.gui import (
     COPYRIGHT_TEXT,
@@ -28,6 +30,8 @@ from patent_summarizer.gui import (
     report_scope_confirmation_message,
 )
 from patent_summarizer.progress import ProgressUpdate
+from patent_summarizer.report_docx import REPORT_FONT, _apply_report_font, _iter_paragraphs, _trend_sections
+from patent_summarizer.trend_analysis import TrendAnalysisResult, TrendGroupStats, TrendReport
 
 
 class GuiCommandTests(unittest.TestCase):
@@ -298,6 +302,84 @@ class PortableRuntimeFilesTests(unittest.TestCase):
             self.assertIn(heading, guide)
         self.assertIn("前置条件", guide)
         self.assertIn("使用方法", guide)
+
+
+class ReportDocxTests(unittest.TestCase):
+    def test_trend_sections_use_nested_headings_instead_of_table(self):
+        stats = TrendGroupStats(
+            first_level="制动系统",
+            second_level="线控制动",
+            patent_count=3,
+            year_counts={"2024": 3},
+            year_range="2024-2024",
+            peak_year="2024",
+            average_confidence=0.9,
+            review_count=0,
+            top_keywords=["制动"],
+            representative_patents=["CN1"],
+        )
+        report = TrendReport(
+            stats=stats,
+            status_summary="处于持续布局状态",
+            development_stage="成长期",
+            technical_routes="电机与液压协同",
+            hot_topics="冗余控制",
+            opportunities="故障降级",
+            risks="样本有限",
+            representative_patents="CN1",
+            evidence_limits="仅基于输入样本",
+        )
+        document = Document()
+
+        _trend_sections(document, TrendAnalysisResult(reports=[report], records=[]))
+
+        self.assertEqual(0, len(document.tables))
+        headings = [
+            (paragraph.style.name, paragraph.text)
+            for paragraph in document.paragraphs
+            if paragraph.style.name.startswith("Heading")
+        ]
+        self.assertEqual(
+            [
+                ("Heading 2", "主要技术路线、热点与机会"),
+                ("Heading 3", "制动系统 / 线控制动"),
+                ("Heading 4", "发展现状/阶段"),
+                ("Heading 4", "主要技术路线"),
+                ("Heading 4", "热点方向"),
+                ("Heading 4", "机会与空白"),
+                ("Heading 4", "代表专利"),
+            ],
+            headings,
+        )
+        body_text = "\n".join(paragraph.text for paragraph in document.paragraphs)
+        for expected in ["处于持续布局状态", "成长期", "电机与液压协同", "冗余控制", "故障降级", "CN1"]:
+            self.assertIn(expected, body_text)
+
+    def test_report_font_applies_to_styles_body_tables_headers_and_footers(self):
+        document = Document()
+        title = document.add_heading("报告标题", level=1)
+        title.runs[0].font.name = "微软雅黑"
+        document.add_table(rows=1, cols=1).cell(0, 0).text = "表格内容"
+        document.sections[0].header.paragraphs[0].text = "页眉"
+        document.sections[0].footer.paragraphs[0].text = "页脚"
+
+        _apply_report_font(document)
+
+        for style_name in ["Normal", "Title", "Heading 1", "Heading 4", "List Bullet", "Header", "Footer"]:
+            style = document.styles[style_name]
+            self.assertEqual(REPORT_FONT, style.font.name)
+            fonts = style.element.get_or_add_rPr().get_or_add_rFonts()
+            for attribute in ("ascii", "hAnsi", "eastAsia", "cs"):
+                self.assertEqual(REPORT_FONT, fonts.get(qn(f"w:{attribute}")))
+
+        containers = [document, document.sections[0].header, document.sections[0].footer]
+        for container in containers:
+            for paragraph in _iter_paragraphs(container):
+                for run in paragraph.runs:
+                    self.assertEqual(REPORT_FONT, run.font.name)
+                    fonts = run._element.get_or_add_rPr().get_or_add_rFonts()
+                    for attribute in ("ascii", "hAnsi", "eastAsia", "cs"):
+                        self.assertEqual(REPORT_FONT, fonts.get(qn(f"w:{attribute}")))
 
 
 if __name__ == "__main__":
