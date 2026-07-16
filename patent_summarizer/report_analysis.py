@@ -10,7 +10,13 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol, TypeVar
 
 from .comparison import ComparisonResult, PortfolioDataset
-from .prompts import REPORT_COMPETITOR_PROMPT, REPORT_EXECUTIVE_PROMPT, REPORT_SYSTEM_PROMPT, REPORT_TARGET_PROMPT
+from .prompts import (
+    REPORT_COMPETITOR_PROMPT,
+    REPORT_EXECUTIVE_PROMPT,
+    REPORT_PORTFOLIO_OVERVIEW_PROMPT,
+    REPORT_SYSTEM_PROMPT,
+    REPORT_TARGET_PROMPT,
+)
 from .trend_analysis import TrendAnalysisResult
 
 
@@ -115,12 +121,25 @@ class ExecutiveSummary:
 
 
 @dataclass(frozen=True)
+class PortfolioOverview:
+    label: str
+    summary: str
+
+
+@dataclass(frozen=True)
+class PortfolioOverviewAnalysis:
+    industry_summary: str
+    company_summaries: dict[str, str]
+
+
+@dataclass(frozen=True)
 class PatentLayoutReport:
     target: PortfolioDataset
     baselines: list[PortfolioDataset]
     industry: PortfolioDataset
     trends: dict[str, TrendAnalysisResult]
     comparison: ComparisonResult
+    portfolio_overviews: PortfolioOverviewAnalysis
     competitor_analysis: CompetitorAnalysis
     target_analysis: TargetAnalysis
     executive_summary: ExecutiveSummary
@@ -214,11 +233,43 @@ class ReportSynthesisAnalyzer:
         self,
         target: PortfolioDataset,
         baselines: list[PortfolioDataset],
+        industry: PortfolioDataset,
         trends: dict[str, TrendAnalysisResult],
         comparison: ComparisonResult,
         on_stage: Callable[[str, bool], None] | None = None,
-    ) -> tuple[CompetitorAnalysis, TargetAnalysis, ExecutiveSummary]:
+    ) -> tuple[PortfolioOverviewAnalysis, CompetitorAnalysis, TargetAnalysis, ExecutiveSummary]:
         evidence = _report_evidence_payload(target, baselines, trends, comparison)
+        overview_specs = [
+            ("全部样本", industry),
+            ("企业", target),
+            *[("企业", item) for item in baselines],
+        ]
+        overview_results: list[PortfolioOverview] = []
+        for scope_type, portfolio in overview_specs:
+            stage = f"{portfolio.label}整体布局现状"
+            _notify_stage(on_stage, stage, started=True)
+            overview = self._validated_chat(
+                stage,
+                REPORT_PORTFOLIO_OVERVIEW_PROMPT.format(
+                    scope_type=scope_type,
+                    scope_label=portfolio.label,
+                    evidence=json.dumps(
+                        _portfolio_overview_evidence(portfolio, trends.get(portfolio.label)),
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                ),
+                lambda response, expected_label=portfolio.label: parse_portfolio_overview(
+                    response,
+                    expected_label=expected_label,
+                ),
+            )
+            overview_results.append(overview)
+            _notify_stage(on_stage, stage, started=False)
+        portfolio_overviews = PortfolioOverviewAnalysis(
+            industry_summary=overview_results[0].summary,
+            company_summaries={item.label: item.summary for item in overview_results[1:]},
+        )
         _notify_stage(on_stage, "竞争对手布局策略", started=True)
         competitor_labels = {item.label for item in baselines}
         competitor = self._validated_chat(
@@ -251,7 +302,7 @@ class ReportSynthesisAnalyzer:
             parse_executive_summary,
         )
         _notify_stage(on_stage, "管理层结论", started=False)
-        return competitor, target_analysis, executive
+        return portfolio_overviews, competitor, target_analysis, executive
 
     def _validated_chat(
         self,
@@ -436,6 +487,22 @@ def parse_executive_summary(response: str | Mapping[str, Any]) -> ExecutiveSumma
     return ExecutiveSummary(conclusions, _required_text(payload, "总体证据局限"))
 
 
+def parse_portfolio_overview(
+    response: str | Mapping[str, Any],
+    expected_label: str,
+) -> PortfolioOverview:
+    payload = _mapping_payload(response)
+    _require_fields(payload, ["对象", "整体布局现状"])
+    _reject_forbidden(payload)
+    label = _required_string(payload, "对象")
+    if label != expected_label:
+        raise ValueError(f"整体布局现状对象必须为：{expected_label}；实际为：{label}")
+    return PortfolioOverview(
+        label=label,
+        summary=_required_string(payload, "整体布局现状"),
+    )
+
+
 def _parse_strategy(payload: Mapping[str, Any], context: str = "策略") -> StrategyItem:
     fields = ["策略名称", "核心特征", "适用企业", "重点技术分类", "统计及连续性证据", "代表性专利", "组合中的作用"]
     _require_fields(payload, fields)
@@ -563,6 +630,16 @@ def _required_text(payload: Mapping[str, Any], field: str) -> str:
     return value
 
 
+def _required_string(payload: Mapping[str, Any], field: str) -> str:
+    value = payload.get(field)
+    if not isinstance(value, str):
+        raise ValueError(f"{field} 必须是字符串")
+    value = value.strip()
+    if not value:
+        raise ValueError(f"{field} 必须是非空文本")
+    return value
+
+
 def _reject_forbidden(payload: Mapping[str, Any]) -> None:
     text = json.dumps(payload, ensure_ascii=False)
     for phrase in FORBIDDEN_REPORT_PHRASES:
@@ -627,6 +704,32 @@ def _report_evidence_payload(
                 ],
             }
             for item in comparison.reports
+        ],
+    }
+
+
+def _portfolio_overview_evidence(
+    portfolio: PortfolioDataset,
+    trend: TrendAnalysisResult | None,
+) -> dict[str, Any]:
+    return {
+        "分析口径": "仅基于用户上传并完成摘要、分类的专利样本",
+        "组合统计": _portfolio_digest(portfolio),
+        "趋势分析": [
+            {
+                "一级分类": item.stats.first_level,
+                "二级分类": item.stats.second_level,
+                "专利数": item.stats.patent_count,
+                "年份分布": item.stats.year_counts,
+                "发展现状": item.status_summary,
+                "发展阶段": item.development_stage,
+                "主要技术路线": item.technical_routes,
+                "热点方向": item.hot_topics,
+                "机会与空白": item.opportunities,
+                "代表专利": item.representative_patents,
+                "证据局限": item.evidence_limits,
+            }
+            for item in (trend.reports if trend is not None else [])
         ],
     }
 

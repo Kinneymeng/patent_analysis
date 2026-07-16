@@ -1,3 +1,4 @@
+import json
 import runpy
 import tempfile
 import unittest
@@ -8,6 +9,7 @@ import build_portable
 from docx import Document
 from docx.oxml.ns import qn
 
+from patent_summarizer.comparison import ComparisonResult, PortfolioDataset
 from patent_summarizer.gui import (
     COPYRIGHT_TEXT,
     DESKTOP_EDITORIAL_PALETTE,
@@ -28,7 +30,22 @@ from patent_summarizer.gui import (
     progress_display,
 )
 from patent_summarizer.progress import ProgressUpdate
-from patent_summarizer.report_docx import REPORT_FONT, _apply_report_font, _iter_paragraphs, _trend_sections
+from patent_summarizer.report_analysis import (
+    CompetitorAnalysis,
+    ExecutiveSummary,
+    PatentLayoutReport,
+    PortfolioOverviewAnalysis,
+    ReportSynthesisAnalyzer,
+    TargetAnalysis,
+    parse_portfolio_overview,
+)
+from patent_summarizer.report_docx import (
+    REPORT_FONT,
+    _apply_report_font,
+    _build_report_body,
+    _iter_paragraphs,
+    _trend_sections,
+)
 from patent_summarizer.trend_analysis import TrendAnalysisResult, TrendGroupStats, TrendReport
 
 
@@ -261,6 +278,236 @@ class PortableRuntimeFilesTests(unittest.TestCase):
 
 
 class ReportDocxTests(unittest.TestCase):
+    def test_portfolio_overview_requires_exact_object_and_text(self):
+        valid = {
+            "对象": "目标企业",
+            "整体布局现状": "目标企业集中布局制动系统。",
+        }
+
+        result = parse_portfolio_overview(valid, "目标企业")
+
+        self.assertEqual("目标企业", result.label)
+        self.assertEqual("目标企业集中布局制动系统。", result.summary)
+
+        invalid_cases = [
+            (
+                {
+                    **valid,
+                    "对象": "其他企业",
+                },
+                "对象必须为",
+            ),
+            (
+                {
+                    **valid,
+                    "整体布局现状": "",
+                },
+                "必须是非空文本",
+            ),
+            (
+                {
+                    **valid,
+                    "整体布局现状": ["错误类型"],
+                },
+                "必须是字符串",
+            ),
+            (
+                {
+                    "对象": "目标企业",
+                },
+                "缺少必填字段",
+            ),
+        ]
+        for payload, error in invalid_cases:
+            with self.subTest(error=error):
+                with self.assertRaisesRegex(ValueError, error):
+                    parse_portfolio_overview(payload, "目标企业")
+
+    def test_invalid_portfolio_overviews_use_existing_repair_flow(self):
+        invalid = {
+            "对象": "错误企业",
+            "整体布局现状": "错误概述",
+        }
+        valid = {
+            "对象": "目标企业",
+            "整体布局现状": "目标概述",
+        }
+
+        class SequenceClient:
+            def __init__(self):
+                self.responses = [invalid, valid]
+                self.prompts = []
+
+            def chat(self, system_prompt, user_prompt):
+                self.prompts.append(user_prompt)
+                return self.responses.pop(0)
+
+        client = SequenceClient()
+        result = ReportSynthesisAnalyzer(client)._validated_chat(
+            "整体布局现状",
+            "生成布局概述",
+            lambda response: parse_portfolio_overview(response, "目标企业"),
+        )
+
+        self.assertEqual("目标概述", result.summary)
+        self.assertEqual(2, len(client.prompts))
+        self.assertIn("对象必须为", client.prompts[1])
+
+    def test_report_analysis_generates_each_overview_in_its_own_call(self):
+        target = PortfolioDataset("目标企业", Path("target"), Path(), "test", [])
+        baseline = PortfolioDataset("竞争对手", Path("baseline"), Path(), "test", [])
+        industry = PortfolioDataset("全部样本", Path("industry"), Path(), "combined", [])
+
+        def trend_for(label):
+            stats = TrendGroupStats(
+                first_level=label,
+                second_level="测试分类",
+                patent_count=1,
+                year_counts={"2024": 1},
+                year_range="2024-2024",
+                peak_year="2024",
+                average_confidence=0.9,
+                review_count=0,
+                top_keywords=[label],
+                representative_patents=[f"{label}专利"],
+            )
+            return TrendAnalysisResult(
+                reports=[
+                    TrendReport(
+                        stats=stats,
+                        status_summary=f"{label}现状",
+                        development_stage="成长期",
+                        technical_routes=f"{label}路线",
+                        hot_topics=f"{label}热点",
+                        opportunities=f"{label}机会",
+                        risks="样本有限",
+                        representative_patents=f"{label}专利",
+                        evidence_limits="仅基于样本",
+                    )
+                ],
+                records=[],
+            )
+
+        trends = {label: trend_for(label) for label in ["全部样本", "目标企业", "竞争对手"]}
+        responses = [
+            {
+                "对象": "全部样本",
+                "整体布局现状": "样本概述",
+            },
+            {
+                "对象": "目标企业",
+                "整体布局现状": "目标概述",
+            },
+            {
+                "对象": "竞争对手",
+                "整体布局现状": "竞品概述",
+            },
+            {
+                "共性布局策略": [],
+                "企业差异化策略": [],
+                "竞争对手趋势研判": [],
+                "未来竞争焦点": "制动系统",
+                "证据局限": "仅基于样本",
+            },
+            {
+                "长安总体策略": [],
+                "待布局建议点": [],
+                "专利组合策略": [],
+                "证据局限": "仅基于样本",
+            },
+            {
+                "管理层结论": ["结论一", "结论二", "结论三"],
+                "总体证据局限": "仅基于样本",
+            },
+        ]
+
+        class SequenceClient:
+            def __init__(self):
+                self.prompts = []
+
+            def chat(self, system_prompt, user_prompt):
+                self.prompts.append(user_prompt)
+                return responses.pop(0)
+
+        client = SequenceClient()
+        overviews, _competitor, _target_analysis, _executive = ReportSynthesisAnalyzer(client).analyze(
+            target,
+            [baseline],
+            industry,
+            trends,
+            ComparisonResult(target, [baseline], baseline, []),
+        )
+
+        self.assertEqual("样本概述", overviews.industry_summary)
+        self.assertEqual("目标概述", overviews.company_summaries["目标企业"])
+        self.assertEqual("竞品概述", overviews.company_summaries["竞争对手"])
+        self.assertEqual(6, len(client.prompts))
+        self.assertIn("对象名称：全部样本", client.prompts[0])
+        self.assertIn("对象名称：目标企业", client.prompts[1])
+        self.assertIn("对象名称：竞争对手", client.prompts[2])
+        self.assertNotIn("竞争对手", client.prompts[1])
+        self.assertNotIn("目标企业", client.prompts[2])
+        self.assertIn("全部样本路线", client.prompts[0])
+        self.assertNotIn("目标企业路线", client.prompts[0])
+        self.assertIn("目标企业路线", client.prompts[1])
+        self.assertNotIn("竞争对手路线", client.prompts[1])
+        self.assertIn("竞争对手路线", client.prompts[2])
+        self.assertNotIn("全部样本路线", client.prompts[2])
+        self.assertEqual(3, sum("指定对象撰写" in prompt for prompt in client.prompts))
+
+    def test_report_places_three_overviews_after_summary_tables(self):
+        target = PortfolioDataset("目标企业", Path("target"), Path(), "test", [])
+        baseline = PortfolioDataset("竞争对手", Path("baseline"), Path(), "test", [])
+        industry = PortfolioDataset("全部样本", Path("industry"), Path(), "combined", [])
+        report = PatentLayoutReport(
+            target=target,
+            baselines=[baseline],
+            industry=industry,
+            trends={},
+            comparison=ComparisonResult(target, [baseline], baseline, []),
+            portfolio_overviews=PortfolioOverviewAnalysis(
+                industry_summary="行业概述",
+                company_summaries={"目标企业": "目标概述", "竞争对手": "竞品概述"},
+            ),
+            competitor_analysis=CompetitorAnalysis([], [], [], "未来焦点", "证据有限"),
+            target_analysis=TargetAnalysis([], [], [], "证据有限"),
+            executive_summary=ExecutiveSummary(["结论一", "结论二", "结论三"], "证据有限"),
+            taxonomy=[],
+        )
+        document = Document()
+
+        _build_report_body(document, report)
+
+        body_children = list(document._element.body)
+        overview_paragraphs = {
+            paragraph.text: paragraph
+            for paragraph in document.paragraphs
+            if paragraph.text in {
+                "整体布局现状：行业概述",
+                "整体布局现状：竞品概述",
+                "整体布局现状：目标概述",
+            }
+        }
+        self.assertEqual(3, len(overview_paragraphs))
+        for text, paragraph in overview_paragraphs.items():
+            index = body_children.index(paragraph._element)
+            preceding = index - 1
+            while preceding >= 0 and body_children[preceding].tag == qn("w:p"):
+                preceding_text = "".join(body_children[preceding].itertext()).strip()
+                if preceding_text:
+                    break
+                preceding -= 1
+            self.assertEqual(qn("w:tbl"), body_children[preceding].tag, text)
+            document_paragraphs = document.paragraphs
+            paragraph_index = next(
+                position
+                for position, item in enumerate(document_paragraphs)
+                if item._element is paragraph._element
+            )
+            following = next(item for item in document_paragraphs[paragraph_index + 1 :] if item.text.strip())
+            self.assertEqual("年度分布", following.text, text)
+            self.assertTrue(paragraph.runs[0].bold)
+
     def test_trend_sections_use_nested_headings_instead_of_table(self):
         stats = TrendGroupStats(
             first_level="制动系统",
