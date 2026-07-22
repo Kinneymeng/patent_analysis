@@ -29,34 +29,59 @@ def write_patent_layout_report(
     template: Path,
     output: Path,
     overwrite: bool = False,
-) -> None:
+) -> tuple[Path, Path]:
     template = Path(template)
     output = Path(output)
+    appendix_output = derive_appendix_output(output)
     if not template.exists():
         raise FileNotFoundError(f"DOCX template does not exist: {template}")
     if output.suffix.lower() != ".docx":
         raise ValueError("Report output must use the .docx extension")
-    if output.exists() and not overwrite:
-        raise FileExistsError(f"Report output already exists: {output}; use --overwrite to replace it")
+    existing = [path for path in (output, appendix_output) if path.exists()]
+    if existing and not overwrite:
+        paths = "；".join(str(path) for path in existing)
+        raise FileExistsError(f"Report output already exists: {paths}; use --overwrite to replace it")
 
     document = Document(template)
     _prepare_template(document)
     _build_report_body(document, report)
     _apply_report_font(document)
+    appendix = Document(template)
+    _prepare_template(appendix, appendix=True)
+    _build_appendix_body(appendix, report)
+    _apply_report_font(appendix)
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.with_name(f".{output.stem}.{uuid.uuid4().hex}.tmp.docx")
+    appendix_temporary = appendix_output.with_name(
+        f".{appendix_output.stem}.{uuid.uuid4().hex}.tmp.docx"
+    )
     try:
         document.save(temporary)
+        appendix.save(appendix_temporary)
+        Document(temporary)
+        Document(appendix_temporary)
         os.replace(temporary, output)
+        os.replace(appendix_temporary, appendix_output)
     finally:
         if temporary.exists():
             temporary.unlink()
+        if appendix_temporary.exists():
+            appendix_temporary.unlink()
+    return output, appendix_output
 
 
-def _prepare_template(document: DocumentType) -> None:
+def derive_appendix_output(output: Path) -> Path:
+    output = Path(output)
+    return output.with_name(f"{output.stem}_附录.docx")
+
+
+def _prepare_template(document: DocumentType, appendix: bool = False) -> None:
     for paragraph in document.paragraphs:
         if "DOCX 内容与章节模板" in paragraph.text:
-            paragraph.text = paragraph.text.replace("DOCX 内容与章节模板", "专利布局分析报告")
+            replacement = "分析依据与专利清单" if appendix else "专利布局分析报告"
+            paragraph.text = paragraph.text.replace("DOCX 内容与章节模板", replacement)
+        if appendix and paragraph.style.name == "Title" and "专利布局分析报告" in paragraph.text:
+            paragraph.text = paragraph.text.replace("专利布局分析报告", "专利布局分析报告附录")
 
     first_heading = next(
         (paragraph for paragraph in document.paragraphs if paragraph.style.name == "Heading 1"),
@@ -88,7 +113,6 @@ def _build_report_body(document: DocumentType, report: PatentLayoutReport) -> No
             ["六", f"{report.target.label}专利布局策略及建议"],
             ["七", "待布局的重点建议"],
             ["八", "专利组合构建策略建议"],
-            ["附录", "分析依据与专利清单"],
         ],
     )
 
@@ -134,19 +158,13 @@ def _build_report_body(document: DocumentType, report: PatentLayoutReport) -> No
     _evidence_note(document, report.competitor_analysis.evidence_limits)
 
     _chapter(document, "四、主要竞争对手的布局趋势研判")
-    _add_table(
-        document,
-        ["企业", "可能强化方向", "时间序列信号", "关键词及路线依据", "代表性专利", "证据限制"],
-        [
-            [item.company, item.direction, item.time_signal, item.route_evidence, "\n".join(item.representative_patents), item.evidence_limit]
-            for item in report.competitor_analysis.forecasts
-        ],
-        font_size=8,
-    )
-    document.add_heading("4.3 未来竞争焦点", level=2)
+    _chapter_summary(document, report.enhancements.chapter_summaries.chapter_four)
+    company_count = _forecast_sections(document, report)
+    document.add_heading(f"4.{company_count + 1} 未来竞争焦点", level=2)
     document.add_paragraph(report.competitor_analysis.future_focus)
 
     _chapter(document, f"五、{report.target.label}布局现状及优劣势分析")
+    _chapter_summary(document, report.enhancements.chapter_summaries.chapter_five)
     document.add_heading(f"5.1 {report.target.label}布局现状", level=2)
     _portfolio_overview(
         document,
@@ -157,6 +175,7 @@ def _build_report_body(document: DocumentType, report: PatentLayoutReport) -> No
     _comparison_sections(document, report)
 
     _chapter(document, f"六、{report.target.label}专利布局策略及建议")
+    _chapter_summary(document, report.enhancements.chapter_summaries.chapter_six)
     _add_table(
         document,
         ["策略", "目标", "重点技术领域", "优先顺序", "建议理由", "关联建议点"],
@@ -200,6 +219,10 @@ def _build_report_body(document: DocumentType, report: PatentLayoutReport) -> No
         )
     _evidence_note(document, report.target_analysis.evidence_limits)
 
+    _remove_trailing_empty_paragraph(document)
+
+
+def _build_appendix_body(document: DocumentType, report: PatentLayoutReport) -> None:
     _chapter(document, "附录：分析依据与专利清单")
     document.add_heading("附录 A：分析样本与企业目录", level=2)
     _add_table(
@@ -231,6 +254,46 @@ def _chapter(document: DocumentType, title: str) -> None:
     if document.paragraphs:
         document.paragraphs[-1].add_run().add_break(WD_BREAK.PAGE)
     document.add_heading(title, level=1)
+
+
+def _chapter_summary(document: DocumentType, paragraphs: Sequence[str]) -> None:
+    for text in paragraphs:
+        if text.strip():
+            document.add_paragraph(text.strip())
+
+
+def _forecast_sections(document: DocumentType, report: PatentLayoutReport) -> int:
+    grouped: dict[str, list[tuple[int, object]]] = {}
+    for forecast_index, forecast in enumerate(report.competitor_analysis.forecasts, start=1):
+        grouped.setdefault(forecast.company, []).append((forecast_index, forecast))
+
+    for company_index, (company, forecasts) in enumerate(grouped.items(), start=1):
+        document.add_heading(f"4.{company_index} {company}", level=2)
+        fields = [
+            ("可能强化方向", lambda item: item.direction),
+            ("时间序列信号", lambda item: item.time_signal),
+            ("关键词及路线依据", lambda item: item.route_evidence),
+            ("典型技术", None),
+            ("代表性专利", lambda item: "\n".join(item.representative_patents)),
+            ("证据局限", lambda item: item.evidence_limit),
+        ]
+        for heading, getter in fields:
+            field_heading = document.add_heading(heading, level=3)
+            field_heading.paragraph_format.keep_with_next = True
+            for direction_index, (forecast_index, forecast) in enumerate(forecasts, start=1):
+                paragraph = document.add_paragraph()
+                label = paragraph.add_run(f"方向{direction_index}：")
+                label.bold = True
+                if heading == "典型技术":
+                    technologies = report.enhancements.forecast_technologies.get(forecast_index, [])
+                    if technologies:
+                        paragraph.add_run("\n" + "\n".join(
+                            f"技术{index}：{technology}"
+                            for index, technology in enumerate(technologies, start=1)
+                        ))
+                else:
+                    paragraph.add_run(str(getter(forecast) or ""))
+    return len(grouped)
 
 
 def _portfolio_overview(

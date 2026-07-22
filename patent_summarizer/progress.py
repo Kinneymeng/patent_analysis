@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Callable, Literal
 
 
-ProgressState = Literal["preparing", "running", "success", "error"]
+ProgressState = Literal["preparing", "running", "success", "error", "cancelled"]
 ProgressCallback = Callable[["ProgressUpdate"], None]
 
 
@@ -59,6 +59,9 @@ class ProgressTracker:
 
     def fail(self, stage: str, detail: str = "") -> None:
         self._emit("error", stage, detail)
+
+    def cancel(self, stage: str = "已取消", detail: str = "") -> None:
+        self._emit("cancelled", stage, detail)
 
     def _require_started(self) -> None:
         if self.total is None:
