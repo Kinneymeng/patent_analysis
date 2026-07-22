@@ -302,9 +302,15 @@ class ReportSynthesisAnalyzer:
         )
         _notify_stage(on_stage, "竞争对手布局策略", started=False)
         _notify_stage(on_stage, f"{target.label}布局建议", started=True)
+        target_prompt = REPORT_TARGET_PROMPT.format(evidence=json.dumps(evidence, ensure_ascii=False, indent=2))
+        if "长安" not in target.label:
+            target_prompt += f"""
+
+目标企业实际名称为“{target.label}”。JSON 字段名中的“长安”仅为兼容现有数据结构的固定字段名；所有字段内容必须使用“{target.label}”指代目标企业，不得将目标企业写成长安汽车。
+"""
         target_analysis = self._validated_chat(
             f"{target.label}布局建议",
-            REPORT_TARGET_PROMPT.format(evidence=json.dumps(evidence, ensure_ascii=False, indent=2)),
+            target_prompt,
             parse_target_analysis,
         )
         _notify_stage(on_stage, f"{target.label}布局建议", started=False)
@@ -377,6 +383,7 @@ class ReportEnhancementAnalyzer:
         portfolio_overviews: PortfolioOverviewAnalysis,
         competitor_analysis: CompetitorAnalysis,
         target_analysis: TargetAnalysis,
+        executive_summary: ExecutiveSummary | None = None,
         on_stage: Callable[[str, bool], None] | None = None,
     ) -> ReportEnhancements:
         technologies: dict[int, list[str]] = {}
@@ -414,6 +421,7 @@ class ReportEnhancementAnalyzer:
                         competitor_analysis,
                         target_analysis,
                         technologies,
+                        executive_summary,
                     ),
                     ensure_ascii=False,
                     indent=2,
@@ -493,16 +501,18 @@ def parse_competitor_analysis(
         _parse_strategy(item, f"企业差异化策略[{index}]")
         for index, item in enumerate(_mapping_list(payload["企业差异化策略"], "企业差异化策略"), start=1)
     ]
+    forecasts = [
+        _parse_forecast(item, f"竞争对手趋势研判[{index}]")
+        for index, item in enumerate(_mapping_list(payload["竞争对手趋势研判"], "竞争对手趋势研判"), start=1)
+    ]
     if allowed_companies is not None:
         common_strategies = _filter_competitor_strategies(common_strategies, allowed_companies)
         differentiated_strategies = _filter_competitor_strategies(differentiated_strategies, allowed_companies)
+        forecasts = _filter_competitor_forecasts(forecasts, allowed_companies)
     return CompetitorAnalysis(
         common_strategies=common_strategies,
         differentiated_strategies=differentiated_strategies,
-        forecasts=[
-            _parse_forecast(item, f"竞争对手趋势研判[{index}]")
-            for index, item in enumerate(_mapping_list(payload["竞争对手趋势研判"], "竞争对手趋势研判"), start=1)
-        ],
+        forecasts=forecasts,
         future_focus=_required_text(payload, "未来竞争焦点"),
         evidence_limits=_required_text(payload, "证据局限"),
     )
@@ -521,6 +531,18 @@ def _filter_competitor_strategies(
                 companies.append(resolved)
         if companies:
             filtered.append(replace(strategy, companies=companies))
+    return filtered
+
+
+def _filter_competitor_forecasts(
+    forecasts: list[TrendForecast],
+    allowed_companies: set[str],
+) -> list[TrendForecast]:
+    filtered: list[TrendForecast] = []
+    for forecast in forecasts:
+        company = _resolve_allowed_company(forecast.company, allowed_companies)
+        if company is not None:
+            filtered.append(replace(forecast, company=company))
     return filtered
 
 
@@ -825,9 +847,18 @@ def _chapter_summary_evidence(
     competitor: CompetitorAnalysis,
     target_analysis: TargetAnalysis,
     technologies: dict[int, list[str]],
+    executive_summary: ExecutiveSummary | None = None,
 ) -> dict[str, Any]:
     target_trends = trends.get(target.label)
     return {
+        "已有管理层摘要": (
+            {
+                "管理层结论": executive_summary.conclusions,
+                "总体证据局限": executive_summary.evidence_limits,
+            }
+            if executive_summary is not None
+            else {}
+        ),
         "第四章": {
             "竞争对手趋势研判": [
                 {
@@ -841,6 +872,7 @@ def _chapter_summary_evidence(
         },
         "第五章": {
             "目标企业": target.label,
+            "组合统计": _portfolio_chapter_stats(target),
             "整体布局现状": overviews.company_summaries.get(target.label, ""),
             "技术趋势": [
                 {
@@ -888,6 +920,23 @@ def _chapter_summary_evidence(
             ],
             "证据局限": target_analysis.evidence_limits,
         },
+    }
+
+
+def _portfolio_chapter_stats(portfolio: PortfolioDataset) -> dict[str, Any]:
+    years = Counter(record.inferred_year or "未知" for record in portfolio.records)
+    labels = Counter(
+        (record.primary_first_level, record.primary_second_level)
+        for record in portfolio.records
+        if record.primary_second_level.strip()
+    )
+    return {
+        "专利数": len(portfolio.records),
+        "年份分布": dict(sorted(years.items())),
+        "分类分布": [
+            {"一级分类": first, "二级分类": second, "专利数": count}
+            for (first, second), count in labels.most_common()
+        ],
     }
 
 

@@ -465,6 +465,8 @@ class ReportDocxTests(unittest.TestCase):
         self.assertIn("竞争对手路线", client.prompts[2])
         self.assertNotIn("全部样本路线", client.prompts[2])
         self.assertEqual(3, sum("指定对象撰写" in prompt for prompt in client.prompts))
+        self.assertIn("目标企业实际名称为“目标企业”", client.prompts[4])
+        self.assertIn("不得将目标企业写成长安汽车", client.prompts[4])
 
     def test_report_places_three_overviews_after_summary_tables(self):
         target = PortfolioDataset("目标企业", Path("target"), Path(), "test", [])

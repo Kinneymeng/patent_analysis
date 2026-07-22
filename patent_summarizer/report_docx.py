@@ -43,11 +43,11 @@ def write_patent_layout_report(
         raise FileExistsError(f"Report output already exists: {paths}; use --overwrite to replace it")
 
     document = Document(template)
-    _prepare_template(document)
+    _prepare_template(document, target_label=report.target.label)
     _build_report_body(document, report)
     _apply_report_font(document)
     appendix = Document(template)
-    _prepare_template(appendix, appendix=True)
+    _prepare_template(appendix, appendix=True, target_label=report.target.label)
     _build_appendix_body(appendix, report)
     _apply_report_font(appendix)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -75,13 +75,22 @@ def derive_appendix_output(output: Path) -> Path:
     return output.with_name(f"{output.stem}_附录.docx")
 
 
-def _prepare_template(document: DocumentType, appendix: bool = False) -> None:
+def _prepare_template(
+    document: DocumentType,
+    appendix: bool = False,
+    target_label: str = "长安汽车",
+) -> None:
     for paragraph in document.paragraphs:
         if "DOCX 内容与章节模板" in paragraph.text:
             replacement = "分析依据与专利清单" if appendix else "专利布局分析报告"
             paragraph.text = paragraph.text.replace("DOCX 内容与章节模板", replacement)
         if appendix and paragraph.style.name == "Title" and "专利布局分析报告" in paragraph.text:
             paragraph.text = paragraph.text.replace("专利布局分析报告", "专利布局分析报告附录")
+        if "长安汽车与主要竞争对手专利组合分析" in paragraph.text:
+            paragraph.text = paragraph.text.replace(
+                "长安汽车与主要竞争对手专利组合分析",
+                f"{target_label}与主要竞争对手专利组合分析",
+            )
 
     first_heading = next(
         (paragraph for paragraph in document.paragraphs if paragraph.style.name == "Heading 1"),
@@ -145,8 +154,9 @@ def _build_report_body(document: DocumentType, report: PatentLayoutReport) -> No
             document,
             baseline,
             report.portfolio_overviews.company_summaries[baseline.label],
+            heading_level=3,
         )
-        _trend_sections(document, report.trends.get(baseline.label))
+        _trend_sections(document, report.trends.get(baseline.label), heading_level=3)
     document.add_heading(f"2.{len(report.baselines) + 1} 主要竞争对手横向比较", level=2)
     _competitor_matrix(document, report.baselines)
 
@@ -170,12 +180,15 @@ def _build_report_body(document: DocumentType, report: PatentLayoutReport) -> No
         document,
         report.target,
         report.portfolio_overviews.company_summaries[report.target.label],
+        heading_level=3,
     )
-    _trend_sections(document, report.trends.get(report.target.label))
+    _trend_sections(document, report.trends.get(report.target.label), heading_level=3)
+    document.add_heading("5.2 与主要竞争对手的布局比较", level=2)
     _comparison_sections(document, report)
 
     _chapter(document, f"六、{report.target.label}专利布局策略及建议")
     _chapter_summary(document, report.enhancements.chapter_summaries.chapter_six)
+    document.add_heading("6.1 总体专利布局策略", level=2)
     _add_table(
         document,
         ["策略", "目标", "重点技术领域", "优先顺序", "建议理由", "关联建议点"],
@@ -267,39 +280,70 @@ def _forecast_sections(document: DocumentType, report: PatentLayoutReport) -> in
     for forecast_index, forecast in enumerate(report.competitor_analysis.forecasts, start=1):
         grouped.setdefault(forecast.company, []).append((forecast_index, forecast))
 
-    for company_index, (company, forecasts) in enumerate(grouped.items(), start=1):
+    company_order = [baseline.label for baseline in report.baselines if baseline.label in grouped]
+    company_order.extend(company for company in grouped if company not in company_order)
+    for company_index, company in enumerate(company_order, start=1):
+        forecasts = grouped[company]
         document.add_heading(f"4.{company_index} {company}", level=2)
         fields = [
             ("可能强化方向", lambda item: item.direction),
             ("时间序列信号", lambda item: item.time_signal),
             ("关键词及路线依据", lambda item: item.route_evidence),
             ("典型技术", None),
-            ("代表性专利", lambda item: "\n".join(item.representative_patents)),
+            ("代表性专利", lambda item: item.representative_patents),
             ("证据局限", lambda item: item.evidence_limit),
         ]
         for heading, getter in fields:
             field_heading = document.add_heading(heading, level=3)
             field_heading.paragraph_format.keep_with_next = True
-            for direction_index, (forecast_index, forecast) in enumerate(forecasts, start=1):
+            if heading == "可能强化方向":
+                for direction_index, (_forecast_index, forecast) in enumerate(forecasts, start=1):
+                    paragraph = document.add_paragraph()
+                    label = paragraph.add_run(f"方向{direction_index}：")
+                    label.bold = True
+                    paragraph.add_run(forecast.direction)
+                continue
+            if heading == "典型技术":
+                technologies = _unique_text(
+                    technology
+                    for forecast_index, _forecast in forecasts
+                    for technology in report.enhancements.forecast_technologies.get(forecast_index, [])
+                )
+                for technology_index, technology in enumerate(technologies, start=1):
+                    document.add_paragraph(f"技术{technology_index}：{technology}")
+                continue
+            values = _unique_text(
+                value
+                for _forecast_index, forecast in forecasts
+                for value in _forecast_field_values(getter(forecast))
+            )
+            for value in values:
                 paragraph = document.add_paragraph()
-                label = paragraph.add_run(f"方向{direction_index}：")
-                label.bold = True
-                if heading == "典型技术":
-                    technologies = report.enhancements.forecast_technologies.get(forecast_index, [])
-                    if technologies:
-                        paragraph.add_run("\n" + "\n".join(
-                            f"技术{index}：{technology}"
-                            for index, technology in enumerate(technologies, start=1)
-                        ))
-                else:
-                    paragraph.add_run(str(getter(forecast) or ""))
+                paragraph.add_run(value)
     return len(grouped)
+
+
+def _forecast_field_values(value: object) -> list[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    text = str(value or "").strip()
+    return [text] if text else []
+
+
+def _unique_text(values: Iterable[str]) -> list[str]:
+    result: list[str] = []
+    for value in values:
+        text = str(value).strip()
+        if text and text not in result:
+            result.append(text)
+    return result
 
 
 def _portfolio_overview(
     document: DocumentType,
     portfolio: PortfolioDataset,
     overview_summary: str,
+    heading_level: int = 2,
 ) -> None:
     years = Counter(record.inferred_year or "未知" for record in portfolio.records)
     labels = Counter(
@@ -316,9 +360,9 @@ def _portfolio_overview(
     label = overview.add_run("整体布局现状：")
     label.bold = True
     overview.add_run(overview_summary)
-    document.add_heading("年度分布", level=2)
+    document.add_heading("年度分布", level=heading_level)
     _add_table(document, ["年份", "专利数"], [[year, str(count)] for year, count in sorted(years.items())])
-    document.add_heading("重点技术分类", level=2)
+    document.add_heading("重点技术分类", level=heading_level)
     _add_table(
         document,
         ["一级分类", "二级分类", "专利数", "占比"],
@@ -329,15 +373,19 @@ def _portfolio_overview(
     )
 
 
-def _trend_sections(document: DocumentType, result: TrendAnalysisResult | None) -> None:
+def _trend_sections(
+    document: DocumentType,
+    result: TrendAnalysisResult | None,
+    heading_level: int = 2,
+) -> None:
     if result is None or not result.reports:
         document.add_paragraph("该组合未形成可用的标签趋势报告。")
         return
-    document.add_heading("主要技术路线、热点与机会", level=2)
+    document.add_heading("主要技术路线、热点与机会", level=heading_level)
     for item in result.reports:
         category_heading = document.add_heading(
             f"{item.stats.first_level} / {item.stats.second_level}",
-            level=3,
+            level=heading_level + 1,
         )
         category_heading.paragraph_format.keep_with_next = True
         fields = [
@@ -348,7 +396,7 @@ def _trend_sections(document: DocumentType, result: TrendAnalysisResult | None) 
             ("代表专利", item.representative_patents),
         ]
         for label, value in fields:
-            field_heading = document.add_heading(label, level=4)
+            field_heading = document.add_heading(label, level=heading_level + 2)
             field_heading.paragraph_format.keep_with_next = True
             document.add_paragraph(str(value or ""))
 

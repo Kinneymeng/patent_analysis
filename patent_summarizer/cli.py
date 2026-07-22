@@ -322,6 +322,7 @@ def report(
             portfolio_overviews,
             competitor_analysis,
             target_analysis,
+            executive_summary=executive_summary,
             on_stage=on_report_stage if progress is not None else None,
         )
         if report_review is not None:
