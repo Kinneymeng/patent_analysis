@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 from pathlib import Path
 
 from .classification_pipeline import CheckpointStore, PatentClassificationPipeline, discover_classification_documents
@@ -14,15 +15,29 @@ from .llm import RateLimitedOpenAIClient
 from .logging_utils import RunLogger
 from .processor import PatentProcessor, ProcessingResult
 from .progress import ProgressCallback, ProgressTracker
-from .report_analysis import PatentLayoutReport, ReportCheckpointingClient, ReportSynthesisAnalyzer, combine_portfolios
-from .report_docx import write_patent_layout_report
+from .report_analysis import (
+    PatentLayoutReport,
+    ReportCheckpointingClient,
+    ReportEnhancementAnalyzer,
+    ReportReviewCallback,
+    ReportSynthesisAnalyzer,
+    combine_portfolios,
+)
+from .report_docx import derive_appendix_output, write_patent_layout_report
 from .summarizer import PatentSummarizer
 from .taxonomy import load_taxonomy
 from .trend_analysis import TrendAnalyzer, TrendCheckpointStore, build_trend_groups, load_classification_workbook, trend_work_units
 from .trend_excel_export import write_trend_workbook
 
 
-def main(argv: list[str] | None = None, progress: ProgressCallback | None = None) -> int:
+REPORT_CANCELLED_EXIT_CODE = 130
+
+
+def main(
+    argv: list[str] | None = None,
+    progress: ProgressCallback | None = None,
+    report_review: ReportReviewCallback | None = None,
+) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.command == "run":
@@ -34,7 +49,7 @@ def main(argv: list[str] | None = None, progress: ProgressCallback | None = None
     if args.command == "compare":
         return compare(args, progress=progress)
     if args.command == "report":
-        return report(args, progress=progress)
+        return report(args, progress=progress, report_review=report_review)
     parser.print_help()
     return 2
 
@@ -118,7 +133,11 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def report(args: argparse.Namespace, progress: ProgressCallback | None = None) -> int:
+def report(
+    args: argparse.Namespace,
+    progress: ProgressCallback | None = None,
+    report_review: ReportReviewCallback | None = None,
+) -> int:
     domain = args.domain.strip()
     domain_context = args.domain_context.strip()
     if not domain:
@@ -139,14 +158,17 @@ def report(args: argparse.Namespace, progress: ProgressCallback | None = None) -
     if args.output.suffix.lower() != ".docx":
         print("Input error: --output must use the .docx extension")
         return 2
+    appendix_output = derive_appendix_output(args.output)
     if not args.classes.exists():
         print(f"Input error: taxonomy workbook does not exist: {args.classes}")
         return 2
     if not args.template.exists():
         print(f"Input error: DOCX template does not exist: {args.template}")
         return 2
-    if args.output.exists() and not args.overwrite:
-        print(f"Input error: output already exists: {args.output}; use --overwrite to replace it")
+    existing_outputs = [path for path in (args.output, appendix_output) if path.exists()]
+    if existing_outputs and not args.overwrite:
+        paths = "；".join(str(path) for path in existing_outputs)
+        print(f"Input error: output already exists: {paths}; use --overwrite to replace it")
         return 2
 
     portfolio_specs = [(target_label, target_root), *baseline_specs]
@@ -160,6 +182,7 @@ def report(args: argparse.Namespace, progress: ProgressCallback | None = None) -
             print(f"PORTFOLIO\t{label}\t{root}\tclassification={source}\titems={count}")
         print(f"TEMPLATE\t{args.template.resolve()}")
         print(f"OUTPUT\t{args.output.resolve()}")
+        print(f"APPENDIX\t{appendix_output.resolve()}")
         print(f"REPORT\tdomain={domain}\ttarget={target_label}\tcompetitors={len(baseline_specs)}\tbatch_size={args.batch_size}")
         return 0
 
@@ -231,7 +254,7 @@ def report(args: argparse.Namespace, progress: ProgressCallback | None = None) -
         comparison_units = len(baselines) + (1 if len(baselines) > 1 else 0)
         overview_units = len(baselines) + 2
         tracker.start(
-            trend_units + comparison_units + overview_units + 3 + 1,
+            trend_units + comparison_units + overview_units + 3 + 2 + 1,
             "正在分析趋势",
             "已完成准备，开始分析",
         )
@@ -297,6 +320,29 @@ def report(args: argparse.Namespace, progress: ProgressCallback | None = None) -
                 domain_context=domain_context,
                 on_stage=on_report_stage,
             )
+        enhancements = ReportEnhancementAnalyzer(
+            client,
+            on_validation_retry=on_validation_retry,
+        ).analyze(
+            target,
+            trends,
+            comparison,
+            portfolio_overviews,
+            competitor_analysis,
+            target_analysis,
+            executive_summary=executive_summary,
+            domain=domain,
+            domain_context=domain_context,
+            on_stage=on_report_stage if progress is not None else None,
+        )
+        if report_review is not None:
+            tracker.set_stage("等待人工复核", "请复核第四、第五、第六章结论摘要")
+            reviewed_summaries = report_review(enhancements.chapter_summaries)
+            if reviewed_summaries is None:
+                tracker.cancel("报告生成已取消", "未写入正文和附录")
+                print("CANCELLED\t人工复核已取消，未写入正文和附录")
+                return REPORT_CANCELLED_EXIT_CODE
+            enhancements = replace(enhancements, chapter_summaries=reviewed_summaries)
         layout_report = PatentLayoutReport(
             target=target,
             baselines=baselines,
@@ -308,24 +354,25 @@ def report(args: argparse.Namespace, progress: ProgressCallback | None = None) -
             target_analysis=target_analysis,
             executive_summary=executive_summary,
             taxonomy=[(item.first_level, item.second_level) for item in taxonomy.items],
+            enhancements=enhancements,
             domain=domain,
             domain_context=domain_context,
         )
         tracker.set_stage("正在写入报告", "正在生成 DOCX 文件")
-        write_patent_layout_report(
+        report_output, appendix_output = write_patent_layout_report(
             layout_report,
             args.template,
             args.output,
             overwrite=args.overwrite,
         )
-        tracker.advance("正在写入报告", "报告已写入 DOCX")
-        tracker.succeed("报告生成完成", "结果已保存")
+        tracker.advance("正在写入报告", "正文和附录已写入 DOCX")
+        tracker.succeed("报告生成完成", "正文和附录已保存")
     except (RuntimeError, FileNotFoundError, NotADirectoryError, ValueError, FileExistsError) as exc:
         print(f"Report error: {exc}")
         return 1
 
     print(
-        f"Done. report={args.output}, target_patents={len(target.records)}, "
+        f"Done. report={report_output}, appendix={appendix_output}, target_patents={len(target.records)}, "
         f"competitor_patents={sum(len(item.records) for item in baselines)}"
     )
     return 0

@@ -12,10 +12,12 @@ from tkinter import filedialog, messagebox
 
 import customtkinter as ctk
 
-from patent_summarizer.cli import main
+from patent_summarizer.cli import REPORT_CANCELLED_EXIT_CODE, main
 from patent_summarizer.discovery import SummaryCoverage, inspect_summary_coverage
 from patent_summarizer.licensing import startup_allows_gui
 from patent_summarizer.progress import ProgressUpdate
+from patent_summarizer.report_analysis import ChapterSummaries
+from patent_summarizer.report_docx import derive_appendix_output
 
 
 MODE_SUMMARIZE = "summarize"
@@ -48,6 +50,15 @@ class PortfolioInput:
 class PortfolioDraft:
     label_var: ctk.StringVar
     root: Path
+
+
+@dataclass
+class ChapterReviewRequest:
+    draft: ChapterSummaries
+    event: threading.Event
+    result: ChapterSummaries | None = None
+
+
 MODE_OPTIONS = list(MODE_LABELS.values())
 MODERN_APPEARANCE_MODE = "light"
 MODERN_COLOR_THEME = "green"
@@ -122,8 +133,24 @@ def progress_display(update: ProgressUpdate) -> tuple[str, float, str]:
     color = {
         "success": DESKTOP_EDITORIAL_PALETTE["success"],
         "error": DESKTOP_EDITORIAL_PALETTE["error"],
+        "cancelled": DESKTOP_EDITORIAL_PALETTE["warning"],
     }.get(update.state, DESKTOP_EDITORIAL_PALETTE["primary"])
     return (detail, value, color)
+
+
+def split_review_paragraphs(text: str) -> list[str]:
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not normalized:
+        return []
+    return [part.strip() for part in re.split(r"\n\s*\n", normalized) if part.strip()]
+
+
+def chapter_summaries_from_review_texts(texts: dict[str, str]) -> ChapterSummaries:
+    return ChapterSummaries(
+        split_review_paragraphs(texts.get("第四章", "")),
+        split_review_paragraphs(texts.get("第五章", "")),
+        split_review_paragraphs(texts.get("第六章", "")),
+    )
 
 
 def get_app_dir() -> Path:
@@ -261,6 +288,7 @@ class PatentSummarizerApp(ctk.CTk):
         self.report_domain_var = ctk.StringVar(value=REPORT_DOMAIN_EXAMPLE)
         self.report_domain_context_var = ctk.StringVar(value=REPORT_DOMAIN_CONTEXT_EXAMPLE)
         self.output_file_var = ctk.StringVar()
+        self.appendix_file_var = ctk.StringVar()
         self.baselines: list[PortfolioDraft] = []
         self.output_customized = False
         self.mode_var = ctk.StringVar(value=MODE_SUMMARIZE)
@@ -270,6 +298,7 @@ class PatentSummarizerApp(ctk.CTk):
         self.mode_buttons: dict[str, ctk.CTkButton] = {}
         self.progress_state = "idle"
         self.last_progress_update: ProgressUpdate | None = None
+        self.output_file_var.trace_add("write", self._sync_appendix_path)
 
         self.title("专利 DOCX 处理工具")
         with contextlib.suppress(Exception):
@@ -557,6 +586,14 @@ class PatentSummarizerApp(ctk.CTk):
         self._section_label(output_section, title).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 7))
         self._entry(output_section, self.output_file_var).grid(row=1, column=0, sticky="ew", padx=(0, 10))
         self._button(output_section, "另存为", self._choose_output, width=96, secondary=True).grid(row=1, column=1)
+        if self._selected_mode() == MODE_REPORT:
+            ctk.CTkLabel(
+                output_section,
+                textvariable=self.appendix_file_var,
+                font=ctk.CTkFont(family="Microsoft YaHei UI", size=11),
+                text_color=DESKTOP_EDITORIAL_PALETTE["muted"],
+                anchor="w",
+            ).grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
 
     def _choose_target(self) -> None:
         selected = filedialog.askdirectory(title="选择目标专利目录")
@@ -613,6 +650,11 @@ class PatentSummarizerApp(ctk.CTk):
         root = self._target_root()
         if root:
             self.output_file_var.set(default_output_path(self._selected_mode(), root, self.target_label_var.get()))
+
+    def _sync_appendix_path(self, *_args) -> None:
+        value = self.output_file_var.get().strip()
+        appendix = derive_appendix_output(Path(value)) if value else None
+        self.appendix_file_var.set(f"附录将保存为：{appendix}" if appendix else "")
 
     def _target_root(self) -> Path | None:
         value = self.target_dir_var.get().strip()
@@ -717,8 +759,13 @@ class PatentSummarizerApp(ctk.CTk):
 
         output = Path(self.output_file_var.get().strip())
         overwrite = False
-        if output.exists():
-            if not messagebox.askyesno("确认覆盖", f"输出文件已存在，是否覆盖？\n{output}"):
+        outputs = [output]
+        if self._selected_mode() == MODE_REPORT:
+            outputs.append(derive_appendix_output(output))
+        existing = [path for path in outputs if path.exists()]
+        if existing:
+            paths = "\n".join(str(path) for path in existing)
+            if not messagebox.askyesno("确认覆盖", f"以下输出文件已存在，是否覆盖？\n{paths}"):
                 return
             overwrite = self._selected_mode() == MODE_REPORT
         target = PortfolioInput(self.target_label_var.get().strip(), self._target_root())
@@ -795,11 +842,22 @@ class PatentSummarizerApp(ctk.CTk):
         exit_code = 1
         try:
             with contextlib.redirect_stdout(writer), contextlib.redirect_stderr(writer):
-                exit_code = main(argv, progress=lambda update: self.output_queue.put(("progress", update)))
+                review = self._request_chapter_review if argv and argv[0] == "report" else None
+                exit_code = main(
+                    argv,
+                    progress=lambda update: self.output_queue.put(("progress", update)),
+                    report_review=review,
+                )
         except BaseException:
             self.output_queue.put(("log", traceback.format_exc()))
         finally:
             self.output_queue.put(("done", exit_code))
+
+    def _request_chapter_review(self, draft: ChapterSummaries) -> ChapterSummaries | None:
+        request = ChapterReviewRequest(draft=draft, event=threading.Event())
+        self.output_queue.put(("review", request))
+        request.event.wait()
+        return request.result
 
     def _drain_queue(self) -> None:
         try:
@@ -811,11 +869,140 @@ class PatentSummarizerApp(ctk.CTk):
                     self._append_log(str(item[1]))
                 elif item[0] == "progress":
                     self._apply_progress(item[1])
+                elif item[0] == "review":
+                    self._show_chapter_review(item[1])
                 elif item[0] == "done":
                     self._finish(int(item[1]))
         except queue.Empty:
             pass
         self.after(120, self._drain_queue)
+
+    def _show_chapter_review(self, request: ChapterReviewRequest) -> None:
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("复核第四、第五、第六章结论摘要")
+        dialog.geometry("900x680")
+        dialog.minsize(760, 540)
+        dialog.configure(fg_color=DESKTOP_EDITORIAL_PALETTE["canvas"])
+        dialog.transient(self)
+        dialog.grid_columnconfigure(0, weight=1)
+        dialog.grid_rowconfigure(1, weight=1)
+
+        header = ctk.CTkFrame(dialog, fg_color="transparent")
+        header.grid(row=0, column=0, sticky="ew", padx=24, pady=(22, 12))
+        header.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            header,
+            text="人工复核章前结论",
+            font=ctk.CTkFont(family="Microsoft YaHei UI", size=20, weight="bold"),
+            text_color=DESKTOP_EDITORIAL_PALETTE["ink"],
+        ).grid(row=0, column=0, sticky="w")
+        ctk.CTkLabel(
+            header,
+            text="可直接修改或删除内容；空白行用于分隔段落，确认后的文本将写入报告。",
+            font=ctk.CTkFont(family="Microsoft YaHei UI", size=12),
+            text_color=DESKTOP_EDITORIAL_PALETTE["body"],
+        ).grid(row=1, column=0, sticky="w", pady=(6, 0))
+
+        tabview = ctk.CTkTabview(
+            dialog,
+            corner_radius=14,
+            fg_color=DESKTOP_EDITORIAL_PALETTE["surface"],
+            border_width=1,
+            border_color=DESKTOP_EDITORIAL_PALETTE["hairline"],
+            segmented_button_fg_color=DESKTOP_EDITORIAL_PALETTE["surface_card"],
+            segmented_button_selected_color=DESKTOP_EDITORIAL_PALETTE["primary"],
+            segmented_button_selected_hover_color=DESKTOP_EDITORIAL_PALETTE["primary_hover"],
+            segmented_button_unselected_color=DESKTOP_EDITORIAL_PALETTE["surface_card"],
+            segmented_button_unselected_hover_color=DESKTOP_EDITORIAL_PALETTE["surface_selected"],
+            text_color=DESKTOP_EDITORIAL_PALETTE["ink"],
+        )
+        tabview.grid(row=1, column=0, sticky="nsew", padx=24, pady=(0, 14))
+        drafts = {
+            "第四章": "\n\n".join(request.draft.chapter_four),
+            "第五章": "\n\n".join(request.draft.chapter_five),
+            "第六章": "\n\n".join(request.draft.chapter_six),
+        }
+        editors: dict[str, ctk.CTkTextbox] = {}
+        for chapter, text in drafts.items():
+            tab = tabview.add(chapter)
+            tab.grid_columnconfigure(0, weight=1)
+            tab.grid_rowconfigure(0, weight=1)
+            editor = ctk.CTkTextbox(
+                tab,
+                wrap="word",
+                corner_radius=10,
+                border_width=1,
+                border_color=DESKTOP_EDITORIAL_PALETTE["hairline"],
+                fg_color=DESKTOP_EDITORIAL_PALETTE["surface_input"],
+                text_color=DESKTOP_EDITORIAL_PALETTE["ink"],
+                scrollbar_button_color=DESKTOP_EDITORIAL_PALETTE["hairline"],
+                scrollbar_button_hover_color=DESKTOP_EDITORIAL_PALETTE["primary_hover"],
+                font=ctk.CTkFont(family="Microsoft YaHei UI", size=13),
+            )
+            editor.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
+            editor.insert("1.0", text)
+            editors[chapter] = editor
+
+        actions = ctk.CTkFrame(dialog, fg_color="transparent")
+        actions.grid(row=2, column=0, sticky="ew", padx=24, pady=(0, 22))
+        actions.grid_columnconfigure(0, weight=1)
+
+        def complete(result: ChapterSummaries | None) -> None:
+            request.result = result
+            with contextlib.suppress(Exception):
+                dialog.grab_release()
+            dialog.destroy()
+            request.event.set()
+
+        def confirm() -> None:
+            texts = {chapter: editor.get("1.0", "end") for chapter, editor in editors.items()}
+            complete(chapter_summaries_from_review_texts(texts))
+
+        def restore() -> None:
+            for chapter, editor in editors.items():
+                editor.delete("1.0", "end")
+                editor.insert("1.0", drafts[chapter])
+
+        ctk.CTkButton(
+            actions,
+            text="恢复 AI 初稿",
+            width=132,
+            height=40,
+            corner_radius=10,
+            command=restore,
+            fg_color=DESKTOP_EDITORIAL_PALETTE["dark_elevated"],
+            hover_color=DESKTOP_EDITORIAL_PALETTE["dark_soft"],
+            text_color=DESKTOP_EDITORIAL_PALETTE["on_dark"],
+            font=ctk.CTkFont(family="Microsoft YaHei UI", size=12, weight="bold"),
+        ).grid(row=0, column=1, padx=(0, 10))
+        ctk.CTkButton(
+            actions,
+            text="取消生成",
+            width=112,
+            height=40,
+            corner_radius=10,
+            command=lambda: complete(None),
+            fg_color=DESKTOP_EDITORIAL_PALETTE["warning_surface"],
+            hover_color=DESKTOP_EDITORIAL_PALETTE["surface_selected"],
+            text_color=DESKTOP_EDITORIAL_PALETTE["warning"],
+            font=ctk.CTkFont(family="Microsoft YaHei UI", size=12, weight="bold"),
+        ).grid(row=0, column=2, padx=(0, 10))
+        ctk.CTkButton(
+            actions,
+            text="确认并生成报告",
+            width=154,
+            height=42,
+            corner_radius=12,
+            command=confirm,
+            fg_color=DESKTOP_EDITORIAL_PALETTE["primary"],
+            hover_color=DESKTOP_EDITORIAL_PALETTE["primary_hover"],
+            text_color=DESKTOP_EDITORIAL_PALETTE["on_primary"],
+            font=ctk.CTkFont(family="Microsoft YaHei UI", size=13, weight="bold"),
+        ).grid(row=0, column=3)
+        dialog.protocol("WM_DELETE_WINDOW", lambda: complete(None))
+        with contextlib.suppress(Exception):
+            dialog.grab_set()
+        dialog.after(60, dialog.focus_force)
 
     def _append_log(self, text: str) -> None:
         self.log_text.insert("end", text)
@@ -848,7 +1035,22 @@ class PatentSummarizerApp(ctk.CTk):
 
     def _finish(self, exit_code: int) -> None:
         self._set_running(False)
-        if exit_code == 0:
+        if exit_code == REPORT_CANCELLED_EXIT_CODE:
+            previous = self.last_progress_update
+            if self.progress_state != "cancelled":
+                self._apply_progress(
+                    ProgressUpdate(
+                        mode=self._selected_mode(),
+                        state="cancelled",
+                        stage="报告生成已取消",
+                        detail="未写入正文和附录",
+                        completed=previous.completed if previous else None,
+                        total=previous.total if previous else None,
+                    )
+                )
+            self.status_var.set("已取消，未生成报告")
+            self._append_log("\n已取消，未写入正文和附录。\n")
+        elif exit_code == 0:
             if self.progress_state != "success":
                 self._apply_progress(
                     ProgressUpdate(

@@ -412,6 +412,16 @@ class ReportCommandTests(unittest.TestCase):
             "证据局限": "仅基于上传样本",
         }
         executive_payload = {"管理层结论": ["结论一", "结论二", "结论三"], "总体证据局限": "仅基于上传样本"}
+        technology_payload = {
+            "典型技术补充": [
+                {"研判序号": 1, "典型技术": ["电机直驱制动", "制动力协调控制"]}
+            ]
+        }
+        chapter_summary_payload = {
+            "第四章总结": ["第四章结论一", "第四章结论二"],
+            "第五章总结": ["第五章结论一", "第五章结论二"],
+            "第六章总结": ["第六章结论一", "第六章结论二"],
+        }
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -463,6 +473,8 @@ class ReportCommandTests(unittest.TestCase):
                     competitor_payload,
                     target_payload,
                     executive_payload,
+                    technology_payload,
+                    chapter_summary_payload,
                 ]
             )
 
@@ -479,11 +491,13 @@ class ReportCommandTests(unittest.TestCase):
             text = "\n".join(paragraph.text for paragraph in rendered.paragraphs)
             checkpoint = output.parent / ".patent_summary_logs" / "report.report.jsonl"
             checkpoint_exists = checkpoint.exists()
+            appendix_exists = output.with_name("report_附录.docx").exists()
 
         self.assertEqual(exit_code, 0)
         self.assertIn("横向协同控制", text)
         self.assertTrue(checkpoint_exists)
-        self.assertEqual(len(fake_client.calls), 6)
+        self.assertTrue(appendix_exists)
+        self.assertEqual(len(fake_client.calls), 8)
 
 
 class ReportDocumentationTests(unittest.TestCase):
@@ -654,7 +668,8 @@ class ReportDocxTests(unittest.TestCase):
         self.assertNotIn("这是应被删除的模板说明", text)
         self.assertNotIn("汽车底盘", text)
         self.assertNotIn("理想汽车", text)
-        self.assertTrue(final_body_element.tag.endswith("}tbl"), "report must not end with a trailing blank paragraph")
+        self.assertTrue(final_body_element.tag.endswith("}p"))
+        self.assertTrue(rendered.paragraphs[-1].text.strip(), "report must not end with a trailing blank paragraph")
 
 
 if __name__ == "__main__":

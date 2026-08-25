@@ -5,14 +5,17 @@ import json
 import re
 from collections import Counter
 from dataclasses import asdict
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol, TypeVar
 
 from .comparison import ComparisonResult, PortfolioDataset
 from .prompts import (
+    REPORT_CHAPTER_SUMMARY_PROMPT,
     REPORT_COMPETITOR_PROMPT,
+    REPORT_ENHANCEMENT_SYSTEM_PROMPT,
     REPORT_EXECUTIVE_PROMPT,
+    REPORT_FORECAST_TECH_PROMPT,
     REPORT_PORTFOLIO_OVERVIEW_PROMPT,
     REPORT_SYSTEM_PROMPT,
     REPORT_TARGET_PROMPT,
@@ -133,6 +136,26 @@ class PortfolioOverviewAnalysis:
 
 
 @dataclass(frozen=True)
+class ChapterSummaries:
+    chapter_four: list[str]
+    chapter_five: list[str]
+    chapter_six: list[str]
+
+
+ReportReviewCallback = Callable[[ChapterSummaries], ChapterSummaries | None]
+
+
+@dataclass(frozen=True)
+class ReportEnhancements:
+    forecast_technologies: dict[int, list[str]]
+    chapter_summaries: ChapterSummaries
+
+    @classmethod
+    def empty(cls) -> "ReportEnhancements":
+        return cls({}, ChapterSummaries([], [], []))
+
+
+@dataclass(frozen=True)
 class PatentLayoutReport:
     target: PortfolioDataset
     baselines: list[PortfolioDataset]
@@ -144,6 +167,7 @@ class PatentLayoutReport:
     target_analysis: TargetAnalysis
     executive_summary: ExecutiveSummary
     taxonomy: list[tuple[str, str]]
+    enhancements: ReportEnhancements = field(default_factory=ReportEnhancements.empty)
     domain: str = ""
     domain_context: str = ""
 
@@ -291,9 +315,15 @@ class ReportSynthesisAnalyzer:
         )
         _notify_stage(on_stage, "竞争对手布局策略", started=False)
         _notify_stage(on_stage, f"{target.label}布局建议", started=True)
+        target_prompt = REPORT_TARGET_PROMPT.format(evidence=json.dumps(evidence, ensure_ascii=False, indent=2))
+        if "长安" not in target.label:
+            target_prompt += f"""
+
+目标企业实际名称为“{target.label}”。所有字段内容必须使用“{target.label}”指代目标企业，不得将目标企业写成长安汽车或其他企业。
+"""
         target_analysis = self._validated_chat(
             f"{target.label}布局建议",
-            REPORT_TARGET_PROMPT.format(evidence=json.dumps(evidence, ensure_ascii=False, indent=2)),
+            target_prompt,
             parse_target_analysis,
             system_prompt=system_prompt,
         )
@@ -347,6 +377,87 @@ class ReportSynthesisAnalyzer:
                 prompt = _validation_repair_prompt(user_prompt, str(exc))
 
         raise AssertionError("unreachable")
+
+
+class ReportEnhancementAnalyzer:
+    """Generate additive report content without invalidating existing synthesis prompts."""
+
+    def __init__(
+        self,
+        client: ReportChatClient,
+        validation_retries: int = REPORT_VALIDATION_RETRIES,
+        on_validation_retry: Callable[[str, int, str], None] | None = None,
+    ):
+        self.validator = ReportSynthesisAnalyzer(
+            client,
+            validation_retries=validation_retries,
+            on_validation_retry=on_validation_retry,
+        )
+
+    def analyze(
+        self,
+        target: PortfolioDataset,
+        trends: dict[str, TrendAnalysisResult],
+        comparison: ComparisonResult,
+        portfolio_overviews: PortfolioOverviewAnalysis,
+        competitor_analysis: CompetitorAnalysis,
+        target_analysis: TargetAnalysis,
+        executive_summary: ExecutiveSummary | None = None,
+        domain: str = "未指定领域",
+        domain_context: str = "未提供",
+        on_stage: Callable[[str, bool], None] | None = None,
+    ) -> ReportEnhancements:
+        system_prompt = REPORT_ENHANCEMENT_SYSTEM_PROMPT.format(
+            domain=domain,
+            domain_context=domain_context or "未提供",
+            target_label=target.label,
+        )
+        technologies: dict[int, list[str]] = {}
+        stage = "典型技术补充"
+        _notify_stage(on_stage, stage, started=True)
+        if competitor_analysis.forecasts:
+            technologies = self.validator._validated_chat(
+                stage,
+                REPORT_FORECAST_TECH_PROMPT.format(
+                    evidence=json.dumps(
+                        _forecast_technology_evidence(competitor_analysis),
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                ),
+                lambda response: parse_forecast_technologies(
+                    response,
+                    expected_count=len(competitor_analysis.forecasts),
+                ),
+                system_prompt=system_prompt,
+            )
+        _notify_stage(on_stage, stage, started=False)
+
+        stage = "第四至第六章结论摘要"
+        _notify_stage(on_stage, stage, started=True)
+        summaries = self.validator._validated_chat(
+            stage,
+            REPORT_CHAPTER_SUMMARY_PROMPT.format(
+                evidence=json.dumps(
+                    _chapter_summary_evidence(
+                        target,
+                        trends,
+                        comparison,
+                        portfolio_overviews,
+                        competitor_analysis,
+                        target_analysis,
+                        technologies,
+                        executive_summary,
+                    ),
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            ),
+            parse_chapter_summaries,
+            system_prompt=system_prompt,
+        )
+        _notify_stage(on_stage, stage, started=False)
+        return ReportEnhancements(technologies, summaries)
 
 
 def _notify_stage(callback: Callable[[str, bool], None] | None, detail: str, started: bool) -> None:
@@ -416,16 +527,18 @@ def parse_competitor_analysis(
         _parse_strategy(item, f"企业差异化策略[{index}]")
         for index, item in enumerate(_mapping_list(payload["企业差异化策略"], "企业差异化策略"), start=1)
     ]
+    forecasts = [
+        _parse_forecast(item, f"竞争对手趋势研判[{index}]")
+        for index, item in enumerate(_mapping_list(payload["竞争对手趋势研判"], "竞争对手趋势研判"), start=1)
+    ]
     if allowed_companies is not None:
         common_strategies = _filter_competitor_strategies(common_strategies, allowed_companies)
         differentiated_strategies = _filter_competitor_strategies(differentiated_strategies, allowed_companies)
+        forecasts = _filter_competitor_forecasts(forecasts, allowed_companies)
     return CompetitorAnalysis(
         common_strategies=common_strategies,
         differentiated_strategies=differentiated_strategies,
-        forecasts=[
-            _parse_forecast(item, f"竞争对手趋势研判[{index}]")
-            for index, item in enumerate(_mapping_list(payload["竞争对手趋势研判"], "竞争对手趋势研判"), start=1)
-        ],
+        forecasts=forecasts,
         future_focus=_required_text(payload, "未来竞争焦点"),
         evidence_limits=_required_text(payload, "证据局限"),
     )
@@ -444,6 +557,18 @@ def _filter_competitor_strategies(
                 companies.append(resolved)
         if companies:
             filtered.append(replace(strategy, companies=companies))
+    return filtered
+
+
+def _filter_competitor_forecasts(
+    forecasts: list[TrendForecast],
+    allowed_companies: set[str],
+) -> list[TrendForecast]:
+    filtered: list[TrendForecast] = []
+    for forecast in forecasts:
+        company = _resolve_allowed_company(forecast.company, allowed_companies)
+        if company is not None:
+            filtered.append(replace(forecast, company=company))
     return filtered
 
 
@@ -511,6 +636,50 @@ def parse_portfolio_overview(
     return PortfolioOverview(
         label=label,
         summary=_required_string(payload, "整体布局现状"),
+    )
+
+
+def parse_forecast_technologies(
+    response: str | Mapping[str, Any],
+    expected_count: int,
+) -> dict[int, list[str]]:
+    payload = _mapping_payload(response)
+    _require_fields(payload, ["典型技术补充"])
+    _reject_forbidden(payload)
+    result: dict[int, list[str]] = {}
+    for item in _mapping_list(payload["典型技术补充"], "典型技术补充"):
+        _require_fields(item, ["研判序号", "典型技术"])
+        index = item["研判序号"]
+        if isinstance(index, bool) or not isinstance(index, int):
+            raise ValueError("典型技术补充.研判序号 必须是整数")
+        if index in result:
+            raise ValueError(f"典型技术补充.研判序号 {index} 重复")
+        technologies = _strict_text_list(item["典型技术"], f"典型技术补充[{index}].典型技术")
+        if not 2 <= len(technologies) <= 4:
+            raise ValueError(f"典型技术补充[{index}].典型技术 必须包含 2 到 4 项")
+        result[index] = technologies
+    expected = set(range(1, expected_count + 1))
+    actual = set(result)
+    if actual != expected:
+        missing = sorted(expected - actual)
+        extra = sorted(actual - expected)
+        raise ValueError(f"典型技术补充研判序号不完整：缺少 {missing}；多出 {extra}")
+    return result
+
+
+def parse_chapter_summaries(response: str | Mapping[str, Any]) -> ChapterSummaries:
+    payload = _mapping_payload(response)
+    fields = ["第四章总结", "第五章总结", "第六章总结"]
+    _require_fields(payload, fields)
+    _reject_forbidden(payload)
+    paragraphs = {field: _strict_text_list(payload[field], field) for field in fields}
+    for field, values in paragraphs.items():
+        if len(values) != 2:
+            raise ValueError(f"{field} 必须严格包含 2 段")
+    return ChapterSummaries(
+        paragraphs["第四章总结"],
+        paragraphs["第五章总结"],
+        paragraphs["第六章总结"],
     )
 
 
@@ -628,6 +797,17 @@ def _text_list(value: Any, field: str) -> list[str]:
     return result
 
 
+def _strict_text_list(value: Any, field: str) -> list[str]:
+    if not isinstance(value, list) or not value:
+        raise ValueError(f"{field} 必须是非空数组")
+    if any(not isinstance(item, str) for item in value):
+        raise ValueError(f"{field} 中的每一项必须是字符串")
+    result = [item.strip() for item in value]
+    if any(not item for item in result):
+        raise ValueError(f"{field} 中的每一项必须是非空文本")
+    return result
+
+
 def _require_fields(payload: Mapping[str, Any], fields: list[str]) -> None:
     for field in fields:
         if field not in payload:
@@ -656,6 +836,122 @@ def _reject_forbidden(payload: Mapping[str, Any]) -> None:
     for phrase in FORBIDDEN_REPORT_PHRASES:
         if phrase in text:
             raise ValueError(f"报告内容不得包含：{phrase}")
+
+
+def _forecast_technology_evidence(competitor: CompetitorAnalysis) -> list[dict[str, Any]]:
+    return [
+        {
+            "研判序号": index,
+            "企业": item.company,
+            "可能强化方向": item.direction,
+            "时间序列信号": item.time_signal,
+            "关键词及技术路线依据": item.route_evidence,
+            "代表性专利": item.representative_patents,
+            "证据局限": item.evidence_limit,
+        }
+        for index, item in enumerate(competitor.forecasts, start=1)
+    ]
+
+
+def _chapter_summary_evidence(
+    target: PortfolioDataset,
+    trends: dict[str, TrendAnalysisResult],
+    comparison: ComparisonResult,
+    overviews: PortfolioOverviewAnalysis,
+    competitor: CompetitorAnalysis,
+    target_analysis: TargetAnalysis,
+    technologies: dict[int, list[str]],
+    executive_summary: ExecutiveSummary | None = None,
+) -> dict[str, Any]:
+    target_trends = trends.get(target.label)
+    return {
+        "已有管理层摘要": (
+            {
+                "管理层结论": executive_summary.conclusions,
+                "总体证据局限": executive_summary.evidence_limits,
+            }
+            if executive_summary is not None
+            else {}
+        ),
+        "第四章": {
+            "竞争对手趋势研判": [
+                {
+                    **item,
+                    "典型技术": technologies.get(item["研判序号"], []),
+                }
+                for item in _forecast_technology_evidence(competitor)
+            ],
+            "未来竞争焦点": competitor.future_focus,
+            "总体证据局限": competitor.evidence_limits,
+        },
+        "第五章": {
+            "目标企业": target.label,
+            "组合统计": _portfolio_chapter_stats(target),
+            "整体布局现状": overviews.company_summaries.get(target.label, ""),
+            "技术趋势": [
+                {
+                    "一级分类": item.stats.first_level,
+                    "二级分类": item.stats.second_level,
+                    "专利数": item.stats.patent_count,
+                    "年份分布": item.stats.year_counts,
+                    "发展现状": item.status_summary,
+                    "发展阶段": item.development_stage,
+                    "主要技术路线": item.technical_routes,
+                    "热点方向": item.hot_topics,
+                    "机会与空白": item.opportunities,
+                    "代表专利": item.representative_patents,
+                    "证据局限": item.evidence_limits,
+                }
+                for item in (target_trends.reports if target_trends is not None else [])
+            ],
+            "竞争对比": [
+                {
+                    "对比对象": item.baseline_label,
+                    "整体结论": item.overall_conclusion,
+                    "目标布局概况": item.target_layout,
+                    "优势": item.advantages,
+                    "短板": item.weaknesses,
+                    "差异化": item.differentiation,
+                    "与样本主流关系": item.mainstream_judgement,
+                    "建议布局点": item.recommendations,
+                    "证据局限": item.evidence_limits,
+                }
+                for item in comparison.reports
+            ],
+        },
+        "第六章": {
+            "目标企业": target.label,
+            "总体策略": [
+                {
+                    "策略名称": item.name,
+                    "目标": item.objective,
+                    "重点技术领域": item.technical_fields,
+                    "优先顺序": item.priority,
+                    "建议理由": item.reason,
+                    "关联建议点": item.related_points,
+                }
+                for item in target_analysis.strategies
+            ],
+            "证据局限": target_analysis.evidence_limits,
+        },
+    }
+
+
+def _portfolio_chapter_stats(portfolio: PortfolioDataset) -> dict[str, Any]:
+    years = Counter(record.inferred_year or "未知" for record in portfolio.records)
+    labels = Counter(
+        (record.primary_first_level, record.primary_second_level)
+        for record in portfolio.records
+        if record.primary_second_level.strip()
+    )
+    return {
+        "专利数": len(portfolio.records),
+        "年份分布": dict(sorted(years.items())),
+        "分类分布": [
+            {"一级分类": first, "二级分类": second, "专利数": count}
+            for (first, second), count in labels.most_common()
+        ],
+    }
 
 
 def _report_evidence_payload(
