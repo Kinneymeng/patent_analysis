@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 from dataclasses import replace
 from pathlib import Path
 
@@ -9,6 +10,20 @@ from .comparison import ComparisonAnalyzer, load_or_build_portfolio
 from .comparison_excel_export import write_comparison_workbook
 from .config import ConfigError, load_config
 from .discovery import discover_documents, inspect_summary_coverage
+from .disclosure import (
+    ConflictPolicy,
+    DisclosureAnalyzer,
+    DisclosureFailure,
+    DisclosureGenerationResult,
+    DisclosureTitleReviewCallback,
+    load_idea_source,
+    load_report_sources,
+    load_title_selections,
+    disclosure_output_path,
+    selected_work_items,
+    selections_from_proposals,
+)
+from .disclosure_docx import write_technical_disclosure
 from .extractors import TextExtractor
 from .excel_export import write_classification_workbook
 from .llm import RateLimitedOpenAIClient
@@ -31,12 +46,14 @@ from .trend_excel_export import write_trend_workbook
 
 
 REPORT_CANCELLED_EXIT_CODE = 130
+DISCLOSURE_CANCELLED_EXIT_CODE = 130
 
 
 def main(
     argv: list[str] | None = None,
     progress: ProgressCallback | None = None,
     report_review: ReportReviewCallback | None = None,
+    disclosure_title_review: DisclosureTitleReviewCallback | None = None,
 ) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -50,6 +67,12 @@ def main(
         return compare(args, progress=progress)
     if args.command == "report":
         return report(args, progress=progress, report_review=report_review)
+    if args.command == "disclosure":
+        return disclosure(
+            args,
+            progress=progress,
+            title_review=disclosure_title_review,
+        )
     parser.print_help()
     return 2
 
@@ -128,6 +151,27 @@ def build_parser() -> argparse.ArgumentParser:
     report_parser.add_argument("--env-file", type=Path, default=Path(".env"), help="Path to .env config file")
     report_parser.add_argument("--overwrite", action="store_true", help="Overwrite an existing DOCX report")
     report_parser.add_argument("--dry-run", action="store_true", help="Validate report inputs without calling the API or writing files")
+
+    disclosure_parser = subparsers.add_parser(
+        "disclosure",
+        help="Generate reviewed DOCX technical disclosure documents",
+    )
+    disclosure_source = disclosure_parser.add_mutually_exclusive_group(required=True)
+    disclosure_source.add_argument("--report", type=Path, help="Existing patent-layout analysis report DOCX")
+    disclosure_source.add_argument("--idea", help="Direct technical idea text")
+    disclosure_source.add_argument("--idea-file", type=Path, help="UTF-8 text file containing a direct technical idea")
+    disclosure_parser.add_argument("--output-dir", required=True, type=Path, help="Directory for generated DOCX files")
+    disclosure_parser.add_argument(
+        "--titles-file",
+        type=Path,
+        help="UTF-8 JSON array of explicit source_id/titles selections; otherwise all proposed titles are accepted",
+    )
+    disclosure_conflicts = disclosure_parser.add_mutually_exclusive_group()
+    disclosure_conflicts.add_argument("--skip-existing", action="store_true", help="Skip existing same-name DOCX files")
+    disclosure_conflicts.add_argument("--overwrite", action="store_true", help="Atomically replace existing same-name DOCX files")
+    disclosure_parser.add_argument("--api-rpm", type=int, help="Override PATENT_API_RPM")
+    disclosure_parser.add_argument("--env-file", type=Path, default=Path(".env"), help="Path to .env config file")
+    disclosure_parser.add_argument("--dry-run", action="store_true", help="Validate sources and list planned title groups without calling the API")
     return parser
 
 
@@ -365,6 +409,194 @@ def report(
         f"competitor_patents={sum(len(item.records) for item in baselines)}"
     )
     return 0
+
+
+def disclosure(
+    args: argparse.Namespace,
+    progress: ProgressCallback | None = None,
+    title_review: DisclosureTitleReviewCallback | None = None,
+) -> int:
+    tracker = ProgressTracker("disclosure", progress)
+    tracker.preparing("正在准备技术交底书", "正在读取技术来源")
+    try:
+        if args.report is not None:
+            sources = load_report_sources(args.report.resolve())
+            source_key = args.report.stem
+        else:
+            if args.idea_file is not None:
+                idea = args.idea_file.read_text(encoding="utf-8-sig")
+            else:
+                idea = args.idea or ""
+            sources = load_idea_source(idea)
+            source_key = f"manual-{hashlib.sha256(idea.encode('utf-8')).hexdigest()[:12]}"
+        output_dir = args.output_dir.resolve()
+        if output_dir.exists() and not output_dir.is_dir():
+            raise NotADirectoryError(f"输出路径不是目录：{output_dir}")
+        explicit_selections = load_title_selections(args.titles_file) if args.titles_file else None
+        if explicit_selections is not None:
+            selected_work_items(explicit_selections, sources)
+    except (FileNotFoundError, NotADirectoryError, OSError, ValueError) as exc:
+        print(f"Input error: {exc}")
+        return 2
+
+    if args.dry_run:
+        for source in sources:
+            print(f"DISCLOSURE_SOURCE\t{source.source_id}\t{source.label}")
+        if explicit_selections is not None:
+            for source, title in selected_work_items(explicit_selections, sources):
+                print(f"DISCLOSURE_TITLE\t{source.source_id}\t{title}")
+        else:
+            print(f"TITLE_PROPOSALS\tgroups={len(sources)}\tper_group=3")
+        print(f"OUTPUT_DIR\t{output_dir}")
+        return 0
+
+    try:
+        config = load_config(env_path=args.env_file, api_rpm=args.api_rpm)
+    except ConfigError as exc:
+        print(f"Config error: {exc}")
+        return 2
+
+    log_dir = output_dir / ".patent_summary_logs"
+    debug_path = log_dir / f"{source_key}.disclosure.llm-debug.jsonl"
+    base_client = RateLimitedOpenAIClient(
+        base_url=config.base_url,
+        api_key=config.api_key,
+        model=config.model,
+        rpm=config.api_rpm,
+        max_retries=config.max_retries,
+        debug_path=debug_path,
+    )
+    client = ReportCheckpointingClient(
+        base_client,
+        log_dir / f"{source_key}.disclosure.jsonl",
+    )
+
+    def on_validation_retry(stage: str, retry: int, error: str) -> None:
+        print(f"DISCLOSURE_REPAIR\t{stage}\tretry={retry}\terror={error}")
+
+    analyzer = DisclosureAnalyzer(client, on_validation_retry=on_validation_retry)
+    try:
+        if explicit_selections is None:
+            tracker.start(len(sources), "正在生成候选标题", "每条建议生成 3 个标题")
+            proposals = []
+            for source in sources:
+                tracker.set_stage("正在生成候选标题", f"{source.source_id} {source.label}")
+                proposal = analyzer.propose_titles(source)
+                proposals.append(proposal)
+                for title in proposal.titles:
+                    print(f"TITLE\t{source.source_id}\t{title}")
+                tracker.advance("正在生成候选标题", f"已完成 {source.source_id}")
+            if title_review is not None:
+                tracker.set_stage("等待人工确认标题", "可修改、删除或增加标题")
+                reviewed = title_review(proposals, output_dir)
+                if reviewed is None:
+                    tracker.cancel("技术交底书生成已取消", "未生成正文或 DOCX")
+                    print("CANCELLED\t标题确认已取消，未生成正文或 DOCX")
+                    return DISCLOSURE_CANCELLED_EXIT_CODE
+                selections = reviewed.selections
+                conflict_policy = ConflictPolicy(reviewed.conflict_policy)
+            else:
+                selections = selections_from_proposals(proposals)
+                conflict_policy = _disclosure_conflict_policy(args)
+        else:
+            selections = explicit_selections
+            conflict_policy = _disclosure_conflict_policy(args)
+
+        work_items = selected_work_items(selections, sources)
+        if not work_items:
+            tracker.cancel("技术交底书生成已取消", "没有保留任何标题")
+            print("CANCELLED\t没有保留任何标题，未生成正文或 DOCX")
+            return DISCLOSURE_CANCELLED_EXIT_CODE
+
+        conflicts = [
+            disclosure_output_path(output_dir, title)
+            for _source, title in work_items
+            if disclosure_output_path(output_dir, title).exists()
+        ]
+        if conflicts and conflict_policy == ConflictPolicy.ERROR:
+            paths = "；".join(str(path) for path in conflicts)
+            raise FileExistsError(f"技术交底书已经存在：{paths}")
+
+        skipped = set(conflicts) if conflict_policy == ConflictPolicy.SKIP else set()
+        pending = [
+            (source, title, disclosure_output_path(output_dir, title))
+            for source, title in work_items
+            if disclosure_output_path(output_dir, title) not in skipped
+        ]
+        for path in sorted(skipped, key=str):
+            print(f"SKIP\t{path}")
+
+        tracker.start(len(pending) * 3, "正在生成技术交底书", "开始逐篇生成和审校")
+        written: list[Path] = []
+        failures: list[DisclosureFailure] = []
+        for source, title, output in pending:
+            completed_units = 0
+            try:
+                tracker.set_stage("正在撰写技术交底书", title)
+                draft = analyzer.draft(source, title)
+                tracker.advance("正在撰写技术交底书", f"{title} 初稿完成")
+                completed_units += 1
+
+                tracker.set_stage("正在独立审校", title)
+                reviewed_disclosure = analyzer.review(source, draft)
+                tracker.advance("正在独立审校", f"{title} 审校完成")
+                completed_units += 1
+
+                tracker.set_stage("正在核验并写入 DOCX", title)
+                written_path = write_technical_disclosure(
+                    reviewed_disclosure,
+                    output,
+                    overwrite=conflict_policy == ConflictPolicy.OVERWRITE,
+                )
+                written.append(written_path)
+                tracker.advance("正在核验并写入 DOCX", f"{title} 已保存")
+                completed_units += 1
+                print(f"OK\t{source.source_id}\t{written_path}")
+            except Exception as exc:
+                failures.append(DisclosureFailure(source.source_id, title, str(exc)))
+                print(f"FAIL\t{source.source_id}\t{title}\t{exc}")
+            finally:
+                remaining = 3 - completed_units
+                if remaining:
+                    tracker.advance("技术交底书处理失败", title, units=remaining)
+
+        result = DisclosureGenerationResult(
+            written=written,
+            skipped=sorted(skipped, key=str),
+            failures=failures,
+        )
+        if result.failures:
+            tracker.fail(
+                "部分技术交底书生成失败",
+                f"成功 {len(result.written)}，跳过 {len(result.skipped)}，失败 {len(result.failures)}",
+            )
+            print(
+                f"Done. written={len(result.written)}, skipped={len(result.skipped)}, "
+                f"failed={len(result.failures)}, output_dir={output_dir}"
+            )
+            return 1
+        tracker.succeed(
+            "技术交底书生成完成",
+            f"已保存 {len(result.written)} 份，跳过 {len(result.skipped)} 份",
+        )
+        print(
+            f"Done. written={len(result.written)}, skipped={len(result.skipped)}, "
+            f"failed=0, output_dir={output_dir}"
+        )
+        return 0
+    except (FileNotFoundError, NotADirectoryError, OSError, RuntimeError, ValueError) as exc:
+        tracker.fail("技术交底书生成失败", str(exc))
+        print(f"Disclosure error: {exc}")
+        print(f"LLM debug: {debug_path}")
+        return 1
+
+
+def _disclosure_conflict_policy(args: argparse.Namespace) -> ConflictPolicy:
+    if args.overwrite:
+        return ConflictPolicy.OVERWRITE
+    if args.skip_existing:
+        return ConflictPolicy.SKIP
+    return ConflictPolicy.ERROR
 
 
 def run(args: argparse.Namespace, progress: ProgressCallback | None = None) -> int:

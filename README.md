@@ -199,6 +199,37 @@ python -m patent_summarizer report `
 - `--dry-run`：仅检查输入和计划。
 - `--api-rpm N`：覆盖 `.env` 中的请求上限。
 
+## 生成发明专利技术交底书
+
+`disclosure` 可以读取本工具已经生成的专利布局分析报告，也可以直接接收用户的发明构想。报告模式只解析报告第五至第八章，以第七章待布局建议及其对应的第八章组合策略为主要上下文，不会重新运行分类、趋势或组合对比。
+
+从分析报告生成：
+
+```powershell
+python -m patent_summarizer disclosure `
+  --report "output\doc\长安汽车_专利布局分析报告.docx" `
+  --output-dir "output\doc\技术交底书"
+```
+
+从直接思路生成：
+
+```powershell
+python -m patent_summarizer disclosure `
+  --idea-file "发明构想.txt" `
+  --output-dir "output\doc\技术交底书"
+```
+
+每条来源先生成 3 个不同技术切入点的标题。GUI 会按建议分组打开标题确认窗口，允许修改、删除和增加标题；普通 CLI 不打开编辑菜单，默认采用全部候选标题。CLI 可用 `--titles-file` 提供显式标题选择，JSON 格式如下；报告来源使用界面或 dry-run 显示的 `7.x` 编号，直接思路使用 `manual`：
+
+```json
+[
+  {"source_id": "7.1", "titles": ["一种冗余制动通道的状态协调方法"]},
+  {"source_id": "7.2", "titles": []}
+]
+```
+
+每个保留标题依次经过独立初稿、独立审校、本地内容校验和 DOCX 格式校验，最终保存为 `<标题>_技术交底书.docx`。正文采用论文式连续技术叙述，不生成权利要求书或保护范围建议。默认遇到同名文件即停止；可使用 `--skip-existing` 跳过已有文件，或使用 `--overwrite` 在新文件核验通过后原子覆盖。`--dry-run` 只检查来源并列出标题组计划，不调用 API 或写入 DOCX。
+
 ## 便携 GUI EXE
 
 Windows 便携版只处理 DOCX 文件，不处理 PDF/OCR。GUI 使用 CustomTkinter，并内置 `pypandoc-binary` 提供的 Pandoc。
@@ -223,7 +254,7 @@ conda run -n temp python build_portable.py
 - `使用说明.md`：面向普通使用人员的完整操作指南。
 - `_internal\`：EXE 运行依赖，包含 CustomTkinter、Python 运行库和 Pandoc 等文件。
 
-使用时把整个 `dist\PatentSummarizer\` 文件夹复制给使用者，不要只复制 EXE。GUI 提供五项任务：
+使用时把整个 `dist\PatentSummarizer\` 文件夹复制给使用者，不要只复制 EXE。GUI 提供六项任务：
 
 - “批量总结”“分类”“趋势分析”继续使用单个专利目录。
 - “对比”和“报告”使用一个目标组合及一个或多个对比组合。名称默认取文件夹名，也可以改成报告中使用的正式名称；所有名称必须非空且不能重复。
@@ -231,6 +262,7 @@ conda run -n temp python build_portable.py
 - 每个组合目录中的 `patent_classification.xlsx` 相互独立；已有文件会被复用，缺失时使用 EXE 同目录的 `class.xlsx` 自动生成。
 - “对比”默认输出 `<目标名称>_专利组合对比.xlsx`，“报告”默认输出 `<目标名称>_专利布局分析报告.docx`，均保存到目标目录并可通过“另存为”修改。
 - “报告”固定使用便携包内置的 `汽车底盘领域专利布局分析报告模板.docx`。
+- “技术交底书”支持导入分析报告或直接输入一项发明构想。报告生成完成后可选择自动切换并带入报告，但必须再次点击“生成候选标题”才会调用模型。
 
 完整的逐步说明、前置条件和常见问题请查看根目录的 [使用说明.md](使用说明.md)。
 

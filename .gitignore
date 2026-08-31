@@ -14,4 +14,5 @@ build_palette/
 dist_palette/
 *.spec.log
 *.egg-info/
-tests/
+tests/*
+!tests/test_disclosure.py

@@ -13,18 +13,24 @@ from patent_summarizer.comparison import ComparisonResult, PortfolioDataset
 from patent_summarizer.gui import (
     COPYRIGHT_TEXT,
     DESKTOP_EDITORIAL_PALETTE,
+    DISCLOSURE_IDEA_PLACEHOLDER,
     MODE_ANALYZE,
     MODE_CLASSIFY,
     MODE_COMPARE,
+    MODE_DISCLOSURE,
     MODE_REPORT,
     MODE_SUMMARIZE,
+    DISCLOSURE_SOURCE_IDEA,
+    DISCLOSURE_SOURCE_REPORT,
     MODERN_APPEARANCE_MODE,
     MODERN_COLOR_THEME,
     MODE_OPTIONS,
     PortfolioInput,
     build_cli_argv,
+    build_disclosure_cli_argv,
     build_portfolio_cli_argv,
     default_output_path,
+    disclosure_idea_value,
     mode_from_label,
     mode_button_style,
     progress_display,
@@ -127,12 +133,13 @@ class GuiCommandTests(unittest.TestCase):
             build_cli_argv("unknown", Path("D:/patents"), Path("D:/app"))
 
     def test_segmented_mode_options_map_labels_to_cli_modes(self):
-        self.assertEqual(MODE_OPTIONS, ["批量总结", "分类", "趋势分析", "对比", "报告"])
+        self.assertEqual(MODE_OPTIONS, ["批量总结", "分类", "趋势分析", "对比", "报告", "技术交底书"])
         self.assertEqual(mode_from_label("批量总结"), MODE_SUMMARIZE)
         self.assertEqual(mode_from_label("分类"), MODE_CLASSIFY)
         self.assertEqual(mode_from_label("趋势分析"), MODE_ANALYZE)
         self.assertEqual(mode_from_label("对比"), MODE_COMPARE)
         self.assertEqual(mode_from_label("报告"), MODE_REPORT)
+        self.assertEqual(mode_from_label("技术交底书"), MODE_DISCLOSURE)
 
         with self.assertRaises(ValueError):
             mode_from_label("未知")
@@ -170,6 +177,40 @@ class GuiCommandTests(unittest.TestCase):
         self.assertEqual(argv[0], "report")
         self.assertIn(str(app_dir / "汽车底盘领域专利布局分析报告模板.docx"), argv)
         self.assertIn("--overwrite", argv)
+
+    def test_builds_disclosure_commands_for_report_and_direct_idea(self):
+        app_dir = Path("D:/portable")
+        output_dir = Path("D:/out/技术交底书")
+        report = Path("D:/out/布局分析报告.docx")
+
+        report_argv = build_disclosure_cli_argv(
+            DISCLOSURE_SOURCE_REPORT,
+            report,
+            "",
+            output_dir,
+            app_dir,
+        )
+        idea_argv = build_disclosure_cli_argv(
+            DISCLOSURE_SOURCE_IDEA,
+            None,
+            "一种冗余制动构想",
+            output_dir,
+            app_dir,
+        )
+
+        self.assertEqual("disclosure", report_argv[0])
+        self.assertIn(str(report), report_argv)
+        self.assertIn("--report", report_argv)
+        self.assertIn("--idea", idea_argv)
+        self.assertIn("一种冗余制动构想", idea_argv)
+        self.assertIn(str(app_dir / ".env"), idea_argv)
+
+    def test_eps_idea_example_is_display_only(self):
+        self.assertIn("电动助力转向（EPS）", DISCLOSURE_IDEA_PLACEHOLDER)
+        for prompt_part in ("拟解决的问题", "预期结构与流程", "输入与输出", "使用场景与约束"):
+            self.assertIn(prompt_part, DISCLOSURE_IDEA_PLACEHOLDER)
+        self.assertEqual("", disclosure_idea_value(DISCLOSURE_IDEA_PLACEHOLDER, True))
+        self.assertEqual("用户填写的构思", disclosure_idea_value("  用户填写的构思  ", False))
 
     def test_default_output_uses_safe_target_label(self):
         root = Path("D:/patents/target")
@@ -279,10 +320,17 @@ class PortableRuntimeFilesTests(unittest.TestCase):
 
         self.assertIn('icon=str(ROOT / "assets" / "patent-summarizer.ico")', spec)
 
-    def test_user_guide_covers_all_five_gui_tasks(self):
+    def test_user_guide_covers_all_six_gui_tasks(self):
         guide = Path("使用说明.md").read_text(encoding="utf-8")
 
-        for heading in ["## 四、批量总结", "## 五、分类", "## 六、趋势分析", "## 七、对比", "## 八、报告"]:
+        for heading in [
+            "## 四、批量总结",
+            "## 五、分类",
+            "## 六、趋势分析",
+            "## 七、对比",
+            "## 八、报告",
+            "## 九、技术交底书",
+        ]:
             self.assertIn(heading, guide)
         self.assertIn("前置条件", guide)
         self.assertIn("使用方法", guide)

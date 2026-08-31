@@ -150,7 +150,7 @@ components:
     button_height: 38
     button_width: 104
     button_radius: 10
-    note: "Maps to the current mode buttons: 批量总结, 分类, 趋势分析, 对比, 报告."
+    note: "Maps to the current mode buttons: 批量总结, 分类, 趋势分析, 对比, 报告, 技术交底书."
   section_label:
     widget: "CTkLabel"
     text_color: "{colors.body_strong}"
@@ -358,7 +358,7 @@ notes:
 
 - 顶部标题和说明。
 - 一个主面板。
-- 五个任务 tab。
+- 六个任务 tab。
 - 模式相关配置区。
 - 状态条和开始按钮。
 - 深色运行日志。
