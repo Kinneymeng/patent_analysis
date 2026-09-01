@@ -155,6 +155,14 @@ class TechnicalDisclosure:
     content_paragraphs: list[str]
 
 
+class DisclosureContentLengthError(ValueError):
+    """A disclosure that is otherwise valid but misses the target body length."""
+
+    def __init__(self, message: str, disclosure: TechnicalDisclosure):
+        super().__init__(message)
+        self.disclosure = disclosure
+
+
 @dataclass(frozen=True)
 class DisclosureFailure:
     source_id: str
@@ -365,12 +373,14 @@ class DisclosureAnalyzer:
         client: DisclosureChatClient,
         validation_retries: int = DISCLOSURE_VALIDATION_RETRIES,
         on_validation_retry: Callable[[str, int, str], None] | None = None,
+        on_validation_warning: Callable[[str, str], None] | None = None,
     ):
         if validation_retries < 0:
             raise ValueError("validation_retries must not be negative")
         self.client = client
         self.validation_retries = validation_retries
         self.on_validation_retry = on_validation_retry
+        self.on_validation_warning = on_validation_warning
 
     def propose_titles(self, source: DisclosureSourceItem) -> TitleProposal:
         prompt = TITLE_USER_PROMPT.format(
@@ -450,6 +460,12 @@ class DisclosureAnalyzer:
                 if hasattr(self.client, "invalidate"):
                     self.client.invalidate(system_prompt, prompt, str(exc), response)
                 if attempt >= self.validation_retries:
+                    if isinstance(exc, DisclosureContentLengthError):
+                        if hasattr(self.client, "store_validated"):
+                            self.client.store_validated(system_prompt, user_prompt, response)
+                        if self.on_validation_warning is not None:
+                            self.on_validation_warning(stage, str(exc))
+                        return exc.disclosure
                     raise ValueError(f"{stage}结构化响应校验失败：{exc}") from exc
                 if self.on_validation_retry is not None:
                     self.on_validation_retry(stage, attempt + 1, str(exc))
@@ -504,15 +520,17 @@ def parse_technical_disclosure(
     if any(item != item.strip() or "\n" in item or "\r" in item for item in paragraphs):
         raise ValueError("发明内容的每个数组项必须对应一个无内嵌换行的自然段")
     content_chars = _non_whitespace_chars("".join(paragraphs))
-    if not MIN_CONTENT_CHARS <= content_chars <= MAX_CONTENT_CHARS:
-        raise ValueError(
-            f"发明内容非空白字符数必须为 {MIN_CONTENT_CHARS} 至 {MAX_CONTENT_CHARS}，实际为 {content_chars}"
-        )
     full_text = "\n".join([title, abstract, *paragraphs])
     for phrase in FORBIDDEN_CLAIM_PHRASES:
         if phrase in full_text:
             raise ValueError(f"技术交底书不得包含权利要求式表达：{phrase}")
-    return TechnicalDisclosure(title, abstract, paragraphs)
+    disclosure = TechnicalDisclosure(title, abstract, paragraphs)
+    if not MIN_CONTENT_CHARS <= content_chars <= MAX_CONTENT_CHARS:
+        raise DisclosureContentLengthError(
+            f"发明内容非空白字符数建议为 {MIN_CONTENT_CHARS} 至 {MAX_CONTENT_CHARS}，实际为 {content_chars}",
+            disclosure,
+        )
+    return disclosure
 
 
 def _mapping_payload(response: str | Mapping[str, Any]) -> Mapping[str, Any]:

@@ -1,4 +1,6 @@
 import json
+from contextlib import redirect_stdout
+from io import StringIO
 import tempfile
 import unittest
 from pathlib import Path
@@ -191,6 +193,65 @@ class DisclosureParsingTests(unittest.TestCase):
         self.assertEqual(2, len(client.prompts))
         self.assertIn("上一次响应未通过", client.prompts[1])
 
+    def test_content_length_becomes_warning_after_one_retry_for_both_sources(self):
+        class SequenceClient:
+            def __init__(self, responses):
+                self.responses = list(responses)
+                self.prompts = []
+
+            def chat(self, system_prompt, user_prompt):
+                self.prompts.append(user_prompt)
+                return self.responses.pop(0)
+
+        short_payload = _valid_payload()
+        short_payload["发明内容"] = ["内容较短但结构完整" for _ in range(6)]
+
+        direct_client = SequenceClient([short_payload, short_payload])
+        direct_warnings = []
+        direct_source = DisclosureSourceItem("manual", "用户直接思路", "摘要", "上下文")
+        direct_result = DisclosureAnalyzer(
+            direct_client,
+            on_validation_warning=lambda stage, error: direct_warnings.append((stage, error)),
+        ).draft(direct_source, short_payload["标题"])
+
+        report_client = SequenceClient([short_payload, short_payload])
+        report_warnings = []
+        report_source = DisclosureSourceItem("7.1", "报告建议", "摘要", "报告上下文")
+        valid_draft = parse_technical_disclosure(_valid_payload(), short_payload["标题"])
+        report_result = DisclosureAnalyzer(
+            report_client,
+            on_validation_warning=lambda stage, error: report_warnings.append((stage, error)),
+        ).review(report_source, valid_draft)
+
+        self.assertEqual(2, len(direct_client.prompts))
+        self.assertEqual(2, len(report_client.prompts))
+        self.assertEqual(short_payload["发明内容"], direct_result.content_paragraphs)
+        self.assertEqual(short_payload["发明内容"], report_result.content_paragraphs)
+        self.assertIn("初稿", direct_warnings[0][0])
+        self.assertIn("独立审校", report_warnings[0][0])
+        self.assertIn("实际为", direct_warnings[0][1])
+
+    def test_non_length_validation_still_fails_after_one_retry(self):
+        class SequenceClient:
+            def __init__(self, response):
+                self.response = response
+
+            def chat(self, system_prompt, user_prompt):
+                return self.response
+
+        invalid = _valid_payload()
+        invalid["发明内容"][0] = "其特征在于" + invalid["发明内容"][0]
+        warnings = []
+        analyzer = DisclosureAnalyzer(
+            SequenceClient(invalid),
+            on_validation_warning=lambda stage, error: warnings.append((stage, error)),
+        )
+        source = DisclosureSourceItem("manual", "用户直接思路", "摘要", "上下文")
+
+        with self.assertRaisesRegex(ValueError, "结构化响应校验失败"):
+            analyzer.draft(source, invalid["标题"])
+        self.assertEqual([], warnings)
+
     def test_title_selection_validates_duplicates_and_filename_mapping(self):
         sources = [DisclosureSourceItem("7.1", "建议", "摘要", "上下文")]
         selections = [TitleSelection("7.1", ["标题甲", "标题乙"])]
@@ -307,6 +368,50 @@ class DisclosureCliTests(unittest.TestCase):
             )
             self.assertEqual(130, exit_code)
             self.assertEqual([], list(output.glob("*.docx")))
+
+    def test_cli_writes_short_content_with_warning_after_repair(self):
+        class SequenceClient:
+            def __init__(self, response):
+                self.responses = [response, response, response, response]
+
+            def chat(self, system_prompt, user_prompt):
+                return self.responses.pop(0)
+
+        title = "一种冗余制动控制方法"
+        short_payload = _valid_payload(title)
+        short_payload["发明内容"] = ["内容较短但结构完整" for _ in range(6)]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            output = root / "out"
+            titles = root / "titles.json"
+            titles.write_text(
+                json.dumps([{"source_id": "manual", "titles": [title]}], ensure_ascii=False),
+                encoding="utf-8",
+            )
+            stdout = StringIO()
+            with patch(
+                "patent_summarizer.cli.load_config",
+                return_value=AppConfig("https://example.test", "key", "model"),
+            ), patch(
+                "patent_summarizer.cli.RateLimitedOpenAIClient",
+                return_value=SequenceClient(short_payload),
+            ), redirect_stdout(stdout):
+                exit_code = main(
+                    [
+                        "disclosure",
+                        "--idea",
+                        "一种冗余制动控制思路",
+                        "--output-dir",
+                        str(output),
+                        "--titles-file",
+                        str(titles),
+                    ]
+                )
+
+            self.assertEqual(0, exit_code)
+            self.assertTrue((output / f"{title}_技术交底书.docx").exists())
+            self.assertIn("WARNING\t", stdout.getvalue())
+            self.assertNotIn("FAIL\t", stdout.getvalue())
 
     def test_explicit_titles_generate_skip_and_atomically_overwrite(self):
         title = "一种冗余制动控制方法"

@@ -474,7 +474,14 @@ def disclosure(
     def on_validation_retry(stage: str, retry: int, error: str) -> None:
         print(f"DISCLOSURE_REPAIR\t{stage}\tretry={retry}\terror={error}")
 
-    analyzer = DisclosureAnalyzer(client, on_validation_retry=on_validation_retry)
+    def on_validation_warning(stage: str, error: str) -> None:
+        print(f"WARNING\t{stage}\t{error}\t已完成一次修复尝试，将按当前内容继续生成")
+
+    analyzer = DisclosureAnalyzer(
+        client,
+        on_validation_retry=on_validation_retry,
+        on_validation_warning=on_validation_warning,
+    )
     try:
         if explicit_selections is None:
             tracker.start(len(sources), "正在生成候选标题", "每条建议生成 3 个标题")
