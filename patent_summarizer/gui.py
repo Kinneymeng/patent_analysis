@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import queue
 import re
 import sys
@@ -16,10 +17,13 @@ from patent_summarizer.cli import DISCLOSURE_CANCELLED_EXIT_CODE, REPORT_CANCELL
 from patent_summarizer.discovery import SummaryCoverage, inspect_summary_coverage
 from patent_summarizer.disclosure import (
     ConflictPolicy,
+    DisclosurePreview,
     DisclosureTitleReviewResult,
+    PriorArtFailureAction,
     TitleProposal,
     TitleSelection,
-    disclosure_output_path,
+    disclosure_output_paths,
+    parse_disclosure_preview,
     selected_work_items,
     validate_title_selections,
 )
@@ -75,8 +79,31 @@ class DisclosureTitleReviewRequest:
     result: DisclosureTitleReviewResult | None = None
 
 
+@dataclass
+class DisclosurePreviewReviewRequest:
+    preview: DisclosurePreview
+    event: threading.Event
+    result: DisclosurePreview | None = None
+
+
+@dataclass
+class PriorArtFailureRequest:
+    title: str
+    error: str
+    event: threading.Event
+    result: PriorArtFailureAction = PriorArtFailureAction.CANCEL
+
+
 DISCLOSURE_SOURCE_REPORT = "导入分析报告"
 DISCLOSURE_SOURCE_IDEA = "直接输入思路"
+DISCLOSURE_SOURCE_PROJECT = "扫描项目材料"
+PRIOR_ART_STATUS_LABELS = {
+    "disabled": "未启用",
+    "success": "已完成",
+    "empty": "未找到相关结果",
+    "partial": "部分完成",
+    "failed": "失败后跳过",
+}
 DISCLOSURE_IDEA_PLACEHOLDER = """示例（开始输入后自动隐藏）：
 拟解决的问题：电动助力转向（EPS）在低附着路面或转矩传感器信号异常时，助力输出容易发生波动，影响转向稳定性和驾驶员手感。
 预期结构与流程：由 EPS 控制器融合方向盘转矩、转角、车速和电机状态，识别路面及传感器可信度，动态计算基础助力、补偿助力与降级控制量，并向助力电机输出目标转矩。
@@ -173,6 +200,42 @@ def split_review_paragraphs(text: str) -> list[str]:
     return [part.strip() for part in re.split(r"\n\s*\n", normalized) if part.strip()]
 
 
+def _disclosure_preview_payload(preview: DisclosurePreview) -> dict[str, object]:
+    return {
+        "标题": preview.title,
+        "技术问题": list(preview.technical_problems),
+        "模块": [
+            {
+                "名称": module.name,
+                "职责": module.responsibility,
+                "输入": list(module.inputs),
+                "输出": list(module.outputs),
+            }
+            for module in preview.modules
+        ],
+        "流程": list(preview.process_steps),
+        "技术关键点": list(preview.key_points),
+        "材料依据": list(preview.evidence_refs),
+        "建议参数": [
+            {
+                "名称": parameter.name,
+                "符号": parameter.symbol,
+                "含义": parameter.meaning,
+                "值或范围": parameter.value_or_range,
+                "依据": parameter.basis,
+                "示例": parameter.is_example,
+            }
+            for parameter in preview.suggested_parameters
+        ],
+        "假设": list(preview.assumptions),
+        "待确认问题": list(preview.open_questions),
+    }
+
+
+def disclosure_material_paths(value: str) -> list[Path]:
+    return [Path(part.strip()) for part in value.split(";") if part.strip()]
+
+
 def chapter_summaries_from_review_texts(texts: dict[str, str]) -> ChapterSummaries:
     return ChapterSummaries(
         split_review_paragraphs(texts.get("第四章", "")),
@@ -259,6 +322,9 @@ def build_disclosure_cli_argv(
     idea: str,
     output_dir: Path,
     app_dir: Path,
+    project_dir: Path | None = None,
+    material_dirs: list[Path] | None = None,
+    prior_art: bool = False,
 ) -> list[str]:
     argv = ["disclosure"]
     if source_type == DISCLOSURE_SOURCE_REPORT:
@@ -267,8 +333,16 @@ def build_disclosure_cli_argv(
         argv.extend(["--report", str(report_path)])
     elif source_type == DISCLOSURE_SOURCE_IDEA:
         argv.extend(["--idea", idea])
+    elif source_type == DISCLOSURE_SOURCE_PROJECT:
+        if project_dir is None:
+            raise ValueError("Project path is required")
+        argv.extend(["--project-dir", str(project_dir)])
     else:
         raise ValueError(f"Unknown disclosure source type: {source_type}")
+    for material_dir in material_dirs or []:
+        argv.extend(["--material-dir", str(material_dir)])
+    if prior_art:
+        argv.append("--prior-art")
     argv.extend(
         [
             "--output-dir",
@@ -316,6 +390,9 @@ class PatentSummarizerApp(ctk.CTk):
         self.appendix_file_var = ctk.StringVar()
         self.disclosure_source_var = ctk.StringVar(value=DISCLOSURE_SOURCE_REPORT)
         self.disclosure_report_var = ctk.StringVar()
+        self.disclosure_project_var = ctk.StringVar()
+        self.disclosure_material_var = ctk.StringVar()
+        self.disclosure_prior_art_var = ctk.BooleanVar(value=False)
         self.disclosure_output_dir_var = ctk.StringVar()
         self.disclosure_idea = ""
         self.disclosure_idea_editor: ctk.CTkTextbox | None = None
@@ -331,6 +408,8 @@ class PatentSummarizerApp(ctk.CTk):
         self.last_progress_update: ProgressUpdate | None = None
         self.output_file_var.trace_add("write", self._sync_appendix_path)
         self.disclosure_report_var.trace_add("write", lambda *_args: self.after_idle(self._refresh_start_state))
+        self.disclosure_project_var.trace_add("write", lambda *_args: self.after_idle(self._refresh_start_state))
+        self.disclosure_material_var.trace_add("write", lambda *_args: self.after_idle(self._refresh_start_state))
         self.disclosure_output_dir_var.trace_add("write", lambda *_args: self.after_idle(self._refresh_start_state))
 
         self.title("专利 DOCX 处理工具")
@@ -522,7 +601,7 @@ class PatentSummarizerApp(ctk.CTk):
         else:
             self._render_single_directory_config()
         self.start_button.configure(
-            text="生成候选标题" if self._selected_mode() == MODE_DISCLOSURE else "开始运行"
+            text="生成候选方案" if self._selected_mode() == MODE_DISCLOSURE else "开始运行"
         )
         self.after_idle(self._refresh_start_state)
 
@@ -542,7 +621,7 @@ class PatentSummarizerApp(ctk.CTk):
         self._section_label(source_section, "技术来源").grid(row=0, column=0, sticky="w", pady=(0, 7))
         selector = ctk.CTkSegmentedButton(
             source_section,
-            values=[DISCLOSURE_SOURCE_REPORT, DISCLOSURE_SOURCE_IDEA],
+            values=[DISCLOSURE_SOURCE_REPORT, DISCLOSURE_SOURCE_IDEA, DISCLOSURE_SOURCE_PROJECT],
             variable=self.disclosure_source_var,
             command=self._disclosure_source_changed,
             height=38,
@@ -576,12 +655,12 @@ class PatentSummarizerApp(ctk.CTk):
             ).grid(row=1, column=1)
             ctk.CTkLabel(
                 input_section,
-                text="将读取第七章建议及其对应的第八章组合策略，不重新运行分类或趋势分析。",
+                text="将保留第五、六章背景，并读取第七章建议及其对应的第八章组合策略；不重新运行分类或趋势分析。",
                 font=ctk.CTkFont(family="Microsoft YaHei UI", size=11),
                 text_color=DESKTOP_EDITORIAL_PALETTE["muted"],
                 anchor="w",
             ).grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
-        else:
+        elif self.disclosure_source_var.get() == DISCLOSURE_SOURCE_IDEA:
             self._section_label(input_section, "发明构想").grid(
                 row=0, column=0, sticky="w", pady=(0, 7)
             )
@@ -623,8 +702,62 @@ class PatentSummarizerApp(ctk.CTk):
             else:
                 self._show_disclosure_idea_placeholder()
 
+        else:
+            self._section_label(input_section, "项目材料目录").grid(
+                row=0, column=0, columnspan=2, sticky="w", pady=(0, 7)
+            )
+            self._entry(input_section, self.disclosure_project_var).grid(
+                row=1, column=0, sticky="ew", padx=(0, 10)
+            )
+            self._button(
+                input_section,
+                "选择目录",
+                self._choose_disclosure_project,
+                width=104,
+                secondary=True,
+            ).grid(row=1, column=1)
+            ctk.CTkLabel(
+                input_section,
+                text="递归读取 DOCX、PPTX、文字型 PDF、Markdown、文本和常见源码；不会执行代码或识别图片内容。",
+                font=ctk.CTkFont(family="Microsoft YaHei UI", size=11),
+                text_color=DESKTOP_EDITORIAL_PALETTE["muted"],
+                anchor="w",
+            ).grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+
+        material_section = ctk.CTkFrame(self.config_frame, fg_color="transparent")
+        material_section.grid(row=2, column=0, sticky="ew", pady=(16, 0))
+        material_section.grid_columnconfigure(0, weight=1)
+        self._section_label(material_section, "补充材料目录（可选；多个目录用英文分号分隔）").grid(
+            row=0, column=0, columnspan=2, sticky="w", pady=(0, 7)
+        )
+        self._entry(material_section, self.disclosure_material_var).grid(
+            row=1, column=0, sticky="ew", padx=(0, 10)
+        )
+        self._button(
+            material_section,
+            "添加目录",
+            self._choose_disclosure_material,
+            width=104,
+            secondary=True,
+        ).grid(row=1, column=1)
+
+        novelty_section = ctk.CTkFrame(self.config_frame, fg_color="transparent")
+        novelty_section.grid(row=3, column=0, sticky="ew", pady=(14, 0))
+        ctk.CTkCheckBox(
+            novelty_section,
+            text="启用国知局中国发明专利查新（需要公网，默认关闭）",
+            variable=self.disclosure_prior_art_var,
+            onvalue=True,
+            offvalue=False,
+            fg_color=DESKTOP_EDITORIAL_PALETTE["primary"],
+            hover_color=DESKTOP_EDITORIAL_PALETTE["primary_hover"],
+            border_color=DESKTOP_EDITORIAL_PALETTE["hairline"],
+            text_color=DESKTOP_EDITORIAL_PALETTE["body_strong"],
+            font=ctk.CTkFont(family="Microsoft YaHei UI", size=12),
+        ).grid(row=0, column=0, sticky="w")
+
         output_section = ctk.CTkFrame(self.config_frame, fg_color="transparent")
-        output_section.grid(row=2, column=0, sticky="ew", pady=(16, 0))
+        output_section.grid(row=4, column=0, sticky="ew", pady=(16, 0))
         output_section.grid_columnconfigure(0, weight=1)
         self._section_label(output_section, "技术交底书输出目录").grid(
             row=0, column=0, columnspan=2, sticky="w", pady=(0, 7)
@@ -685,12 +818,13 @@ class PatentSummarizerApp(ctk.CTk):
 
     def _disclosure_source_changed(self, _value: str | None = None) -> None:
         self._capture_disclosure_idea()
-        if (
-            self.disclosure_source_var.get() == DISCLOSURE_SOURCE_REPORT
-            and self.disclosure_report_var.get().strip()
-        ):
+        source_type = self.disclosure_source_var.get()
+        if source_type == DISCLOSURE_SOURCE_REPORT and self.disclosure_report_var.get().strip():
             report = Path(self.disclosure_report_var.get().strip())
             self.disclosure_output_dir_var.set(str(report.parent / "技术交底书"))
+        elif source_type == DISCLOSURE_SOURCE_PROJECT and self.disclosure_project_var.get().strip():
+            project = Path(self.disclosure_project_var.get().strip())
+            self.disclosure_output_dir_var.set(str(project / "技术交底书"))
         self._render_mode_config()
 
     def _choose_disclosure_report(self) -> None:
@@ -704,6 +838,25 @@ class PatentSummarizerApp(ctk.CTk):
         self.disclosure_report_var.set(str(report))
         self.disclosure_output_dir_var.set(str(report.parent / "技术交底书"))
         self._refresh_start_state()
+
+    def _choose_disclosure_project(self) -> None:
+        selected = filedialog.askdirectory(title="选择需要扫描的项目材料目录")
+        if not selected:
+            return
+        project = Path(selected)
+        self.disclosure_project_var.set(str(project))
+        self.disclosure_output_dir_var.set(str(project / "技术交底书"))
+        self._refresh_start_state()
+
+    def _choose_disclosure_material(self) -> None:
+        selected = filedialog.askdirectory(title="选择补充材料目录")
+        if selected:
+            values = disclosure_material_paths(self.disclosure_material_var.get())
+            selected_path = Path(selected)
+            if selected_path not in values:
+                values.append(selected_path)
+            self.disclosure_material_var.set("; ".join(str(path) for path in values))
+            self._refresh_start_state()
 
     def _choose_disclosure_output_dir(self) -> None:
         selected = filedialog.askdirectory(title="选择技术交底书输出目录")
@@ -956,12 +1109,21 @@ class PatentSummarizerApp(ctk.CTk):
             if source_type == DISCLOSURE_SOURCE_REPORT
             else None
         )
+        project_dir = (
+            Path(self.disclosure_project_var.get().strip())
+            if source_type == DISCLOSURE_SOURCE_PROJECT
+            else None
+        )
+        material_dirs = disclosure_material_paths(self.disclosure_material_var.get())
         argv = build_disclosure_cli_argv(
             source_type,
             report_path,
             self.disclosure_idea,
             Path(self.disclosure_output_dir_var.get().strip()),
             app_dir,
+            project_dir=project_dir,
+            material_dirs=material_dirs,
+            prior_art=bool(self.disclosure_prior_art_var.get()),
         )
         self._set_running(True)
         self._clear_log()
@@ -983,8 +1145,18 @@ class PatentSummarizerApp(ctk.CTk):
         elif source_type == DISCLOSURE_SOURCE_IDEA:
             if not self.disclosure_idea.strip():
                 return "请输入发明构想。"
+        elif source_type == DISCLOSURE_SOURCE_PROJECT:
+            value = self.disclosure_project_var.get().strip()
+            if not value:
+                return "请选择需要扫描的项目材料目录。"
+            project = Path(value)
+            if not project.exists() or not project.is_dir():
+                return "请选择一个存在的项目材料目录。"
         else:
             return "请选择技术来源。"
+        for material in disclosure_material_paths(self.disclosure_material_var.get()):
+            if not material.exists() or not material.is_dir():
+                return f"补充材料目录不存在或不是目录：{material}"
         output = self.disclosure_output_dir_var.get().strip()
         if not output:
             return "请选择技术交底书输出目录。"
@@ -1082,11 +1254,23 @@ class PatentSummarizerApp(ctk.CTk):
                     if argv and argv[0] == "disclosure"
                     else None
                 )
+                disclosure_preview_review = (
+                    self._request_disclosure_preview_review
+                    if argv and argv[0] == "disclosure"
+                    else None
+                )
+                disclosure_prior_art_failure = (
+                    self._request_prior_art_failure
+                    if argv and argv[0] == "disclosure"
+                    else None
+                )
                 exit_code = main(
                     argv,
                     progress=lambda update: self.output_queue.put(("progress", update)),
                     report_review=review,
                     disclosure_title_review=disclosure_review,
+                    disclosure_preview_review=disclosure_preview_review,
+                    disclosure_prior_art_failure=disclosure_prior_art_failure,
                 )
         except BaseException:
             self.output_queue.put(("log", traceback.format_exc()))
@@ -1096,6 +1280,21 @@ class PatentSummarizerApp(ctk.CTk):
     def _request_chapter_review(self, draft: ChapterSummaries) -> ChapterSummaries | None:
         request = ChapterReviewRequest(draft=draft, event=threading.Event())
         self.output_queue.put(("review", request))
+        request.event.wait()
+        return request.result
+
+    def _request_disclosure_preview_review(
+        self,
+        preview: DisclosurePreview,
+    ) -> DisclosurePreview | None:
+        request = DisclosurePreviewReviewRequest(preview=preview, event=threading.Event())
+        self.output_queue.put(("disclosure_preview_review", request))
+        request.event.wait()
+        return request.result
+
+    def _request_prior_art_failure(self, title: str, error: str) -> PriorArtFailureAction:
+        request = PriorArtFailureRequest(title=title, error=error, event=threading.Event())
+        self.output_queue.put(("prior_art_failure", request))
         request.event.wait()
         return request.result
 
@@ -1127,6 +1326,10 @@ class PatentSummarizerApp(ctk.CTk):
                     self._show_chapter_review(item[1])
                 elif item[0] == "disclosure_review":
                     self._show_disclosure_title_review(item[1])
+                elif item[0] == "disclosure_preview_review":
+                    self._show_disclosure_preview_review(item[1])
+                elif item[0] == "prior_art_failure":
+                    self._show_prior_art_failure(item[1])
                 elif item[0] == "done":
                     self._finish(int(item[1]))
         except queue.Empty:
@@ -1262,7 +1465,7 @@ class PatentSummarizerApp(ctk.CTk):
 
     def _show_disclosure_title_review(self, request: DisclosureTitleReviewRequest) -> None:
         dialog = ctk.CTkToplevel(self)
-        dialog.title("确认技术交底书标题")
+        dialog.title("第一次确认：选择技术方案")
         dialog.geometry("940x720")
         dialog.minsize(780, 560)
         dialog.configure(fg_color=DESKTOP_EDITORIAL_PALETTE["canvas"])
@@ -1275,13 +1478,13 @@ class PatentSummarizerApp(ctk.CTk):
         header.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(
             header,
-            text="确认技术交底书标题",
+            text="选择、编辑或融合候选技术方案",
             font=ctk.CTkFont(family="Microsoft YaHei UI", size=20, weight="bold"),
             text_color=DESKTOP_EDITORIAL_PALETTE["ink"],
         ).grid(row=0, column=0, sticky="w")
         ctk.CTkLabel(
             header,
-            text="每个保留标题会生成一份 DOCX；删除一组的全部标题即可跳过该建议。",
+            text="默认只选择推荐方案。可多选、改写标题，或新增一个融合方向；每项生成 DOCX、Markdown 和配套图片。",
             font=ctk.CTkFont(family="Microsoft YaHei UI", size=12),
             text_color=DESKTOP_EDITORIAL_PALETTE["body"],
         ).grid(row=1, column=0, sticky="w", pady=(6, 0))
@@ -1304,25 +1507,54 @@ class PatentSummarizerApp(ctk.CTk):
         )
         content.grid(row=1, column=0, sticky="nsew", padx=24, pady=(0, 14))
         content.grid_columnconfigure(0, weight=1)
-        rows: dict[str, list[tuple[ctk.CTkFrame, ctk.StringVar]]] = {}
+        rows: dict[str, list[tuple[ctk.CTkFrame, ctk.StringVar, ctk.BooleanVar]]] = {}
 
-        def add_title(rows_frame, source_id: str, value: str = "") -> None:
+        def add_title(
+            rows_frame,
+            source_id: str,
+            value: str = "",
+            *,
+            selected: bool = True,
+            details: str = "",
+        ) -> None:
             row = ctk.CTkFrame(rows_frame, fg_color="transparent")
             row.grid(row=len(rows[source_id]), column=0, sticky="ew", pady=4)
-            row.grid_columnconfigure(0, weight=1)
+            row.grid_columnconfigure(1, weight=1)
             variable = ctk.StringVar(value=value)
+            selected_var = ctk.BooleanVar(value=selected)
+            ctk.CTkCheckBox(
+                row,
+                text="",
+                width=28,
+                variable=selected_var,
+                onvalue=True,
+                offvalue=False,
+                fg_color=DESKTOP_EDITORIAL_PALETTE["primary"],
+                hover_color=DESKTOP_EDITORIAL_PALETTE["primary_hover"],
+                border_color=DESKTOP_EDITORIAL_PALETTE["hairline"],
+            ).grid(row=0, column=0, sticky="w", padx=(0, 6))
             entry = self._entry(row, variable)
-            entry.grid(row=0, column=0, sticky="ew", padx=(0, 8))
-            record = (row, variable)
+            entry.grid(row=0, column=1, sticky="ew", padx=(0, 8))
+            record = (row, variable, selected_var)
+            if details:
+                ctk.CTkLabel(
+                    row,
+                    text=details,
+                    font=ctk.CTkFont(family="Microsoft YaHei UI", size=11),
+                    text_color=DESKTOP_EDITORIAL_PALETTE["muted"],
+                    justify="left",
+                    anchor="w",
+                    wraplength=700,
+                ).grid(row=1, column=1, columnspan=2, sticky="ew", pady=(4, 5))
 
             def remove() -> None:
                 if record in rows[source_id]:
                     rows[source_id].remove(record)
                 row.destroy()
-                for row_index, (remaining_row, _variable) in enumerate(rows[source_id]):
+                for row_index, (remaining_row, _variable, _selected) in enumerate(rows[source_id]):
                     remaining_row.grid_configure(row=row_index)
 
-            self._button(row, "删除", remove, width=68, secondary=True).grid(row=0, column=1)
+            self._button(row, "删除", remove, width=68, secondary=True).grid(row=0, column=2)
             rows[source_id].append(record)
 
         def render_groups() -> None:
@@ -1360,13 +1592,35 @@ class PatentSummarizerApp(ctk.CTk):
                 rows_frame.grid(row=2, column=0, sticky="ew", padx=14)
                 rows_frame.grid_columnconfigure(0, weight=1)
                 rows[source.source_id] = []
-                for title in proposal.titles:
-                    add_title(rows_frame, source.source_id, title)
+                if proposal.candidates:
+                    for candidate in proposal.candidates:
+                        details = (
+                            f"技术问题：{candidate.technical_problem}\n"
+                            f"关键机制：{candidate.innovation}\n"
+                            f"可实施性：{candidate.feasibility}"
+                        )
+                        if candidate.recommendation_reason:
+                            details += f"\n推荐理由：{candidate.recommendation_reason}"
+                        add_title(
+                            rows_frame,
+                            source.source_id,
+                            candidate.title,
+                            selected=candidate.recommended,
+                            details=details,
+                        )
+                else:
+                    for title_index, title in enumerate(proposal.titles):
+                        add_title(
+                            rows_frame,
+                            source.source_id,
+                            title,
+                            selected=title_index == 0,
+                        )
                 self._button(
                     card,
-                    "＋ 增加标题",
+                    "＋ 新增或融合方向",
                     lambda frame=rows_frame, source_id=source.source_id: add_title(frame, source_id),
-                    width=112,
+                    width=146,
                     secondary=True,
                 ).grid(row=3, column=0, sticky="w", padx=14, pady=(6, 12))
 
@@ -1387,7 +1641,11 @@ class PatentSummarizerApp(ctk.CTk):
             selections = [
                 TitleSelection(
                     proposal.source.source_id,
-                    [variable.get() for _row, variable in rows[proposal.source.source_id]],
+                    [
+                        variable.get()
+                        for _row, variable, selected_var in rows[proposal.source.source_id]
+                        if selected_var.get()
+                    ],
                 )
                 for proposal in request.proposals
             ]
@@ -1407,11 +1665,12 @@ class PatentSummarizerApp(ctk.CTk):
                     return
                 complete(DisclosureTitleReviewResult(selections, ConflictPolicy.ERROR))
                 return
-            conflicts = [
-                disclosure_output_path(request.output_dir, title)
-                for _source, title in work_items
-                if disclosure_output_path(request.output_dir, title).exists()
-            ]
+            conflicts: list[Path] = []
+            for _source, title in work_items:
+                paths = disclosure_output_paths(request.output_dir, title)
+                conflicts.extend(
+                    path for path in (paths.docx, paths.markdown) if path.exists()
+                )
             policy = ConflictPolicy.ERROR
             if conflicts:
                 displayed = "\n".join(str(path) for path in conflicts[:20])
@@ -1454,7 +1713,7 @@ class PatentSummarizerApp(ctk.CTk):
         ).grid(row=0, column=2, padx=(0, 10))
         ctk.CTkButton(
             actions,
-            text="确认并开始生成",
+            text="确认方向并继续",
             width=160,
             height=42,
             corner_radius=12,
@@ -1468,6 +1727,130 @@ class PatentSummarizerApp(ctk.CTk):
         with contextlib.suppress(Exception):
             dialog.grab_set()
         dialog.after(60, dialog.focus_force)
+
+    def _show_disclosure_preview_review(
+        self,
+        request: DisclosurePreviewReviewRequest,
+    ) -> None:
+        preview = request.preview
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("第二次确认：完整技术方案")
+        dialog.geometry("1000x780")
+        dialog.minsize(820, 620)
+        dialog.configure(fg_color=DESKTOP_EDITORIAL_PALETTE["canvas"])
+        dialog.transient(self)
+        dialog.grid_columnconfigure(0, weight=1)
+        dialog.grid_rowconfigure(1, weight=1)
+
+        header = ctk.CTkFrame(dialog, fg_color="transparent")
+        header.grid(row=0, column=0, sticky="ew", padx=24, pady=(22, 12))
+        header.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            header,
+            text="确认完整技术方案",
+            font=ctk.CTkFont(family="Microsoft YaHei UI", size=20, weight="bold"),
+            text_color=DESKTOP_EDITORIAL_PALETTE["ink"],
+            anchor="w",
+        ).grid(row=0, column=0, sticky="ew")
+        ctk.CTkLabel(
+            header,
+            text=(
+                "可直接编辑结构化内容。请核对技术问题、模块输入输出、流程、材料依据、"
+                "示例参数、假设和未决问题；确认后正文不会改变核心机制。"
+            ),
+            font=ctk.CTkFont(family="Microsoft YaHei UI", size=12),
+            text_color=DESKTOP_EDITORIAL_PALETTE["body"],
+            justify="left",
+            anchor="w",
+            wraplength=900,
+        ).grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        ctk.CTkLabel(
+            header,
+            text=(
+                "查新状态："
+                f"{PRIOR_ART_STATUS_LABELS.get(preview.prior_art.status.value, preview.prior_art.status.value)}"
+                f"　{preview.prior_art.message}"
+            ),
+            font=ctk.CTkFont(family="Microsoft YaHei UI", size=11),
+            text_color=DESKTOP_EDITORIAL_PALETTE["muted"],
+            anchor="w",
+        ).grid(row=2, column=0, sticky="ew", pady=(5, 0))
+
+        editor = ctk.CTkTextbox(
+            dialog,
+            wrap="none",
+            corner_radius=12,
+            border_width=1,
+            border_color=DESKTOP_EDITORIAL_PALETTE["hairline"],
+            fg_color=DESKTOP_EDITORIAL_PALETTE["surface_input"],
+            text_color=DESKTOP_EDITORIAL_PALETTE["ink"],
+            font=ctk.CTkFont(family="Consolas", size=12),
+        )
+        editor.grid(row=1, column=0, sticky="nsew", padx=24, pady=(0, 14))
+        initial_payload = _disclosure_preview_payload(preview)
+        editor.insert("1.0", json.dumps(initial_payload, ensure_ascii=False, indent=2))
+
+        actions = ctk.CTkFrame(dialog, fg_color="transparent")
+        actions.grid(row=2, column=0, sticky="ew", padx=24, pady=(0, 22))
+        actions.grid_columnconfigure(0, weight=1)
+
+        def complete(result: DisclosurePreview | None) -> None:
+            request.result = result
+            with contextlib.suppress(Exception):
+                dialog.grab_release()
+            dialog.destroy()
+            request.event.set()
+
+        def restore() -> None:
+            editor.delete("1.0", "end")
+            editor.insert("1.0", json.dumps(initial_payload, ensure_ascii=False, indent=2))
+
+        def confirm() -> None:
+            try:
+                payload = json.loads(editor.get("1.0", "end"))
+                if not isinstance(payload, dict):
+                    raise ValueError("方案内容必须是一个 JSON 对象")
+                revised = parse_disclosure_preview(
+                    payload,
+                    preview.title,
+                    preview.source_id,
+                    preview.prior_art,
+                )
+            except (ValueError, json.JSONDecodeError) as exc:
+                messagebox.showerror("方案内容无效", str(exc), parent=dialog)
+                return
+            complete(revised)
+
+        self._button(actions, "恢复 AI 方案", restore, width=132, secondary=True).grid(
+            row=0, column=1, padx=(0, 10)
+        )
+        self._button(
+            actions,
+            "取消生成",
+            lambda: complete(None),
+            width=112,
+            secondary=True,
+        ).grid(row=0, column=2, padx=(0, 10))
+        self._button(actions, "确认方案并成文", confirm, width=160).grid(row=0, column=3)
+        dialog.protocol("WM_DELETE_WINDOW", lambda: complete(None))
+        with contextlib.suppress(Exception):
+            dialog.grab_set()
+        dialog.after(60, dialog.focus_force)
+
+    def _show_prior_art_failure(self, request: PriorArtFailureRequest) -> None:
+        choice = messagebox.askyesnocancel(
+            "国知局查新未完成",
+            f"技术方案：{request.title}\n\n{request.error}\n\n"
+            "选择“是”重试；选择“否”明确跳过查新并继续；选择“取消”终止本次生成。",
+            parent=self,
+        )
+        if choice is True:
+            request.result = PriorArtFailureAction.RETRY
+        elif choice is False:
+            request.result = PriorArtFailureAction.SKIP
+        else:
+            request.result = PriorArtFailureAction.CANCEL
+        request.event.set()
 
     def _append_log(self, text: str) -> None:
         self.log_text.insert("end", text)
@@ -1494,7 +1877,7 @@ class PatentSummarizerApp(ctk.CTk):
             self._capture_disclosure_idea()
             error = self._disclosure_validation_error()
             self.start_button.configure(state="disabled" if error else "normal")
-            self.status_var.set(error or "技术来源已就绪，可以生成候选标题")
+            self.status_var.set(error or "技术来源已就绪，可以生成候选方案")
         elif self._selected_mode() in {MODE_COMPARE, MODE_REPORT}:
             error = self._portfolio_validation_error()
             self.start_button.configure(state="disabled" if error else "normal")
@@ -1515,14 +1898,14 @@ class PatentSummarizerApp(ctk.CTk):
                         mode=finished_mode,
                         state="cancelled",
                         stage="技术交底书生成已取消" if is_disclosure else "报告生成已取消",
-                        detail="未生成正文或 DOCX" if is_disclosure else "未写入正文和附录",
+                        detail="未生成 DOCX、Markdown 或配套图片" if is_disclosure else "未写入正文和附录",
                         completed=previous.completed if previous else None,
                         total=previous.total if previous else None,
                     )
                 )
             if finished_mode == MODE_DISCLOSURE:
                 self.status_var.set("已取消，未生成技术交底书")
-                self._append_log("\n已取消，未生成正文或 DOCX。\n")
+                self._append_log("\n已取消，未生成 DOCX、Markdown 或配套图片。\n")
             else:
                 self.status_var.set("已取消，未生成报告")
                 self._append_log("\n已取消，未写入正文和附录。\n")

@@ -2,22 +2,31 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
-from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Mapping, Protocol, TypeVar
+from typing import Any, Callable, Mapping, TypeVar
 
 from docx import Document
 from docx.table import Table
 from docx.text.paragraph import Paragraph
+
+from .models import (
+    ConflictPolicy,
+    DisclosureChatClient,
+    DisclosureFailure,
+    DisclosureGenerationResult,
+    DisclosureSourceItem,
+    DisclosureTitleReviewCallback,
+    DisclosureTitleReviewResult,
+    TechnicalDisclosure,
+    TitleProposal,
+    TitleSelection,
+)
 
 
 TITLE_COUNT = 3
 DISCLOSURE_VALIDATION_RETRIES = 1
 MIN_ABSTRACT_CHARS = 150
 MAX_ABSTRACT_CHARS = 800
-MIN_CONTENT_CHARS = 3000
-MAX_CONTENT_CHARS = 5000
 MIN_CONTENT_PARAGRAPHS = 6
 MAX_TITLE_CHARS = 120
 FORBIDDEN_TITLE_CHARS = re.compile(r'[<>:"/\\|?*\r\n]')
@@ -72,7 +81,7 @@ DRAFT_USER_PROMPT = """请基于给定来源和已经由用户确认的标题，
 - 只输出 JSON，不要解释，不要使用 Markdown 代码块。
 - “标题”必须与确认标题逐字一致。
 - “摘要”为 300 至 500 个中文字符的单一自然段，不得换行。
-- “发明内容”为 JSON 字符串数组，目标 8 至 12 个自然段，总长度必须为 3000 至 5000 个非空白字符，且不得在一个数组项中再使用换行拆段。
+- “发明内容”为 JSON 字符串数组，使用足以完整说明输入、处理、判断、输出、异常和边界条件的自然段，不设固定字数上限，且不得在一个数组项中再使用换行拆段。
 - 正文采用类似论文的连续技术叙述，只负责把技术实现方式讲清楚，不设置“技术领域”“技术问题”“实施方式”等内部小标题，不使用编号分节。
 - 自然说明技术问题、总体思路、系统组成或功能模块、部件关系、工作机理、实现流程、异常或边界处理、可选实施方式以及由技术手段直接带来的效果。
 - 不得写保护范围、权利要求拆分建议，不得出现“其特征在于”“根据权利要求”“独立权利要求”“从属权利要求”等表达。
@@ -99,82 +108,11 @@ REVIEW_USER_PROMPT = """请作为独立技术审校人员，对以下技术交�
 - 检查技术问题、组成关系、机理、流程、边界处理、可选实现和技术效果能否形成自洽且可执行的技术说明；有缺失时直接补入正文。
 - 保持论文式连续自然段，不增加内部小标题、编号分节、保护范围或权利要求拆分建议。
 - 摘要必须是 150 至 800 个非空白字符的单段文字。
-- 发明内容至少 6 个自然段，总长度必须为 3000 至 5000 个非空白字符。
+- 发明内容至少 6 个自然段，并以工程师能够理解和复现方案为完整性标准，不设固定字数上限。
 - 删除或改写“其特征在于”“根据权利要求”“独立权利要求”“从属权利要求”等权利要求式表达。
 - 不得虚构企业已有技术、专利事实、实验结果或量化性能；拟议实现应使用技术方案或可选实施方式的语气。
 - JSON 格式：{{"标题": "{title}", "摘要": "...", "发明内容": ["...", "...", "..."]}}
 """
-
-
-class DisclosureChatClient(Protocol):
-    def chat(self, system_prompt: str, user_prompt: str) -> str | Mapping[str, Any]:
-        ...
-
-
-class ConflictPolicy(str, Enum):
-    ERROR = "error"
-    SKIP = "skip"
-    OVERWRITE = "overwrite"
-
-
-@dataclass(frozen=True)
-class DisclosureSourceItem:
-    source_id: str
-    label: str
-    summary: str
-    context: str
-
-
-@dataclass(frozen=True)
-class TitleProposal:
-    source: DisclosureSourceItem
-    titles: list[str]
-
-
-@dataclass(frozen=True)
-class TitleSelection:
-    source_id: str
-    titles: list[str]
-
-
-@dataclass(frozen=True)
-class DisclosureTitleReviewResult:
-    selections: list[TitleSelection]
-    conflict_policy: ConflictPolicy
-
-
-DisclosureTitleReviewCallback = Callable[
-    [list[TitleProposal], Path], DisclosureTitleReviewResult | None
-]
-
-
-@dataclass(frozen=True)
-class TechnicalDisclosure:
-    title: str
-    abstract: str
-    content_paragraphs: list[str]
-
-
-class DisclosureContentLengthError(ValueError):
-    """A disclosure that is otherwise valid but misses the target body length."""
-
-    def __init__(self, message: str, disclosure: TechnicalDisclosure):
-        super().__init__(message)
-        self.disclosure = disclosure
-
-
-@dataclass(frozen=True)
-class DisclosureFailure:
-    source_id: str
-    title: str
-    error: str
-
-
-@dataclass(frozen=True)
-class DisclosureGenerationResult:
-    written: list[Path]
-    skipped: list[Path]
-    failures: list[DisclosureFailure]
 
 
 def load_report_sources(report_path: Path) -> list[DisclosureSourceItem]:
@@ -460,12 +398,6 @@ class DisclosureAnalyzer:
                 if hasattr(self.client, "invalidate"):
                     self.client.invalidate(system_prompt, prompt, str(exc), response)
                 if attempt >= self.validation_retries:
-                    if isinstance(exc, DisclosureContentLengthError):
-                        if hasattr(self.client, "store_validated"):
-                            self.client.store_validated(system_prompt, user_prompt, response)
-                        if self.on_validation_warning is not None:
-                            self.on_validation_warning(stage, str(exc))
-                        return exc.disclosure
                     raise ValueError(f"{stage}结构化响应校验失败：{exc}") from exc
                 if self.on_validation_retry is not None:
                     self.on_validation_retry(stage, attempt + 1, str(exc))
@@ -519,17 +451,11 @@ def parse_technical_disclosure(
     paragraphs = list(content)
     if any(item != item.strip() or "\n" in item or "\r" in item for item in paragraphs):
         raise ValueError("发明内容的每个数组项必须对应一个无内嵌换行的自然段")
-    content_chars = _non_whitespace_chars("".join(paragraphs))
     full_text = "\n".join([title, abstract, *paragraphs])
     for phrase in FORBIDDEN_CLAIM_PHRASES:
         if phrase in full_text:
             raise ValueError(f"技术交底书不得包含权利要求式表达：{phrase}")
     disclosure = TechnicalDisclosure(title, abstract, paragraphs)
-    if not MIN_CONTENT_CHARS <= content_chars <= MAX_CONTENT_CHARS:
-        raise DisclosureContentLengthError(
-            f"发明内容非空白字符数建议为 {MIN_CONTENT_CHARS} 至 {MAX_CONTENT_CHARS}，实际为 {content_chars}",
-            disclosure,
-        )
     return disclosure
 
 

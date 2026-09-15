@@ -10,13 +10,38 @@ pypandoc_datas = collect_data_files("pypandoc")
 pypandoc_hiddenimports = collect_submodules("pypandoc")
 customtkinter_datas = collect_data_files("customtkinter")
 customtkinter_hiddenimports = collect_submodules("customtkinter")
+disclosure_datas = collect_data_files("patent_summarizer.disclosure")
+playwright_browsers = ROOT / "build" / "playwright-browsers"
+mermaid_runtime = ROOT / "build" / "vendor" / "mermaid.min.js"
+browser_datas = (
+    [(str(playwright_browsers), "playwright-browsers")]
+    if playwright_browsers.exists()
+    else []
+)
+mermaid_datas = [(str(mermaid_runtime), "mermaid")] if mermaid_runtime.exists() else []
+dynamic_packages = ("playwright", "pptx", "pdfplumber", "pypdf", "PIL", "latex2mathml")
+dynamic_hiddenimports = [
+    module
+    for package in dynamic_packages
+    for module in collect_submodules(package)
+]
 
 a = Analysis(
     ["patent_summarizer/gui.py"],
     pathex=[str(ROOT)],
     binaries=[],
-    datas=pypandoc_datas + customtkinter_datas,
-    hiddenimports=pypandoc_hiddenimports + customtkinter_hiddenimports,
+    datas=(
+        pypandoc_datas
+        + customtkinter_datas
+        + disclosure_datas
+        + browser_datas
+        + mermaid_datas
+    ),
+    hiddenimports=(
+        pypandoc_hiddenimports
+        + customtkinter_hiddenimports
+        + dynamic_hiddenimports
+    ),
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

@@ -11,19 +11,32 @@ from .comparison_excel_export import write_comparison_workbook
 from .config import ConfigError, load_config
 from .discovery import discover_documents, inspect_summary_coverage
 from .disclosure import (
+    CnipaPriorArtSearcher,
     ConflictPolicy,
     DisclosureAnalyzer,
     DisclosureFailure,
     DisclosureGenerationResult,
+    DisclosurePreviewReviewCallback,
     DisclosureTitleReviewCallback,
+    PriorArtFailureAction,
+    PriorArtFailureCallback,
+    PriorArtResult,
+    PriorArtSearchError,
+    PriorArtStatus,
+    attach_materials,
+    disclosure_output_paths,
+    find_candidate,
     load_idea_source,
+    load_project_source,
     load_report_sources,
     load_title_selections,
     disclosure_output_path,
+    scan_project_materials,
     selected_work_items,
-    selections_from_proposals,
+    TitleSelection,
+    write_disclosure_bundle,
+    write_scan_manifest,
 )
-from .disclosure_docx import write_technical_disclosure
 from .extractors import TextExtractor
 from .excel_export import write_classification_workbook
 from .llm import RateLimitedOpenAIClient
@@ -54,6 +67,8 @@ def main(
     progress: ProgressCallback | None = None,
     report_review: ReportReviewCallback | None = None,
     disclosure_title_review: DisclosureTitleReviewCallback | None = None,
+    disclosure_preview_review: DisclosurePreviewReviewCallback | None = None,
+    disclosure_prior_art_failure: PriorArtFailureCallback | None = None,
 ) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -72,6 +87,8 @@ def main(
             args,
             progress=progress,
             title_review=disclosure_title_review,
+            preview_review=disclosure_preview_review,
+            prior_art_failure=disclosure_prior_art_failure,
         )
     parser.print_help()
     return 2
@@ -154,21 +171,30 @@ def build_parser() -> argparse.ArgumentParser:
 
     disclosure_parser = subparsers.add_parser(
         "disclosure",
-        help="Generate reviewed DOCX technical disclosure documents",
+        help="Generate reviewed engineering disclosure documents (DOCX + Markdown)",
     )
     disclosure_source = disclosure_parser.add_mutually_exclusive_group(required=True)
     disclosure_source.add_argument("--report", type=Path, help="Existing patent-layout analysis report DOCX")
     disclosure_source.add_argument("--idea", help="Direct technical idea text")
     disclosure_source.add_argument("--idea-file", type=Path, help="UTF-8 text file containing a direct technical idea")
-    disclosure_parser.add_argument("--output-dir", required=True, type=Path, help="Directory for generated DOCX files")
+    disclosure_source.add_argument("--project-dir", type=Path, help="Project directory used as the primary invention source")
+    disclosure_parser.add_argument("--material-dir", action="append", default=[], type=Path, help="Supplementary project-material directory; repeatable")
+    disclosure_parser.add_argument("--prior-art", action="store_true", help="Run optional CNIPA invention prior-art search")
+    disclosure_parser.add_argument(
+        "--prior-art-failure",
+        choices=("fail", "skip"),
+        default="fail",
+        help="CLI behavior when optional prior-art search fails (default: fail)",
+    )
+    disclosure_parser.add_argument("--output-dir", required=True, type=Path, help="Directory for generated DOCX, Markdown, and diagram assets")
     disclosure_parser.add_argument(
         "--titles-file",
         type=Path,
-        help="UTF-8 JSON array of explicit source_id/titles selections; otherwise all proposed titles are accepted",
+        help="UTF-8 JSON array of explicit source_id/titles selections; otherwise the recommended candidate is used",
     )
     disclosure_conflicts = disclosure_parser.add_mutually_exclusive_group()
-    disclosure_conflicts.add_argument("--skip-existing", action="store_true", help="Skip existing same-name DOCX files")
-    disclosure_conflicts.add_argument("--overwrite", action="store_true", help="Atomically replace existing same-name DOCX files")
+    disclosure_conflicts.add_argument("--skip-existing", action="store_true", help="Skip existing same-name DOCX or Markdown files")
+    disclosure_conflicts.add_argument("--overwrite", action="store_true", help="Replace existing same-name DOCX and Markdown after validation")
     disclosure_parser.add_argument("--api-rpm", type=int, help="Override PATENT_API_RPM")
     disclosure_parser.add_argument("--env-file", type=Path, default=Path(".env"), help="Path to .env config file")
     disclosure_parser.add_argument("--dry-run", action="store_true", help="Validate sources and list planned title groups without calling the API")
@@ -415,13 +441,26 @@ def disclosure(
     args: argparse.Namespace,
     progress: ProgressCallback | None = None,
     title_review: DisclosureTitleReviewCallback | None = None,
+    preview_review: DisclosurePreviewReviewCallback | None = None,
+    prior_art_failure: PriorArtFailureCallback | None = None,
 ) -> int:
     tracker = ProgressTracker("disclosure", progress)
-    tracker.preparing("正在准备技术交底书", "正在读取技术来源")
+    tracker.preparing("正在准备研发技术交底书", "正在读取技术来源和项目材料")
     try:
+        output_dir = args.output_dir.resolve()
+        if output_dir.exists() and not output_dir.is_dir():
+            raise NotADirectoryError(f"输出路径不是目录：{output_dir}")
+        scan_result = None
         if args.report is not None:
             sources = load_report_sources(args.report.resolve())
             source_key = args.report.stem
+            material_roots = [path.resolve() for path in args.material_dir]
+        elif args.project_dir is not None:
+            material_roots = [args.project_dir.resolve(), *[path.resolve() for path in args.material_dir]]
+            scan_result = scan_project_materials(material_roots, exclude_roots=[output_dir])
+            sources = load_project_source(scan_result)
+            source_key = f"project-{hashlib.sha256('|'.join(str(path) for path in material_roots).encode('utf-8')).hexdigest()[:12]}"
+            material_roots = []
         else:
             if args.idea_file is not None:
                 idea = args.idea_file.read_text(encoding="utf-8-sig")
@@ -429,9 +468,10 @@ def disclosure(
                 idea = args.idea or ""
             sources = load_idea_source(idea)
             source_key = f"manual-{hashlib.sha256(idea.encode('utf-8')).hexdigest()[:12]}"
-        output_dir = args.output_dir.resolve()
-        if output_dir.exists() and not output_dir.is_dir():
-            raise NotADirectoryError(f"输出路径不是目录：{output_dir}")
+            material_roots = [path.resolve() for path in args.material_dir]
+        if material_roots:
+            scan_result = scan_project_materials(material_roots, exclude_roots=[output_dir])
+            sources = attach_materials(sources, scan_result)
         explicit_selections = load_title_selections(args.titles_file) if args.titles_file else None
         if explicit_selections is not None:
             selected_work_items(explicit_selections, sources)
@@ -442,11 +482,15 @@ def disclosure(
     if args.dry_run:
         for source in sources:
             print(f"DISCLOSURE_SOURCE\t{source.source_id}\t{source.label}")
+        if scan_result is not None:
+            for item in scan_result.documents:
+                print(f"MATERIAL\t{item.status}\t{item.kind}\t{item.path}\t{item.message}")
         if explicit_selections is not None:
             for source, title in selected_work_items(explicit_selections, sources):
                 print(f"DISCLOSURE_TITLE\t{source.source_id}\t{title}")
         else:
-            print(f"TITLE_PROPOSALS\tgroups={len(sources)}\tper_group=3")
+            print(f"CANDIDATE_PROPOSALS\tgroups={len(sources)}\tper_group=1..5\tdefault=recommended")
+        print(f"PRIOR_ART\t{'enabled' if args.prior_art else 'disabled'}")
         print(f"OUTPUT_DIR\t{output_dir}")
         return 0
 
@@ -482,28 +526,65 @@ def disclosure(
         on_validation_retry=on_validation_retry,
         on_validation_warning=on_validation_warning,
     )
+
+    def perform_prior_art_search(
+        source_id: str,
+        title: str,
+        terms: tuple[str, ...],
+    ) -> PriorArtResult | None:
+        tracker.set_stage("正在执行可选查新", title)
+        while True:
+            try:
+                result = CnipaPriorArtSearcher().search(terms)
+                print(
+                    f"PRIOR_ART\t{source_id}\t{result.status.value}\t"
+                    f"records={len(result.records)}\t{result.message}"
+                )
+                return result
+            except PriorArtSearchError as exc:
+                action = _prior_art_failure_action(args, prior_art_failure, title, str(exc))
+                if action == PriorArtFailureAction.RETRY:
+                    continue
+                if action == PriorArtFailureAction.SKIP:
+                    result = PriorArtResult(
+                        PriorArtStatus.FAILED,
+                        keywords=terms,
+                        message=f"查新失败后由用户明确跳过：{exc}",
+                    )
+                    print(f"PRIOR_ART\t{source_id}\tfailed-skipped\t{exc}")
+                    return result
+                tracker.cancel("研发技术交底书生成已取消", "查新失败后取消")
+                print(f"CANCELLED\t查新失败后取消：{exc}")
+                return None
     try:
+        if scan_result is not None:
+            manifest = output_dir / ".patent_disclosure_work" / source_key / "material_manifest.json"
+            write_scan_manifest(scan_result, manifest)
+            for item in scan_result.documents:
+                print(f"MATERIAL\t{item.status}\t{item.kind}\t{item.path}\t{item.message}")
+            print(f"MATERIAL_MANIFEST\t{manifest}")
+
+        proposals: list = []
         if explicit_selections is None:
-            tracker.start(len(sources), "正在生成候选标题", "每条建议生成 3 个标题")
-            proposals = []
+            tracker.start(len(sources), "正在挖掘候选发明方案", "每条来源生成 1 至 5 个有实质差异的方案")
             for source in sources:
-                tracker.set_stage("正在生成候选标题", f"{source.source_id} {source.label}")
+                tracker.set_stage("正在挖掘候选发明方案", f"{source.source_id} {source.label}")
                 proposal = analyzer.propose_titles(source)
                 proposals.append(proposal)
-                for title in proposal.titles:
-                    print(f"TITLE\t{source.source_id}\t{title}")
-                tracker.advance("正在生成候选标题", f"已完成 {source.source_id}")
+                for candidate in proposal.candidates:
+                    print(f"CANDIDATE\t{source.source_id}\t{candidate.candidate_id}\trecommended={str(candidate.recommended).lower()}\t{candidate.title}")
+                tracker.advance("正在挖掘候选发明方案", f"已完成 {source.source_id}")
             if title_review is not None:
-                tracker.set_stage("等待人工确认标题", "可修改、删除或增加标题")
+                tracker.set_stage("等待第一次确认", "请选择、编辑或融合候选发明方案")
                 reviewed = title_review(proposals, output_dir)
                 if reviewed is None:
-                    tracker.cancel("技术交底书生成已取消", "未生成正文或 DOCX")
-                    print("CANCELLED\t标题确认已取消，未生成正文或 DOCX")
+                    tracker.cancel("研发技术交底书生成已取消", "未生成正文、DOCX 或 Markdown")
+                    print("CANCELLED\t候选方案确认已取消，未生成正文、DOCX 或 Markdown")
                     return DISCLOSURE_CANCELLED_EXIT_CODE
                 selections = reviewed.selections
                 conflict_policy = ConflictPolicy(reviewed.conflict_policy)
             else:
-                selections = selections_from_proposals(proposals)
+                selections = _recommended_disclosure_selections(proposals)
                 conflict_policy = _disclosure_conflict_policy(args)
         else:
             selections = explicit_selections
@@ -511,61 +592,120 @@ def disclosure(
 
         work_items = selected_work_items(selections, sources)
         if not work_items:
-            tracker.cancel("技术交底书生成已取消", "没有保留任何标题")
-            print("CANCELLED\t没有保留任何标题，未生成正文或 DOCX")
+            tracker.cancel("研发技术交底书生成已取消", "没有保留任何发明方案")
+            print("CANCELLED\t没有保留任何发明方案，未生成正文、DOCX 或 Markdown")
             return DISCLOSURE_CANCELLED_EXIT_CODE
 
-        conflicts = [
-            disclosure_output_path(output_dir, title)
-            for _source, title in work_items
-            if disclosure_output_path(output_dir, title).exists()
-        ]
+        conflicts = []
+        for _source, title in work_items:
+            paths = disclosure_output_paths(output_dir, title)
+            if paths.docx.exists() or paths.markdown.exists():
+                conflicts.append(paths.docx)
         if conflicts and conflict_policy == ConflictPolicy.ERROR:
             paths = "；".join(str(path) for path in conflicts)
             raise FileExistsError(f"技术交底书已经存在：{paths}")
 
         skipped = set(conflicts) if conflict_policy == ConflictPolicy.SKIP else set()
         pending = [
-            (source, title, disclosure_output_path(output_dir, title))
+            (source, title, disclosure_output_paths(output_dir, title))
             for source, title in work_items
-            if disclosure_output_path(output_dir, title) not in skipped
+            if disclosure_output_paths(output_dir, title).docx not in skipped
         ]
         for path in sorted(skipped, key=str):
             print(f"SKIP\t{path}")
 
-        tracker.start(len(pending) * 3, "正在生成技术交底书", "开始逐篇生成和审校")
+        proposal_map = {proposal.source.source_id: proposal for proposal in proposals}
+        confirmed_items = []
+        tracker.start(
+            len(pending),
+            "正在完善选中的技术方案",
+            "依次执行可选查新并形成完整方案预览",
+        )
+        for source, title, paths in pending:
+            candidate = find_candidate(proposal_map[source.source_id], title) if source.source_id in proposal_map else None
+            prior_art = PriorArtResult.disabled()
+            if args.prior_art:
+                terms = analyzer.plan_search_terms(source, title, candidate)
+                searched = perform_prior_art_search(source.source_id, title, terms)
+                if searched is None:
+                    return DISCLOSURE_CANCELLED_EXIT_CODE
+                prior_art = searched
+
+            tracker.set_stage("正在形成完整技术方案", title)
+            preview = analyzer.build_preview(source, title, candidate=candidate, prior_art=prior_art)
+            if preview_review is not None:
+                while True:
+                    tracker.set_stage("等待第二次确认", "请核对技术方案、假设、示例参数和待确认问题")
+                    revised = preview_review(preview)
+                    if revised is None:
+                        tracker.cancel("研发技术交底书生成已取消", "第二次确认已取消，未生成正文")
+                        print("CANCELLED\t完整技术方案确认已取消，未生成正文、DOCX 或 Markdown")
+                        return DISCLOSURE_CANCELLED_EXIT_CODE
+                    if revised.title != title or revised.source_id != source.source_id:
+                        raise ValueError("完整技术方案确认结果不得改变来源编号或已确认标题")
+                    if args.prior_art and _preview_search_signature(revised) != _preview_search_signature(preview):
+                        print(f"PRIOR_ART_REQUERY\t{source.source_id}\t核心机制已修改，重新规划检索主题")
+                        terms = analyzer.plan_search_terms_for_preview(source, revised)
+                        searched = perform_prior_art_search(source.source_id, title, terms)
+                        if searched is None:
+                            return DISCLOSURE_CANCELLED_EXIT_CODE
+                        preview = replace(revised, prior_art=searched)
+                        continue
+                    preview = revised
+                    break
+            confirmed_items.append((source, title, paths, preview))
+            tracker.advance("完整技术方案已经确认", title)
+
+        tracker.start(len(confirmed_items) * 3, "正在生成研发技术交底书", "开始逐篇撰写、独立审校和图文导出")
         written: list[Path] = []
         failures: list[DisclosureFailure] = []
-        for source, title, output in pending:
+        for source, title, paths, preview in confirmed_items:
             completed_units = 0
             try:
-                tracker.set_stage("正在撰写技术交底书", title)
-                draft = analyzer.draft(source, title)
-                tracker.advance("正在撰写技术交底书", f"{title} 初稿完成")
+                tracker.set_stage("正在撰写研发技术交底书", title)
+                draft = analyzer.draft(source, title, preview)
+                tracker.advance("正在撰写研发技术交底书", f"{title} 初稿完成")
                 completed_units += 1
 
-                tracker.set_stage("正在独立审校", title)
-                reviewed_disclosure = analyzer.review(source, draft)
+                tracker.set_stage("正在独立技术审校", title)
+                reviewed_disclosure = analyzer.review(source, draft, preview)
                 tracker.advance("正在独立审校", f"{title} 审校完成")
                 completed_units += 1
 
-                tracker.set_stage("正在核验并写入 DOCX", title)
-                written_path = write_technical_disclosure(
-                    reviewed_disclosure,
-                    output,
-                    overwrite=conflict_policy == ConflictPolicy.OVERWRITE,
-                )
-                written.append(written_path)
-                tracker.advance("正在核验并写入 DOCX", f"{title} 已保存")
+                tracker.set_stage("正在生成图示并核验双格式文件", title)
+                try:
+                    bundle = write_disclosure_bundle(
+                        reviewed_disclosure,
+                        output_dir,
+                        overwrite=conflict_policy == ConflictPolicy.OVERWRITE,
+                    )
+                except (RuntimeError, ValueError) as first_error:
+                    if preview is None or not _delivery_repairable(first_error):
+                        raise
+                    print(f"DISCLOSURE_DELIVERY_REPAIR\t{title}\t{first_error}")
+                    repaired_disclosure = analyzer.repair_delivery(
+                        source,
+                        reviewed_disclosure,
+                        preview,
+                        str(first_error),
+                    )
+                    bundle = write_disclosure_bundle(
+                        repaired_disclosure,
+                        output_dir,
+                        overwrite=conflict_policy == ConflictPolicy.OVERWRITE,
+                    )
+                written.append(bundle.docx)
+                tracker.advance("正在核验并写入双格式文件", f"{title} 已保存")
                 completed_units += 1
-                print(f"OK\t{source.source_id}\t{written_path}")
+                print(f"OK\t{source.source_id}\t{bundle.docx}")
+                print(f"MARKDOWN\t{source.source_id}\t{bundle.markdown}")
             except Exception as exc:
                 failures.append(DisclosureFailure(source.source_id, title, str(exc)))
                 print(f"FAIL\t{source.source_id}\t{title}\t{exc}")
             finally:
                 remaining = 3 - completed_units
                 if remaining:
-                    tracker.advance("技术交底书处理失败", title, units=remaining)
+                    tracker.advance("研发技术交底书处理失败", title, units=remaining)
 
         result = DisclosureGenerationResult(
             written=written,
@@ -574,7 +714,7 @@ def disclosure(
         )
         if result.failures:
             tracker.fail(
-                "部分技术交底书生成失败",
+                "部分研发技术交底书生成失败",
                 f"成功 {len(result.written)}，跳过 {len(result.skipped)}，失败 {len(result.failures)}",
             )
             print(
@@ -583,7 +723,7 @@ def disclosure(
             )
             return 1
         tracker.succeed(
-            "技术交底书生成完成",
+            "研发技术交底书生成完成",
             f"已保存 {len(result.written)} 份，跳过 {len(result.skipped)} 份",
         )
         print(
@@ -592,10 +732,57 @@ def disclosure(
         )
         return 0
     except (FileNotFoundError, NotADirectoryError, OSError, RuntimeError, ValueError) as exc:
-        tracker.fail("技术交底书生成失败", str(exc))
+        tracker.fail("研发技术交底书生成失败", str(exc))
         print(f"Disclosure error: {exc}")
         print(f"LLM debug: {debug_path}")
         return 1
+
+
+def _recommended_disclosure_selections(proposals) -> list[TitleSelection]:
+    selections: list[TitleSelection] = []
+    for proposal in proposals:
+        recommended = [item.title for item in proposal.candidates if item.recommended]
+        titles = recommended[:1] or proposal.titles[:1]
+        selections.append(TitleSelection(proposal.source.source_id, titles))
+    return selections
+
+
+def _prior_art_failure_action(
+    args: argparse.Namespace,
+    callback: PriorArtFailureCallback | None,
+    title: str,
+    error: str,
+) -> PriorArtFailureAction:
+    if callback is not None:
+        return PriorArtFailureAction(callback(title, error))
+    if args.prior_art_failure == "skip":
+        return PriorArtFailureAction.SKIP
+    raise PriorArtSearchError(error)
+
+
+def _preview_search_signature(preview) -> tuple:
+    return (
+        preview.technical_problems,
+        tuple(
+            (
+                module.name,
+                module.responsibility,
+                module.inputs,
+                module.outputs,
+            )
+            for module in preview.modules
+        ),
+        preview.process_steps,
+        preview.key_points,
+    )
+
+
+def _delivery_repairable(error: Exception) -> bool:
+    message = str(error)
+    return any(
+        marker in message
+        for marker in ("图示", "图片", "Mermaid", "公式", "LaTeX", "参数表", "DOCX", "Markdown")
+    )
 
 
 def _disclosure_conflict_policy(args: argparse.Namespace) -> ConflictPolicy:

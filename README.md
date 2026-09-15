@@ -199,9 +199,9 @@ python -m patent_summarizer report `
 - `--dry-run`：仅检查输入和计划。
 - `--api-rpm N`：覆盖 `.env` 中的请求上限。
 
-## 生成发明专利技术交底书
+## 生成研发技术交底书
 
-`disclosure` 可以读取本工具已经生成的专利布局分析报告，也可以直接接收用户的发明构想。报告模式只解析报告第五至第八章，以第七章待布局建议及其对应的第八章组合策略为主要上下文，不会重新运行分类、趋势或组合对比。
+`disclosure` 面向需要复现方案的研发工程师，仅生成发明类研发技术交底书。主来源可以是本工具生成的专利布局分析报告、用户直接输入的发明构想，或独立项目材料目录；报告和构思也可以通过可重复的 `--material-dir` 附加项目材料。报告模式保留第五、六章背景以及第七、八章之间的对应关系，不重新运行分类、趋势或组合对比。
 
 从分析报告生成：
 
@@ -216,10 +216,21 @@ python -m patent_summarizer disclosure `
 ```powershell
 python -m patent_summarizer disclosure `
   --idea-file "发明构想.txt" `
+  --material-dir "D:\项目\详细设计" `
   --output-dir "output\doc\技术交底书"
 ```
 
-每条来源先生成 3 个不同技术切入点的标题。GUI 会按建议分组打开标题确认窗口，允许修改、删除和增加标题；普通 CLI 不打开编辑菜单，默认采用全部候选标题。CLI 可用 `--titles-file` 提供显式标题选择，JSON 格式如下；报告来源使用界面或 dry-run 显示的 `7.x` 编号，直接思路使用 `manual`：
+独立扫描项目材料：
+
+```powershell
+python -m patent_summarizer disclosure `
+  --project-dir "D:\项目\控制器软件" `
+  --output-dir "D:\项目\技术交底书"
+```
+
+Project Scan 递归读取 DOCX、PPTX、文字型 PDF、Markdown、文本和常见源码，并保留可用的页码、标题或代码片段定位。它不执行代码、宏或材料中的命令，不识别图片内容，也不解析 OCR、CAD 或 Simulink 模型。读取清单和失败原因保存在输出目录的 `.patent_disclosure_work` 中；只有完全没有有效文字输入时才停止。
+
+每条来源生成通常 3 至 5 个有实质差异的候选，材料不足时可以更少。GUI 第一次确认可多选、取消、编辑标题或新增融合方向；CLI 默认只采用每条来源的推荐方案。CLI 可用 `--titles-file` 提供显式标题选择，JSON 格式如下；报告来源使用界面或 dry-run 显示的 `7.x` 编号，直接思路使用 `manual`，项目扫描使用 `project`：
 
 ```json
 [
@@ -228,11 +239,15 @@ python -m patent_summarizer disclosure `
 ]
 ```
 
-每个保留标题依次经过独立初稿、独立审校、本地内容校验和 DOCX 格式校验，最终保存为 `<标题>_技术交底书.docx`。正文采用论文式连续技术叙述，不生成权利要求书或保护范围建议。发明内容以 3000 至 5000 个非空白字符为目标；长度不合格时会自动修复一次，仍不合格则记录 `WARNING` 并继续写入，其他结构或内容校验仍按失败处理。默认遇到同名文件即停止；可使用 `--skip-existing` 跳过已有文件，或使用 `--overwrite` 在新文件核验通过后原子覆盖。`--dry-run` 只检查来源并列出标题组计划，不调用 API 或写入 DOCX。
+候选确认后先形成完整技术方案预览，集中展示技术问题、具体模块及输入输出、流程、材料依据、示例参数、假设和未决问题。GUI 第二次确认可直接编辑这些结构化内容。成文固定使用六章：技术背景与现有方案、需要解决的技术问题、技术方案详细说明、技术效果与适用边界、技术关键点、实施例与验证方法。全文采用工程设计文档表达，检查权利要求式措辞、术语、图文、公式、参数、异常路径和验证方法的一致性，不设置固定字数上限。
+
+每项输出 `<标题>_技术交底书.docx`、同名 `.md` 和 `_assets` 图片目录。Markdown 保留 Mermaid 图源，Word 嵌入本地生成的 PNG；参数使用 Word 表格，必要公式转换为可编辑 Word 公式。图示、公式或双格式校验失败时该篇标记失败，不把损坏内容作为正常交付。默认遇到同名 DOCX 或 Markdown 即停止；可使用 `--skip-existing` 或 `--overwrite`。
+
+查新通过 `--prior-art` 显式开启，默认关闭。开启时只访问国知局专利公布公告系统，先按技术关键词召回，再按 IPC 收敛，保留约 4 至 6 条可核验中国发明记录。CLI 查新失败默认停止，只有同时传入 `--prior-art-failure skip` 才明确跳过并继续。关闭时不发起查新公网请求。`--dry-run` 只检查来源与材料清单，不调用模型、查新或写入交付文件。
 
 ## 便携 GUI EXE
 
-Windows 便携版只处理 DOCX 文件，不处理 PDF/OCR。GUI 使用 CustomTkinter，并内置 `pypandoc-binary` 提供的 Pandoc。
+Windows 便携版的专利总结流程仍只处理 DOCX；研发技术交底书的 Project Scan 还支持 PPTX、文字型 PDF、Markdown、文本和常见源码，不提供 OCR。GUI 使用 CustomTkinter，便携包包含 Python 运行库、Pandoc、Office/PDF 解析库、Playwright、Chromium 和本地 Mermaid 运行时，终端用户不需要安装 Python、Node 或 Office，也不需要在首次运行时下载绘图资源。
 
 ### 自行打包
 
@@ -252,7 +267,7 @@ conda run -n temp python build_portable.py
 - `汽车底盘领域专利布局分析报告模板.docx`：报告功能使用的内置模板。
 - `patent-summarizer.ico`：程序窗口和便携包使用的自定义图标。
 - `使用说明.md`：面向普通使用人员的完整操作指南。
-- `_internal\`：EXE 运行依赖，包含 CustomTkinter、Python 运行库和 Pandoc 等文件。
+- `_internal\`：EXE 运行依赖，包含 CustomTkinter、Python 运行库、Pandoc、Chromium、本地 Mermaid 运行时及第三方许可证等文件。
 
 使用时把整个 `dist\PatentSummarizer\` 文件夹复制给使用者，不要只复制 EXE。GUI 提供六项任务：
 
@@ -262,7 +277,7 @@ conda run -n temp python build_portable.py
 - 每个组合目录中的 `patent_classification.xlsx` 相互独立；已有文件会被复用，缺失时使用 EXE 同目录的 `class.xlsx` 自动生成。
 - “对比”默认输出 `<目标名称>_专利组合对比.xlsx`，“报告”默认输出 `<目标名称>_专利布局分析报告.docx`，均保存到目标目录并可通过“另存为”修改。
 - “报告”固定使用便携包内置的 `汽车底盘领域专利布局分析报告模板.docx`。
-- “技术交底书”支持导入分析报告或直接输入一项发明构想。报告生成完成后可选择自动切换并带入报告，但必须再次点击“生成候选标题”才会调用模型。
+- “技术交底书”支持导入分析报告、直接输入发明构想或扫描项目材料，前两种来源可附加项目目录。查新默认关闭；候选方向和完整技术方案分别经过一次确认。
 
 完整的逐步说明、前置条件和常见问题请查看根目录的 [使用说明.md](使用说明.md)。
 

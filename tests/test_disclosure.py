@@ -3,7 +3,9 @@ from contextlib import redirect_stdout
 from io import StringIO
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from docx import Document
@@ -14,7 +16,11 @@ from patent_summarizer.cli import build_parser, main
 from patent_summarizer.config import AppConfig
 from patent_summarizer.disclosure import (
     DisclosureAnalyzer,
+    DisclosurePreview,
     DisclosureSourceItem,
+    ModuleDefinition,
+    PriorArtResult,
+    PriorArtStatus,
     TechnicalDisclosure,
     TitleProposal,
     TitleSelection,
@@ -48,6 +54,24 @@ def _valid_payload(title: str = "一种冗余制动控制方法") -> dict:
 def _valid_disclosure(title: str = "一种冗余制动控制方法") -> TechnicalDisclosure:
     payload = _valid_payload(title)
     return TechnicalDisclosure(payload["标题"], payload["摘要"], payload["发明内容"])
+
+
+def _valid_preview(title: str = "一种冗余制动控制方法") -> DisclosurePreview:
+    return DisclosurePreview(
+        source_id="manual",
+        title=title,
+        technical_problems=("单通道故障时制动力连续性不足",),
+        modules=(
+            ModuleDefinition("状态判断模块", "判断通道状态", ("状态信号",), ("通道状态",)),
+            ModuleDefinition("制动力协调模块", "计算目标制动力", ("通道状态",), ("目标制动力",)),
+        ),
+        process_steps=("S1 采集状态", "S2 判断有效性", "S3 输出目标制动力"),
+        key_points=("跨通道状态协调",),
+        evidence_refs=(),
+        suggested_parameters=(),
+        assumptions=("控制周期稳定",),
+        open_questions=("故障阈值需要标定",),
+    )
 
 
 def _add_two_column_table(document, headers, fields):
@@ -154,7 +178,7 @@ class DisclosureParsingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "非法字符"):
             parse_title_proposal({"标题": ["标题甲", "标题/乙", "标题丙"]})
 
-    def test_validates_reviewed_content_shape_length_and_claim_language(self):
+    def test_validates_reviewed_content_shape_without_fixed_length_cap_and_claim_language(self):
         parsed = parse_technical_disclosure(_valid_payload(), "一种冗余制动控制方法")
         self.assertEqual(6, len(parsed.content_paragraphs))
 
@@ -165,8 +189,8 @@ class DisclosureParsingTests(unittest.TestCase):
 
         invalid = _valid_payload()
         invalid["发明内容"] = ["短内容"] * 6
-        with self.assertRaisesRegex(ValueError, "3000 至 5000"):
-            parse_technical_disclosure(invalid, invalid["标题"])
+        parsed_short = parse_technical_disclosure(invalid, invalid["标题"])
+        self.assertEqual(["短内容"] * 6, parsed_short.content_paragraphs)
 
         invalid = _valid_payload()
         invalid["发明内容"][0] = "其特征在于" + invalid["发明内容"][0]
@@ -193,7 +217,7 @@ class DisclosureParsingTests(unittest.TestCase):
         self.assertEqual(2, len(client.prompts))
         self.assertIn("上一次响应未通过", client.prompts[1])
 
-    def test_content_length_becomes_warning_after_one_retry_for_both_sources(self):
+    def test_content_length_does_not_trigger_retry_or_warning(self):
         class SequenceClient:
             def __init__(self, responses):
                 self.responses = list(responses)
@@ -206,7 +230,7 @@ class DisclosureParsingTests(unittest.TestCase):
         short_payload = _valid_payload()
         short_payload["发明内容"] = ["内容较短但结构完整" for _ in range(6)]
 
-        direct_client = SequenceClient([short_payload, short_payload])
+        direct_client = SequenceClient([short_payload])
         direct_warnings = []
         direct_source = DisclosureSourceItem("manual", "用户直接思路", "摘要", "上下文")
         direct_result = DisclosureAnalyzer(
@@ -214,7 +238,7 @@ class DisclosureParsingTests(unittest.TestCase):
             on_validation_warning=lambda stage, error: direct_warnings.append((stage, error)),
         ).draft(direct_source, short_payload["标题"])
 
-        report_client = SequenceClient([short_payload, short_payload])
+        report_client = SequenceClient([short_payload])
         report_warnings = []
         report_source = DisclosureSourceItem("7.1", "报告建议", "摘要", "报告上下文")
         valid_draft = parse_technical_disclosure(_valid_payload(), short_payload["标题"])
@@ -223,13 +247,12 @@ class DisclosureParsingTests(unittest.TestCase):
             on_validation_warning=lambda stage, error: report_warnings.append((stage, error)),
         ).review(report_source, valid_draft)
 
-        self.assertEqual(2, len(direct_client.prompts))
-        self.assertEqual(2, len(report_client.prompts))
+        self.assertEqual(1, len(direct_client.prompts))
+        self.assertEqual(1, len(report_client.prompts))
         self.assertEqual(short_payload["发明内容"], direct_result.content_paragraphs)
         self.assertEqual(short_payload["发明内容"], report_result.content_paragraphs)
-        self.assertIn("初稿", direct_warnings[0][0])
-        self.assertIn("独立审校", report_warnings[0][0])
-        self.assertIn("实际为", direct_warnings[0][1])
+        self.assertEqual([], direct_warnings)
+        self.assertEqual([], report_warnings)
 
     def test_non_length_validation_still_fails_after_one_retry(self):
         class SequenceClient:
@@ -369,7 +392,7 @@ class DisclosureCliTests(unittest.TestCase):
             self.assertEqual(130, exit_code)
             self.assertEqual([], list(output.glob("*.docx")))
 
-    def test_cli_writes_short_content_with_warning_after_repair(self):
+    def test_cli_rejects_legacy_unstructured_content_after_upgrade(self):
         class SequenceClient:
             def __init__(self, response):
                 self.responses = [response, response, response, response]
@@ -395,6 +418,9 @@ class DisclosureCliTests(unittest.TestCase):
             ), patch(
                 "patent_summarizer.cli.RateLimitedOpenAIClient",
                 return_value=SequenceClient(short_payload),
+            ), patch(
+                "patent_summarizer.cli.DisclosureAnalyzer.build_preview",
+                return_value=_valid_preview(title),
             ), redirect_stdout(stdout):
                 exit_code = main(
                     [
@@ -408,10 +434,10 @@ class DisclosureCliTests(unittest.TestCase):
                     ]
                 )
 
-            self.assertEqual(0, exit_code)
-            self.assertTrue((output / f"{title}_技术交底书.docx").exists())
-            self.assertIn("WARNING\t", stdout.getvalue())
-            self.assertNotIn("FAIL\t", stdout.getvalue())
+            self.assertEqual(1, exit_code)
+            self.assertFalse((output / f"{title}_技术交底书.docx").exists())
+            self.assertIn("FAIL\t", stdout.getvalue())
+            self.assertNotIn("WARNING\t", stdout.getvalue())
 
     def test_explicit_titles_generate_skip_and_atomically_overwrite(self):
         title = "一种冗余制动控制方法"
@@ -440,6 +466,9 @@ class DisclosureCliTests(unittest.TestCase):
                 "patent_summarizer.cli.load_config",
                 return_value=AppConfig("https://example.test", "key", "model"),
             ), patch(
+                "patent_summarizer.cli.DisclosureAnalyzer.build_preview",
+                return_value=_valid_preview(title),
+            ), patch(
                 "patent_summarizer.cli.DisclosureAnalyzer.draft",
                 return_value=disclosure,
             ), patch(
@@ -462,6 +491,9 @@ class DisclosureCliTests(unittest.TestCase):
                 "patent_summarizer.cli.load_config",
                 return_value=AppConfig("https://example.test", "key", "model"),
             ), patch(
+                "patent_summarizer.cli.DisclosureAnalyzer.build_preview",
+                return_value=_valid_preview(title),
+            ), patch(
                 "patent_summarizer.cli.DisclosureAnalyzer.draft",
                 return_value=disclosure,
             ), patch(
@@ -470,6 +502,122 @@ class DisclosureCliTests(unittest.TestCase):
             ):
                 self.assertEqual(0, main([*argv, "--overwrite"]))
             validate_technical_disclosure_docx(generated, disclosure)
+
+    def test_core_preview_edit_triggers_prior_art_requery(self):
+        title = "一种冗余制动控制方法"
+        initial_preview = _valid_preview(title)
+        revised_preview = replace(
+            initial_preview,
+            modules=(
+                ModuleDefinition("信号可信度判断模块", "计算信号可信度", ("状态信号",), ("可信度",)),
+                initial_preview.modules[1],
+            ),
+        )
+        review_calls = []
+
+        def review_preview(preview):
+            review_calls.append(preview)
+            return revised_preview if len(review_calls) == 1 else preview
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            output = root / "out"
+            titles = root / "titles.json"
+            titles.write_text(
+                json.dumps([{"source_id": "manual", "titles": [title]}], ensure_ascii=False),
+                encoding="utf-8",
+            )
+            bundle = SimpleNamespace(
+                docx=output / f"{title}_技术交底书.docx",
+                markdown=output / f"{title}_技术交底书.md",
+            )
+            result = PriorArtResult(PriorArtStatus.SUCCESS, message="查新完成")
+            with patch(
+                "patent_summarizer.cli.load_config",
+                return_value=AppConfig("https://example.test", "key", "model"),
+            ), patch(
+                "patent_summarizer.cli.DisclosureAnalyzer.plan_search_terms",
+                return_value=("冗余制动", "通道协调"),
+            ), patch(
+                "patent_summarizer.cli.DisclosureAnalyzer.plan_search_terms_for_preview",
+                return_value=("信号可信度", "制动力协调"),
+            ) as replanned, patch(
+                "patent_summarizer.cli.CnipaPriorArtSearcher.search",
+                side_effect=[result, result],
+            ) as searched, patch(
+                "patent_summarizer.cli.DisclosureAnalyzer.build_preview",
+                return_value=initial_preview,
+            ), patch(
+                "patent_summarizer.cli.DisclosureAnalyzer.draft",
+                return_value=_valid_disclosure(title),
+            ), patch(
+                "patent_summarizer.cli.DisclosureAnalyzer.review",
+                return_value=_valid_disclosure(title),
+            ), patch(
+                "patent_summarizer.cli.write_disclosure_bundle",
+                return_value=bundle,
+            ):
+                exit_code = main(
+                    [
+                        "disclosure",
+                        "--idea", "一种冗余制动控制思路",
+                        "--output-dir", str(output),
+                        "--titles-file", str(titles),
+                        "--prior-art",
+                    ],
+                    disclosure_preview_review=review_preview,
+                )
+
+        self.assertEqual(0, exit_code)
+        self.assertEqual(2, searched.call_count)
+        replanned.assert_called_once()
+        self.assertEqual(2, len(review_calls))
+        self.assertEqual(PriorArtStatus.SUCCESS, review_calls[1].prior_art.status)
+
+    def test_diagram_or_formula_export_failure_gets_one_repair_attempt(self):
+        title = "一种冗余制动控制方法"
+        disclosure = _valid_disclosure(title)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            output = root / "out"
+            titles = root / "titles.json"
+            titles.write_text(
+                json.dumps([{"source_id": "manual", "titles": [title]}], ensure_ascii=False),
+                encoding="utf-8",
+            )
+            bundle = SimpleNamespace(
+                docx=output / f"{title}_技术交底书.docx",
+                markdown=output / f"{title}_技术交底书.md",
+            )
+            with patch(
+                "patent_summarizer.cli.load_config",
+                return_value=AppConfig("https://example.test", "key", "model"),
+            ), patch(
+                "patent_summarizer.cli.DisclosureAnalyzer.build_preview",
+                return_value=_valid_preview(title),
+            ), patch(
+                "patent_summarizer.cli.DisclosureAnalyzer.draft",
+                return_value=disclosure,
+            ), patch(
+                "patent_summarizer.cli.DisclosureAnalyzer.review",
+                return_value=disclosure,
+            ), patch(
+                "patent_summarizer.cli.DisclosureAnalyzer.repair_delivery",
+                return_value=disclosure,
+            ) as repair, patch(
+                "patent_summarizer.cli.write_disclosure_bundle",
+                side_effect=[ValueError("公式无法转换为可编辑 Word 公式"), bundle],
+            ) as write:
+                exit_code = main([
+                    "disclosure",
+                    "--idea", "一种冗余制动控制思路",
+                    "--output-dir", str(output),
+                    "--titles-file", str(titles),
+                ])
+
+        self.assertEqual(0, exit_code)
+        self.assertEqual(2, write.call_count)
+        repair.assert_called_once()
 
 
 if __name__ == "__main__":

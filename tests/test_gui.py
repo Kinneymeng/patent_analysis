@@ -31,6 +31,7 @@ from patent_summarizer.gui import (
     build_portfolio_cli_argv,
     default_output_path,
     disclosure_idea_value,
+    disclosure_material_paths,
     mode_from_label,
     mode_button_style,
     progress_display,
@@ -205,12 +206,41 @@ class GuiCommandTests(unittest.TestCase):
         self.assertIn("一种冗余制动构想", idea_argv)
         self.assertIn(str(app_dir / ".env"), idea_argv)
 
+    def test_builds_project_scan_command_with_materials_and_prior_art(self):
+        app_dir = Path("D:/portable")
+        output_dir = Path("D:/out/技术交底书")
+        project = Path("D:/project")
+        material = Path("D:/material")
+
+        argv = build_disclosure_cli_argv(
+            "扫描项目材料",
+            None,
+            "",
+            output_dir,
+            app_dir,
+            project_dir=project,
+            material_dirs=[material],
+            prior_art=True,
+        )
+
+        self.assertIn("--project-dir", argv)
+        self.assertIn(str(project), argv)
+        self.assertIn("--material-dir", argv)
+        self.assertIn(str(material), argv)
+        self.assertIn("--prior-art", argv)
+
     def test_eps_idea_example_is_display_only(self):
         self.assertIn("电动助力转向（EPS）", DISCLOSURE_IDEA_PLACEHOLDER)
         for prompt_part in ("拟解决的问题", "预期结构与流程", "输入与输出", "使用场景与约束"):
             self.assertIn(prompt_part, DISCLOSURE_IDEA_PLACEHOLDER)
         self.assertEqual("", disclosure_idea_value(DISCLOSURE_IDEA_PLACEHOLDER, True))
         self.assertEqual("用户填写的构思", disclosure_idea_value("  用户填写的构思  ", False))
+
+    def test_parses_multiple_disclosure_material_directories(self):
+        self.assertEqual(
+            [Path("D:/材料一"), Path("D:/材料二")],
+            disclosure_material_paths("D:/材料一; D:/材料二"),
+        )
 
     def test_default_output_uses_safe_target_label(self):
         root = Path("D:/patents/target")
@@ -319,6 +349,31 @@ class PortableRuntimeFilesTests(unittest.TestCase):
         spec = Path("PatentSummarizer.spec").read_text(encoding="utf-8")
 
         self.assertIn('icon=str(ROOT / "assets" / "patent-summarizer.ico")', spec)
+
+    def test_portable_verifier_requires_disclosure_prompts_license_and_browser(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dist = Path(tmp) / "PatentSummarizer"
+            internal = dist / "_internal"
+            prompt_dir = internal / "patent_summarizer" / "disclosure" / "prompts"
+            license_dir = internal / "patent_summarizer" / "disclosure" / "cnipa_upstream"
+            mermaid_license_dir = internal / "patent_summarizer" / "disclosure"
+            browser_dir = internal / "playwright-browsers" / "chromium" / "chrome-win"
+            mermaid_dir = internal / "mermaid"
+            for directory in (prompt_dir, license_dir, browser_dir, mermaid_dir):
+                directory.mkdir(parents=True)
+            (dist / "PatentSummarizer.exe").write_bytes(b"exe")
+            (prompt_dir / "common.md").write_text("rules", encoding="utf-8")
+            (license_dir / "LICENSE.txt").write_text("MIT", encoding="utf-8")
+            (mermaid_license_dir / "MERMAID_LICENSE.txt").write_text("MIT", encoding="utf-8")
+            (mermaid_license_dir / "THIRD_PARTY_NOTICES.md").write_text("notices", encoding="utf-8")
+            (browser_dir / "chrome.exe").write_bytes(b"browser")
+            (mermaid_dir / "mermaid.min.js").write_bytes(b"mermaid")
+
+            build_portable.verify_portable_application(dist)
+
+            (browser_dir / "chrome.exe").unlink()
+            with self.assertRaisesRegex(FileNotFoundError, "Chromium executable"):
+                build_portable.verify_portable_application(dist)
 
     def test_user_guide_covers_all_six_gui_tasks(self):
         guide = Path("使用说明.md").read_text(encoding="utf-8")
