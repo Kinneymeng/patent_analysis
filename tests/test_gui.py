@@ -21,6 +21,7 @@ from patent_summarizer.gui import (
     MODE_CLASSIFY,
     MODE_COMPARE,
     MODE_DISCLOSURE,
+    MODE_ELEPHANT_HORSE,
     MODE_REPORT,
     MODE_SUMMARIZE,
     DISCLOSURE_SOURCE_IDEA,
@@ -33,6 +34,7 @@ from patent_summarizer.gui import (
     bind_mousewheel_tree,
     build_cli_argv,
     build_disclosure_cli_argv,
+    build_elephant_horse_cli_argv,
     build_portfolio_cli_argv,
     default_output_path,
     disclosure_idea_value,
@@ -141,7 +143,7 @@ class GuiCommandTests(unittest.TestCase):
             build_cli_argv("unknown", Path("D:/patents"), Path("D:/app"))
 
     def test_segmented_mode_options_map_labels_to_cli_modes(self):
-        self.assertEqual(MODE_OPTIONS, ["批量总结", "分类", "趋势分析", "报告", "技术交底书"])
+        self.assertEqual(MODE_OPTIONS, ["批量总结", "分类", "趋势分析", "报告", "技术交底书", "象马组合"])
         self.assertNotIn(MODE_COMPARE, VISIBLE_MODE_LABELS)
         self.assertEqual(mode_from_label("批量总结"), MODE_SUMMARIZE)
         self.assertEqual(mode_from_label("分类"), MODE_CLASSIFY)
@@ -149,6 +151,7 @@ class GuiCommandTests(unittest.TestCase):
         self.assertEqual(mode_from_label("对比"), MODE_COMPARE)
         self.assertEqual(mode_from_label("报告"), MODE_REPORT)
         self.assertEqual(mode_from_label("技术交底书"), MODE_DISCLOSURE)
+        self.assertEqual(mode_from_label("象马组合"), MODE_ELEPHANT_HORSE)
 
         with self.assertRaises(ValueError):
             mode_from_label("未知")
@@ -185,6 +188,20 @@ class GuiCommandTests(unittest.TestCase):
 
         self.assertEqual(argv[0], "report")
         self.assertIn(str(app_dir / "汽车底盘领域专利布局分析报告模板.docx"), argv)
+        self.assertIn("--overwrite", argv)
+
+    def test_builds_elephant_horse_command_with_search_resume_and_overwrite(self):
+        argv = build_elephant_horse_cli_argv(
+            Path("D:/reports/layout.docx"),
+            Path("D:/reports/target_保护型象马组合布局报告.docx"),
+            Path("D:/portable"),
+            expanded_search=True,
+            resume=False,
+            overwrite=True,
+        )
+        self.assertEqual("elephant-horse", argv[0])
+        self.assertIn("--expanded-search", argv)
+        self.assertIn("--no-resume", argv)
         self.assertIn("--overwrite", argv)
 
     def test_builds_disclosure_commands_for_report_and_direct_idea(self):

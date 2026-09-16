@@ -16,3 +16,4 @@ dist_palette/
 *.egg-info/
 tests/*
 !tests/test_disclosure.py
+!tests/test_elephant_horse.py

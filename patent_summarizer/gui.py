@@ -13,7 +13,7 @@ from tkinter import filedialog, messagebox
 
 import customtkinter as ctk
 
-from patent_summarizer.cli import DISCLOSURE_CANCELLED_EXIT_CODE, REPORT_CANCELLED_EXIT_CODE, main
+from patent_summarizer.cli import DISCLOSURE_CANCELLED_EXIT_CODE, ELEPHANT_HORSE_CANCELLED_EXIT_CODE, REPORT_CANCELLED_EXIT_CODE, main
 from patent_summarizer.discovery import SummaryCoverage, inspect_summary_coverage
 from patent_summarizer.disclosure import (
     ConflictPolicy,
@@ -28,6 +28,11 @@ from patent_summarizer.disclosure import (
     validate_title_selections,
 )
 from patent_summarizer.progress import ProgressUpdate
+from patent_summarizer.elephant_horse import (
+    SearchFailureAction,
+    default_elephant_horse_output,
+    load_elephant_horse_inputs,
+)
 from patent_summarizer.report_analysis import ChapterSummaries
 from patent_summarizer.report_docx import derive_appendix_output
 
@@ -38,6 +43,7 @@ MODE_ANALYZE = "analyze"
 MODE_COMPARE = "compare"
 MODE_REPORT = "report"
 MODE_DISCLOSURE = "disclosure"
+MODE_ELEPHANT_HORSE = "elephant-horse"
 
 MODE_LABELS = {
     MODE_SUMMARIZE: "批量总结",
@@ -46,6 +52,7 @@ MODE_LABELS = {
     MODE_COMPARE: "对比",
     MODE_REPORT: "报告",
     MODE_DISCLOSURE: "技术交底书",
+    MODE_ELEPHANT_HORSE: "象马组合",
 }
 VISIBLE_MODE_LABELS = {
     mode: label for mode, label in MODE_LABELS.items() if mode != MODE_COMPARE
@@ -95,6 +102,14 @@ class PriorArtFailureRequest:
     error: str
     event: threading.Event
     result: PriorArtFailureAction = PriorArtFailureAction.CANCEL
+
+
+@dataclass
+class ElephantHorseSearchFailureRequest:
+    title: str
+    error: str
+    event: threading.Event
+    result: SearchFailureAction = SearchFailureAction.CANCEL
 
 
 DISCLOSURE_SOURCE_REPORT = "导入分析报告"
@@ -399,6 +414,32 @@ def build_disclosure_cli_argv(
     return argv
 
 
+def build_elephant_horse_cli_argv(
+    report_path: Path,
+    output: Path,
+    app_dir: Path,
+    expanded_search: bool = False,
+    resume: bool = True,
+    overwrite: bool = False,
+) -> list[str]:
+    argv = [
+        "elephant-horse",
+        "--report",
+        str(Path(report_path)),
+        "--output",
+        str(Path(output)),
+        "--env-file",
+        str(Path(app_dir) / ".env"),
+    ]
+    if expanded_search:
+        argv.append("--expanded-search")
+    if not resume:
+        argv.append("--no-resume")
+    if overwrite:
+        argv.append("--overwrite")
+    return argv
+
+
 def default_output_path(mode: str, target_root: Path, target_label: str) -> Path:
     safe_label = re.sub(r'[<>:"/\\|?*]', "_", target_label.strip()).rstrip(" .") or "目标组合"
     if mode == MODE_COMPARE:
@@ -440,6 +481,11 @@ class PatentSummarizerApp(ctk.CTk):
         self.disclosure_prior_art_var = ctk.BooleanVar(value=False)
         self.disclosure_resume_var = ctk.BooleanVar(value=True)
         self.disclosure_output_dir_var = ctk.StringVar()
+        self.elephant_horse_report_var = ctk.StringVar()
+        self.elephant_horse_output_var = ctk.StringVar()
+        self.elephant_horse_expanded_var = ctk.BooleanVar(value=False)
+        self.elephant_horse_resume_var = ctk.BooleanVar(value=True)
+        self.elephant_horse_readiness_var = ctk.StringVar(value="请选择专利布局分析报告。")
         self.disclosure_idea = ""
         self.disclosure_idea_editor: ctk.CTkTextbox | None = None
         self.disclosure_idea_showing_placeholder = False
@@ -457,6 +503,8 @@ class PatentSummarizerApp(ctk.CTk):
         self.disclosure_project_var.trace_add("write", lambda *_args: self.after_idle(self._refresh_start_state))
         self.disclosure_material_var.trace_add("write", lambda *_args: self.after_idle(self._refresh_start_state))
         self.disclosure_output_dir_var.trace_add("write", lambda *_args: self.after_idle(self._refresh_start_state))
+        self.elephant_horse_report_var.trace_add("write", lambda *_args: self.after_idle(self._refresh_elephant_horse_readiness))
+        self.elephant_horse_output_var.trace_add("write", lambda *_args: self.after_idle(self._refresh_start_state))
 
         self.title("专利 DOCX 处理工具")
         with contextlib.suppress(Exception):
@@ -641,10 +689,16 @@ class PatentSummarizerApp(ctk.CTk):
             self._render_portfolio_config()
         elif self._selected_mode() == MODE_DISCLOSURE:
             self._render_disclosure_config()
+        elif self._selected_mode() == MODE_ELEPHANT_HORSE:
+            self._render_elephant_horse_config()
         else:
             self._render_single_directory_config()
         self.start_button.configure(
-            text="生成候选方案" if self._selected_mode() == MODE_DISCLOSURE else "开始运行"
+            text=(
+                "生成候选方案" if self._selected_mode() == MODE_DISCLOSURE
+                else "生成象马组合报告" if self._selected_mode() == MODE_ELEPHANT_HORSE
+                else "开始运行"
+            )
         )
         self.after_idle(self._refresh_start_state)
 
@@ -828,6 +882,69 @@ class PatentSummarizerApp(ctk.CTk):
             secondary=True,
         ).grid(row=1, column=1)
 
+    def _render_elephant_horse_config(self) -> None:
+        report_section = ctk.CTkFrame(self.config_frame, fg_color="transparent")
+        report_section.grid(row=0, column=0, sticky="ew")
+        report_section.grid_columnconfigure(0, weight=1)
+        self._section_label(report_section, "专利布局分析报告 DOCX").grid(
+            row=0, column=0, columnspan=2, sticky="w", pady=(0, 7)
+        )
+        self._entry(report_section, self.elephant_horse_report_var).grid(
+            row=1, column=0, sticky="ew", padx=(0, 10)
+        )
+        self._button(
+            report_section, "选择报告", self._choose_elephant_horse_report, width=104, secondary=True
+        ).grid(row=1, column=1)
+        ctk.CTkLabel(
+            report_section,
+            textvariable=self.elephant_horse_readiness_var,
+            justify="left",
+            anchor="w",
+            wraplength=780,
+            font=ctk.CTkFont(family="Microsoft YaHei UI", size=11),
+            text_color=DESKTOP_EDITORIAL_PALETTE["muted"],
+        ).grid(row=2, column=0, columnspan=2, sticky="ew", pady=(7, 0))
+
+        options = ctk.CTkFrame(self.config_frame, fg_color="transparent")
+        options.grid(row=1, column=0, sticky="ew", pady=(15, 0))
+        ctk.CTkCheckBox(
+            options,
+            text="启用扩展行业检索（需要公网，默认关闭）",
+            variable=self.elephant_horse_expanded_var,
+            onvalue=True,
+            offvalue=False,
+            fg_color=DESKTOP_EDITORIAL_PALETTE["primary"],
+            hover_color=DESKTOP_EDITORIAL_PALETTE["primary_hover"],
+            border_color=DESKTOP_EDITORIAL_PALETTE["hairline"],
+            text_color=DESKTOP_EDITORIAL_PALETTE["body_strong"],
+            font=ctk.CTkFont(family="Microsoft YaHei UI", size=12),
+        ).grid(row=0, column=0, sticky="w")
+        ctk.CTkCheckBox(
+            options,
+            text="复用上次有效进度（默认开启）",
+            variable=self.elephant_horse_resume_var,
+            onvalue=True,
+            offvalue=False,
+            fg_color=DESKTOP_EDITORIAL_PALETTE["primary"],
+            hover_color=DESKTOP_EDITORIAL_PALETTE["primary_hover"],
+            border_color=DESKTOP_EDITORIAL_PALETTE["hairline"],
+            text_color=DESKTOP_EDITORIAL_PALETTE["body_strong"],
+            font=ctk.CTkFont(family="Microsoft YaHei UI", size=12),
+        ).grid(row=1, column=0, sticky="w", pady=(8, 0))
+
+        output_section = ctk.CTkFrame(self.config_frame, fg_color="transparent")
+        output_section.grid(row=2, column=0, sticky="ew", pady=(16, 0))
+        output_section.grid_columnconfigure(0, weight=1)
+        self._section_label(output_section, "单一 DOCX 输出路径").grid(
+            row=0, column=0, columnspan=2, sticky="w", pady=(0, 7)
+        )
+        self._entry(output_section, self.elephant_horse_output_var).grid(
+            row=1, column=0, sticky="ew", padx=(0, 10)
+        )
+        self._button(
+            output_section, "选择输出", self._choose_elephant_horse_output, width=104, secondary=True
+        ).grid(row=1, column=1)
+
     def _capture_disclosure_idea(self) -> None:
         editor = getattr(self, "disclosure_idea_editor", None)
         if editor is None:
@@ -892,6 +1009,50 @@ class PatentSummarizerApp(ctk.CTk):
         report = Path(selected)
         self.disclosure_report_var.set(str(report))
         self.disclosure_output_dir_var.set(str(report.parent / "技术交底书"))
+        self._refresh_start_state()
+
+    def _choose_elephant_horse_report(self) -> None:
+        selected = filedialog.askopenfilename(
+            title="选择专利布局分析报告",
+            filetypes=[("Word 文档", "*.docx")],
+        )
+        if selected:
+            self.elephant_horse_report_var.set(selected)
+
+    def _choose_elephant_horse_output(self) -> None:
+        initial = self.elephant_horse_output_var.get().strip()
+        selected = filedialog.asksaveasfilename(
+            title="选择象马组合报告输出路径",
+            defaultextension=".docx",
+            filetypes=[("Word 文档", "*.docx")],
+            initialdir=str(Path(initial).parent) if initial else None,
+            initialfile=Path(initial).name if initial else None,
+        )
+        if selected:
+            self.elephant_horse_output_var.set(selected)
+
+    def _refresh_elephant_horse_readiness(self) -> None:
+        value = self.elephant_horse_report_var.get().strip()
+        if not value:
+            self.elephant_horse_readiness_var.set("请选择专利布局分析报告；系统将自动关联同目录附录和专利目录。")
+            self._refresh_start_state()
+            return
+        try:
+            inputs = load_elephant_horse_inputs(Path(value))
+            details = "；".join(
+                f"{item.label}：{item.coverage_count} 件，摘要 {item.summary_count}/{item.coverage_count}"
+                for item in inputs.portfolio_sources
+            )
+            self.elephant_horse_readiness_var.set(
+                f"已关联附录：{inputs.appendix_path.name}\n{details}\n待处理主题：{len(inputs.sources)} 个。"
+            )
+            current_output = self.elephant_horse_output_var.get().strip()
+            if not current_output:
+                self.elephant_horse_output_var.set(
+                    str(default_elephant_horse_output(inputs.report_path, inputs.target.label))
+                )
+        except Exception as exc:
+            self.elephant_horse_readiness_var.set(f"输入未就绪：{exc}")
         self._refresh_start_state()
 
     def _choose_disclosure_project(self) -> None:
@@ -1120,6 +1281,9 @@ class PatentSummarizerApp(ctk.CTk):
         if self._selected_mode() == MODE_DISCLOSURE:
             self._start_disclosure_task()
             return
+        if self._selected_mode() == MODE_ELEPHANT_HORSE:
+            self._start_elephant_horse_task()
+            return
         if self._selected_mode() in {MODE_COMPARE, MODE_REPORT}:
             self._start_portfolio_task()
             return
@@ -1146,6 +1310,60 @@ class PatentSummarizerApp(ctk.CTk):
         self._append_log("运行命令：patent_summarizer " + _format_command(argv) + "\n\n")
         self.worker = threading.Thread(target=self._run_cli, args=(argv,), daemon=True)
         self.worker.start()
+
+    def _start_elephant_horse_task(self) -> None:
+        error = self._elephant_horse_validation_error()
+        if error:
+            messagebox.showerror("无法运行", error)
+            return
+        app_dir = get_app_dir()
+        if not (app_dir / ".env").exists():
+            messagebox.showerror("缺少配置", f"未找到配置文件：{app_dir / '.env'}")
+            return
+        template_candidates = [
+            app_dir / REPORT_TEMPLATE_NAME,
+            app_dir / "output" / "doc" / REPORT_TEMPLATE_NAME,
+        ]
+        if not any(path.exists() for path in template_candidates):
+            messagebox.showerror("缺少内置报告模板", f"未找到：{REPORT_TEMPLATE_NAME}")
+            return
+        output = Path(self.elephant_horse_output_var.get().strip())
+        overwrite = False
+        if output.exists():
+            if not messagebox.askyesno("确认覆盖", f"输出文件已存在，是否覆盖？\n{output}"):
+                return
+            overwrite = True
+        argv = build_elephant_horse_cli_argv(
+            Path(self.elephant_horse_report_var.get().strip()),
+            output,
+            app_dir,
+            expanded_search=bool(self.elephant_horse_expanded_var.get()),
+            resume=bool(self.elephant_horse_resume_var.get()),
+            overwrite=overwrite,
+        )
+        self._set_running(True)
+        self._clear_log()
+        self._append_log("运行命令：patent_summarizer " + _format_command(argv) + "\n\n")
+        self.worker = threading.Thread(target=self._run_cli, args=(argv,), daemon=True)
+        self.worker.start()
+
+    def _elephant_horse_validation_error(self) -> str | None:
+        report_value = self.elephant_horse_report_var.get().strip()
+        if not report_value:
+            return "请选择专利布局分析报告。"
+        try:
+            load_elephant_horse_inputs(Path(report_value))
+        except Exception as exc:
+            return str(exc)
+        output_value = self.elephant_horse_output_var.get().strip()
+        if not output_value:
+            return "请选择象马组合报告输出路径。"
+        output = Path(output_value)
+        if output.suffix.lower() != ".docx":
+            return "象马组合报告必须使用 .docx 扩展名。"
+        if output.resolve() == Path(report_value).resolve():
+            return "象马组合输出不能覆盖输入分析报告。"
+        return None
 
     def _start_disclosure_task(self) -> None:
         self._capture_disclosure_idea()
@@ -1320,6 +1538,11 @@ class PatentSummarizerApp(ctk.CTk):
                     if argv and argv[0] == "disclosure"
                     else None
                 )
+                elephant_horse_search_failure = (
+                    self._request_elephant_horse_search_failure
+                    if argv and argv[0] == "elephant-horse"
+                    else None
+                )
                 exit_code = main(
                     argv,
                     progress=lambda update: self.output_queue.put(("progress", update)),
@@ -1327,6 +1550,7 @@ class PatentSummarizerApp(ctk.CTk):
                     disclosure_title_review=disclosure_review,
                     disclosure_preview_review=disclosure_preview_review,
                     disclosure_prior_art_failure=disclosure_prior_art_failure,
+                    elephant_horse_search_failure=elephant_horse_search_failure,
                 )
         except BaseException:
             self.output_queue.put(("log", traceback.format_exc()))
@@ -1351,6 +1575,12 @@ class PatentSummarizerApp(ctk.CTk):
     def _request_prior_art_failure(self, title: str, error: str) -> PriorArtFailureAction:
         request = PriorArtFailureRequest(title=title, error=error, event=threading.Event())
         self.output_queue.put(("prior_art_failure", request))
+        request.event.wait()
+        return request.result
+
+    def _request_elephant_horse_search_failure(self, title: str, error: str) -> SearchFailureAction:
+        request = ElephantHorseSearchFailureRequest(title=title, error=error, event=threading.Event())
+        self.output_queue.put(("elephant_horse_search_failure", request))
         request.event.wait()
         return request.result
 
@@ -1386,6 +1616,8 @@ class PatentSummarizerApp(ctk.CTk):
                     self._show_disclosure_preview_review(item[1])
                 elif item[0] == "prior_art_failure":
                     self._show_prior_art_failure(item[1])
+                elif item[0] == "elephant_horse_search_failure":
+                    self._show_elephant_horse_search_failure(item[1])
                 elif item[0] == "done":
                     self._finish(int(item[1]))
         except queue.Empty:
@@ -1908,6 +2140,21 @@ class PatentSummarizerApp(ctk.CTk):
             request.result = PriorArtFailureAction.CANCEL
         request.event.set()
 
+    def _show_elephant_horse_search_failure(self, request: ElephantHorseSearchFailureRequest) -> None:
+        choice = messagebox.askyesnocancel(
+            "扩展行业检索未完成",
+            f"布局主题：{request.title}\n\n{request.error}\n\n"
+            "选择“是”重试；选择“否”按原报告样本继续并在报告中披露失败；选择“取消”终止本次生成。",
+            parent=self,
+        )
+        if choice is True:
+            request.result = SearchFailureAction.RETRY
+        elif choice is False:
+            request.result = SearchFailureAction.CONTINUE
+        else:
+            request.result = SearchFailureAction.CANCEL
+        request.event.set()
+
     def _append_log(self, text: str) -> None:
         self.log_text.insert("end", text)
         self.log_text.see("end")
@@ -1937,6 +2184,10 @@ class PatentSummarizerApp(ctk.CTk):
             error = self._disclosure_validation_error()
             self.start_button.configure(state="disabled" if error else "normal")
             self.status_var.set(error or "技术来源已就绪，可以生成候选方案")
+        elif self._selected_mode() == MODE_ELEPHANT_HORSE:
+            error = self._elephant_horse_validation_error()
+            self.start_button.configure(state="disabled" if error else "normal")
+            self.status_var.set(error or "报告、附录及专利证据已就绪，可以生成象马组合报告")
         elif self._selected_mode() in {MODE_COMPARE, MODE_REPORT}:
             error = self._portfolio_validation_error()
             self.start_button.configure(state="disabled" if error else "normal")
@@ -1948,16 +2199,17 @@ class PatentSummarizerApp(ctk.CTk):
     def _finish(self, exit_code: int) -> None:
         finished_mode = self._selected_mode()
         self._set_running(False)
-        if exit_code in {REPORT_CANCELLED_EXIT_CODE, DISCLOSURE_CANCELLED_EXIT_CODE}:
+        if exit_code in {REPORT_CANCELLED_EXIT_CODE, DISCLOSURE_CANCELLED_EXIT_CODE, ELEPHANT_HORSE_CANCELLED_EXIT_CODE}:
             previous = self.last_progress_update
             if self.progress_state != "cancelled":
                 is_disclosure = finished_mode == MODE_DISCLOSURE
+                is_elephant_horse = finished_mode == MODE_ELEPHANT_HORSE
                 self._apply_progress(
                     ProgressUpdate(
                         mode=finished_mode,
                         state="cancelled",
-                        stage="技术交底书生成已取消" if is_disclosure else "报告生成已取消",
-                        detail="未生成 DOCX、Markdown 或配套图片" if is_disclosure else "未写入正文和附录",
+                        stage=("技术交底书生成已取消" if is_disclosure else "象马组合生成已取消" if is_elephant_horse else "报告生成已取消"),
+                        detail=("未生成 DOCX、Markdown 或配套图片" if is_disclosure else "未写入单一 DOCX" if is_elephant_horse else "未写入正文和附录"),
                         completed=previous.completed if previous else None,
                         total=previous.total if previous else None,
                     )
@@ -1965,6 +2217,9 @@ class PatentSummarizerApp(ctk.CTk):
             if finished_mode == MODE_DISCLOSURE:
                 self.status_var.set("已取消，未生成技术交底书")
                 self._append_log("\n已取消，未生成 DOCX、Markdown 或配套图片。\n")
+            elif finished_mode == MODE_ELEPHANT_HORSE:
+                self.status_var.set("已取消，未生成象马组合报告")
+                self._append_log("\n已取消，未写入象马组合 DOCX。\n")
             else:
                 self.status_var.set("已取消，未生成报告")
                 self._append_log("\n已取消，未写入正文和附录。\n")

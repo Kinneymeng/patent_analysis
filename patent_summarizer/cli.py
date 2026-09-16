@@ -40,6 +40,15 @@ from .disclosure import (
     write_scan_manifest,
 )
 from .extractors import TextExtractor
+from .elephant_horse import (
+    ElephantHorseAnalyzer,
+    ElephantHorseCancelled,
+    SearchFailureAction,
+    SearchFailureCallback,
+    default_elephant_horse_output,
+    load_elephant_horse_inputs,
+)
+from .elephant_horse_docx import write_elephant_horse_report
 from .excel_export import write_classification_workbook
 from .llm import RateLimitedOpenAIClient
 from .logging_utils import RunLogger
@@ -62,6 +71,7 @@ from .trend_excel_export import write_trend_workbook
 
 REPORT_CANCELLED_EXIT_CODE = 130
 DISCLOSURE_CANCELLED_EXIT_CODE = 130
+ELEPHANT_HORSE_CANCELLED_EXIT_CODE = 130
 
 
 def main(
@@ -71,6 +81,7 @@ def main(
     disclosure_title_review: DisclosureTitleReviewCallback | None = None,
     disclosure_preview_review: DisclosurePreviewReviewCallback | None = None,
     disclosure_prior_art_failure: PriorArtFailureCallback | None = None,
+    elephant_horse_search_failure: SearchFailureCallback | None = None,
 ) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -84,6 +95,12 @@ def main(
         return compare(args, progress=progress)
     if args.command == "report":
         return report(args, progress=progress, report_review=report_review)
+    if args.command == "elephant-horse":
+        return elephant_horse(
+            args,
+            progress=progress,
+            search_failure=elephant_horse_search_failure,
+        )
     if args.command == "disclosure":
         return disclosure(
             args,
@@ -171,6 +188,26 @@ def build_parser() -> argparse.ArgumentParser:
     report_parser.add_argument("--overwrite", action="store_true", help="Overwrite an existing DOCX report")
     report_parser.add_argument("--dry-run", action="store_true", help="Validate report inputs without calling the API or writing files")
 
+    elephant_parser = subparsers.add_parser(
+        "elephant-horse",
+        help="Generate one protective elephant-horse patent-layout DOCX from an analysis report",
+    )
+    elephant_parser.add_argument("--report", required=True, type=Path, help="Existing patent-layout analysis report DOCX")
+    elephant_parser.add_argument("--output", required=True, type=Path, help="Output protective elephant-horse DOCX")
+    elephant_parser.add_argument("--expanded-search", action="store_true", help="Run optional two-pass CNIPA industry search for every theme")
+    elephant_parser.add_argument("--overwrite", action="store_true", help="Overwrite an existing output DOCX")
+    elephant_parser.add_argument(
+        "--search-failure",
+        choices=("fail", "continue"),
+        default="fail",
+        help="CLI behavior if an expanded search fails (default: fail)",
+    )
+    elephant_parser.add_argument("--api-rpm", type=int, help="Override PATENT_API_RPM")
+    elephant_parser.add_argument("--env-file", type=Path, default=Path(".env"), help="Path to .env config file")
+    elephant_resume = elephant_parser.add_mutually_exclusive_group()
+    elephant_resume.add_argument("--resume", dest="resume", action="store_true", default=True, help="Reuse the last valid prompt cache (default)")
+    elephant_resume.add_argument("--no-resume", dest="resume", action="store_false", help="Ignore prior model prompt cache")
+
     disclosure_parser = subparsers.add_parser(
         "disclosure",
         help="Generate reviewed engineering disclosure documents (DOCX + Markdown)",
@@ -215,6 +252,91 @@ def build_parser() -> argparse.ArgumentParser:
         help="Ignore semantic workflow checkpoints and regenerate model stages",
     )
     return parser
+
+
+def elephant_horse(
+    args: argparse.Namespace,
+    progress: ProgressCallback | None = None,
+    search_failure: SearchFailureCallback | None = None,
+) -> int:
+    tracker = ProgressTracker("elephant-horse", progress)
+    tracker.preparing("正在准备象马组合", "正在校验报告、附录和专利证据")
+    try:
+        if args.output.suffix.lower() != ".docx":
+            raise ValueError("--output 必须使用 .docx 扩展名")
+        if args.output.resolve() == args.report.resolve():
+            raise ValueError("--output 不能覆盖输入分析报告")
+        if args.output.exists() and not args.overwrite:
+            raise FileExistsError(f"输出已存在：{args.output}；请使用 --overwrite 覆盖")
+        inputs = load_elephant_horse_inputs(args.report)
+        expected = default_elephant_horse_output(args.report, inputs.target.label)
+        print(f"INPUT\treport={inputs.report_path}\tappendix={inputs.appendix_path}")
+        for item in inputs.portfolio_sources:
+            print(f"PORTFOLIO\t{item.label}\tpatents={item.coverage_count}\tsummaries={item.summary_count}\troot={item.root}")
+        print(f"THEMES\t{len(inputs.sources)}")
+        print(f"DEFAULT_OUTPUT\t{expected}")
+
+        config = load_config(env_path=args.env_file, api_rpm=args.api_rpm)
+        log_dir = args.output.parent / ".patent_summary_logs"
+        debug_path = log_dir / f"{args.output.stem}.llm-debug.jsonl"
+        base_client = RateLimitedOpenAIClient(
+            base_url=config.base_url,
+            api_key=config.api_key,
+            model=config.model,
+            rpm=config.api_rpm,
+            max_retries=config.max_retries,
+            timeout=config.api_timeout_seconds,
+            debug_path=debug_path,
+        )
+        client = (
+            ReportCheckpointingClient(base_client, log_dir / f"{args.output.stem}.elephant-horse.jsonl")
+            if args.resume
+            else base_client
+        )
+        failure_callback = search_failure
+        if failure_callback is None and args.search_failure == "continue":
+            failure_callback = lambda _title, _error: SearchFailureAction.CONTINUE
+        tracker.start(len(inputs.sources) + 1, "正在分析象马组合", "开始处理全部待布局建议点")
+
+        def on_theme(detail: str, started: bool) -> None:
+            if started:
+                tracker.set_stage("正在分析象马组合", detail)
+            else:
+                tracker.advance("正在分析象马组合", detail)
+
+        result = ElephantHorseAnalyzer(client).analyze(
+            inputs,
+            expanded_search=args.expanded_search,
+            search_failure=failure_callback,
+            on_theme=on_theme,
+        )
+        template = _elephant_horse_template(args.env_file)
+        tracker.set_stage("正在写入象马组合报告", "正在生成单一 DOCX")
+        output = write_elephant_horse_report(result, template, args.output, overwrite=args.overwrite)
+        tracker.advance("正在写入象马组合报告", "DOCX 已写入")
+        tracker.succeed("象马组合报告生成完成", str(output))
+    except ElephantHorseCancelled as exc:
+        tracker.cancel("象马组合生成已取消", "未写入输出 DOCX")
+        print(f"CANCELLED\t{exc}")
+        return ELEPHANT_HORSE_CANCELLED_EXIT_CODE
+    except (ConfigError, RuntimeError, FileNotFoundError, NotADirectoryError, ValueError, FileExistsError) as exc:
+        print(f"Elephant-horse error: {exc}")
+        return 1
+    print(f"Done. elephant_horse_report={output}, themes={len(result.themes)}, scope={result.overall_scope}")
+    return 0
+
+
+def _elephant_horse_template(env_file: Path) -> Path:
+    name = "汽车底盘领域专利布局分析报告模板.docx"
+    candidates = [
+        Path(env_file).resolve().parent / name,
+        Path.cwd() / "output" / "doc" / name,
+        Path.cwd() / name,
+    ]
+    for path in candidates:
+        if path.exists():
+            return path
+    raise FileNotFoundError(f"未找到内置报告模板：{name}")
 
 
 def report(

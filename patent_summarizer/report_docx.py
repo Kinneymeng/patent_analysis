@@ -461,8 +461,11 @@ def _add_table(
             run.font.bold = True
             run.font.color.rgb = RGBColor(255, 255, 255)
             run.font.size = Pt(font_size)
+        cell.paragraphs[0].paragraph_format.keep_with_next = True
     for row_index, values in enumerate(row_list):
         cells = table.add_row().cells
+        row_properties = table.rows[-1]._tr.get_or_add_trPr()
+        row_properties.append(OxmlElement("w:cantSplit"))
         for column, value in enumerate(values):
             cells[column].text = str(value or "")
             if row_index % 2:
