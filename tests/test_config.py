@@ -18,6 +18,7 @@ class ConfigTests(unittest.TestCase):
                         "OPENAI_MODEL=model-a",
                         "PATENT_API_RPM=10",
                         "PATENT_MAX_RETRIES=5",
+                        "PATENT_API_TIMEOUT_SECONDS=275.5",
                         "PATENT_OCR_ENABLED=true",
                     ]
                 ),
@@ -31,6 +32,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.model, "model-a")
         self.assertEqual(config.api_rpm, 10)
         self.assertEqual(config.max_retries, 5)
+        self.assertEqual(config.api_timeout_seconds, 275.5)
         self.assertTrue(config.ocr_enabled)
 
     def test_environment_overrides_env_file_and_cli_overrides_environment(self):
@@ -71,6 +73,22 @@ class ConfigTests(unittest.TestCase):
         self.assertIn("OPENAI_BASE_URL", str(ctx.exception))
         self.assertIn("OPENAI_API_KEY", str(ctx.exception))
         self.assertIn("OPENAI_MODEL", str(ctx.exception))
+
+    def test_api_timeout_defaults_to_300_and_rejects_non_positive_values(self):
+        required = {
+            "OPENAI_BASE_URL": "https://example.test/v1",
+            "OPENAI_API_KEY": "key",
+            "OPENAI_MODEL": "model",
+        }
+        self.assertEqual(
+            300.0,
+            load_config(env_path=Path("missing.env"), environ=required).api_timeout_seconds,
+        )
+        with self.assertRaisesRegex(ConfigError, "PATENT_API_TIMEOUT_SECONDS"):
+            load_config(
+                env_path=Path("missing.env"),
+                environ={**required, "PATENT_API_TIMEOUT_SECONDS": "0"},
+            )
 
 
 class GitHubActionsWorkflowTests(unittest.TestCase):

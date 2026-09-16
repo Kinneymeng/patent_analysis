@@ -25,6 +25,20 @@ class PriorArtStatus(str, Enum):
     FAILED = "failed"
 
 
+class ValidationSeverity(str, Enum):
+    WARNING = "warning"
+    FATAL = "fatal"
+
+
+@dataclass(frozen=True)
+class DisclosureDiagnostic:
+    stage: str
+    code: str
+    message: str
+    action: str = ""
+    severity: ValidationSeverity = ValidationSeverity.WARNING
+
+
 @dataclass(frozen=True)
 class EvidenceReference:
     path: str
@@ -231,6 +245,7 @@ class TechnicalDisclosure:
     tables: tuple[DisclosureTable, ...] = ()
     formulas: tuple[DisclosureFormula, ...] = ()
     prior_art_status: PriorArtStatus = PriorArtStatus.DISABLED
+    diagnostics: tuple[DisclosureDiagnostic, ...] = ()
 
     @property
     def is_structured(self) -> bool:
@@ -259,6 +274,7 @@ class DisclosureGenerationResult:
     written: list[Path]
     skipped: list[Path]
     failures: list[DisclosureFailure]
+    warnings: list[DisclosureDiagnostic] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -266,3 +282,15 @@ class DisclosureOutputPaths:
     docx: Path
     markdown: Path
     assets_dir: Path
+    diagnostics: tuple[DisclosureDiagnostic, ...] = ()
+
+
+@dataclass(frozen=True)
+class DisclosureCheckpoint:
+    input_hash: str
+    model: str
+    prompt_version: str
+    source_id: str
+    title: str
+    stage: str
+    payload: Mapping[str, Any]

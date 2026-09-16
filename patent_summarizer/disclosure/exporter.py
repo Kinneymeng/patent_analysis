@@ -1,15 +1,21 @@
 from __future__ import annotations
 
 import os
+import json
 import re
 import uuid
+from zipfile import BadZipFile
 from dataclasses import replace
 from pathlib import Path
 
+from docx import Document
+from PIL import Image
+
 from ..disclosure_docx import build_technical_disclosure_document, validate_technical_disclosure_docx
 from .diagrams import render_disclosure_diagrams
+from .math_to_omml import latex_to_omml_with_fallback
 from .legacy import disclosure_output_path, validate_disclosure_title
-from .models import DisclosureOutputPaths, TechnicalDisclosure
+from .models import DisclosureDiagnostic, DisclosureOutputPaths, TechnicalDisclosure
 from .validation import validate_engineering_language
 
 
@@ -22,6 +28,37 @@ def disclosure_output_paths(output_dir: Path, title: str) -> DisclosureOutputPat
         markdown=root / f"{stem}.md",
         assets_dir=root / f"{stem}_assets",
     )
+
+
+def existing_disclosure_bundle_complete(paths: DisclosureOutputPaths) -> bool:
+    if not paths.docx.is_file() or not paths.markdown.is_file():
+        return False
+    try:
+        document = Document(paths.docx)
+        document_text = "\n".join(paragraph.text for paragraph in document.paragraphs)
+        markdown = paths.markdown.read_text(encoding="utf-8")
+        required = (
+            "一、技术背景与现有方案",
+            "二、需要解决的技术问题",
+            "三、技术方案详细说明",
+            "四、技术效果与适用边界",
+            "五、技术关键点",
+            "六、实施例与验证方法",
+        )
+        if any(value not in document_text or value not in markdown for value in required):
+            return False
+        image_links = re.findall(r"!\[[^\]]*\]\(([^)]+)\)", markdown)
+        if not image_links:
+            return False
+        for link in image_links:
+            image_path = paths.markdown.parent / Path(link.replace("/", os.sep))
+            if not image_path.is_file():
+                return False
+            with Image.open(image_path) as image:
+                image.verify()
+        return True
+    except (OSError, ValueError, BadZipFile, KeyError):
+        return False
 
 
 def write_disclosure_bundle(
@@ -40,9 +77,25 @@ def write_disclosure_bundle(
     staged_assets = paths.assets_dir.with_name(f".{paths.assets_dir.name}.{token}.tmp")
     temporary_md = paths.markdown.with_name(f".{paths.markdown.stem}.{token}.tmp.md")
     temporary_docx = paths.docx.with_name(f".{paths.docx.stem}.{token}.tmp.docx")
+    diagnostics = list(disclosure.diagnostics)
+    for formula in disclosure.formulas:
+        formula_result = latex_to_omml_with_fallback(formula.latex)
+        if formula_result.mode != "structured":
+            diagnostics.append(
+                DisclosureDiagnostic(
+                    stage="formula-export",
+                    code=f"formula-{formula_result.mode}",
+                    message=f"{formula.label} 无法转换为结构化 Word 公式：{formula_result.error}",
+                    action=(
+                        "已写入 Word 可编辑线性公式，Markdown 保留原始 LaTeX"
+                        if formula_result.mode == "linear"
+                        else "已写入原始 LaTeX 文本并标记需人工复核"
+                    ),
+                )
+            )
     try:
         rendered = (
-            render_disclosure_diagrams(disclosure, staged_assets)
+            render_disclosure_diagrams(disclosure, staged_assets, diagnostics=diagnostics)
             if disclosure.is_structured
             else disclosure
         )
@@ -78,7 +131,23 @@ def write_disclosure_bundle(
                 if path.is_file():
                     path.unlink()
             staged_assets.rmdir()
-    return paths
+    final_paths = replace(paths, diagnostics=tuple(diagnostics))
+    try:
+        _write_diagnostics(output_dir, disclosure.title, final_paths.diagnostics)
+    except OSError as exc:
+        final_paths = replace(
+            final_paths,
+            diagnostics=(
+                *final_paths.diagnostics,
+                DisclosureDiagnostic(
+                    stage="diagnostics",
+                    code="diagnostics-write-failed",
+                    message=f"内部诊断记录写入失败：{exc}",
+                    action="交付文件已经通过验证并正常发布",
+                ),
+            ),
+        )
+    return final_paths
 
 
 def disclosure_to_markdown(disclosure: TechnicalDisclosure, markdown_path: Path) -> str:
@@ -207,9 +276,37 @@ def _publish_bundle(
                 backup.unlink()
 
 
+def _write_diagnostics(
+    output_dir: Path,
+    title: str,
+    diagnostics: tuple[DisclosureDiagnostic, ...],
+) -> None:
+    work_dir = Path(output_dir) / ".patent_disclosure_work" / "diagnostics"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    path = work_dir / f"{title}.json"
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    payload = [
+        {
+            "stage": item.stage,
+            "code": item.code,
+            "severity": item.severity.value,
+            "message": item.message,
+            "action": item.action,
+        }
+        for item in diagnostics
+    ]
+    try:
+        temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
 __all__ = [
     "disclosure_output_path",
     "disclosure_output_paths",
+    "existing_disclosure_bundle_complete",
     "disclosure_to_markdown",
     "validate_disclosure_markdown",
     "write_disclosure_bundle",

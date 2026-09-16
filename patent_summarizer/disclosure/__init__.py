@@ -4,7 +4,13 @@ The package keeps the former public API while splitting material ingestion,
 workflow orchestration, validation, prior-art search, and export by concern.
 """
 
-from .exporter import disclosure_output_path, disclosure_output_paths, write_disclosure_bundle
+from .exporter import (
+    disclosure_output_path,
+    disclosure_output_paths,
+    existing_disclosure_bundle_complete,
+    write_disclosure_bundle,
+)
+from .checkpoint import DisclosureCheckpointStore
 from .legacy import (
     load_title_selections,
     selected_work_items,
@@ -14,8 +20,10 @@ from .legacy import (
 from .models import (
     ConflictPolicy,
     DisclosureDiagram,
+    DisclosureDiagnostic,
     DisclosureFailure,
     DisclosureGenerationResult,
+    DisclosureCheckpoint,
     DisclosureOutputPaths,
     DisclosurePreview,
     DisclosurePreviewReviewCallback,
@@ -40,6 +48,7 @@ from .models import (
     TechnicalDisclosure,
     TitleProposal,
     TitleSelection,
+    ValidationSeverity,
 )
 from .prior_art import CnipaPriorArtSearcher, PriorArtSearchError
 from .scanner import scan_project_materials, write_scan_manifest
@@ -49,6 +58,7 @@ from .validation import (
     parse_invention_candidates,
     parse_technical_disclosure,
     parse_title_proposal,
+    reconcile_disclosure_with_preview,
     validate_disclosure_against_preview,
     validate_effect_claims,
     validate_disclosure_title,
@@ -60,9 +70,12 @@ __all__ = [
     "CnipaPriorArtSearcher",
     "ConflictPolicy",
     "DisclosureAnalyzer",
+    "DisclosureCheckpointStore",
     "DisclosureDiagram",
+    "DisclosureDiagnostic",
     "DisclosureFailure",
     "DisclosureGenerationResult",
+    "DisclosureCheckpoint",
     "DisclosureOutputPaths",
     "DisclosurePreview",
     "DisclosurePreviewReviewCallback",
@@ -88,9 +101,11 @@ __all__ = [
     "TechnicalDisclosure",
     "TitleProposal",
     "TitleSelection",
+    "ValidationSeverity",
     "attach_materials",
     "disclosure_output_path",
     "disclosure_output_paths",
+    "existing_disclosure_bundle_complete",
     "find_candidate",
     "load_idea_source",
     "load_project_source",
@@ -100,6 +115,7 @@ __all__ = [
     "parse_invention_candidates",
     "parse_technical_disclosure",
     "parse_title_proposal",
+    "reconcile_disclosure_with_preview",
     "scan_project_materials",
     "selected_work_items",
     "selections_from_proposals",

@@ -205,6 +205,17 @@ class GuiCommandTests(unittest.TestCase):
         self.assertIn("--idea", idea_argv)
         self.assertIn("一种冗余制动构想", idea_argv)
         self.assertIn(str(app_dir / ".env"), idea_argv)
+        self.assertNotIn("--no-resume", idea_argv)
+
+        fresh_argv = build_disclosure_cli_argv(
+            DISCLOSURE_SOURCE_IDEA,
+            None,
+            "一种冗余制动构想",
+            output_dir,
+            app_dir,
+            resume=False,
+        )
+        self.assertIn("--no-resume", fresh_argv)
 
     def test_builds_project_scan_command_with_materials_and_prior_art(self):
         app_dir = Path("D:/portable")
@@ -358,8 +369,17 @@ class PortableRuntimeFilesTests(unittest.TestCase):
             license_dir = internal / "patent_summarizer" / "disclosure" / "cnipa_upstream"
             mermaid_license_dir = internal / "patent_summarizer" / "disclosure"
             browser_dir = internal / "playwright-browsers" / "chromium" / "chrome-win"
+            playwright_driver_dir = internal / "playwright" / "driver"
             mermaid_dir = internal / "mermaid"
-            for directory in (prompt_dir, license_dir, browser_dir, mermaid_dir):
+            latex2mathml_dir = internal / "latex2mathml"
+            for directory in (
+                prompt_dir,
+                license_dir,
+                browser_dir,
+                playwright_driver_dir,
+                mermaid_dir,
+                latex2mathml_dir,
+            ):
                 directory.mkdir(parents=True)
             (dist / "PatentSummarizer.exe").write_bytes(b"exe")
             (prompt_dir / "common.md").write_text("rules", encoding="utf-8")
@@ -367,9 +387,25 @@ class PortableRuntimeFilesTests(unittest.TestCase):
             (mermaid_license_dir / "MERMAID_LICENSE.txt").write_text("MIT", encoding="utf-8")
             (mermaid_license_dir / "THIRD_PARTY_NOTICES.md").write_text("notices", encoding="utf-8")
             (browser_dir / "chrome.exe").write_bytes(b"browser")
+            (playwright_driver_dir / "node.exe").write_bytes(b"node")
             (mermaid_dir / "mermaid.min.js").write_bytes(b"mermaid")
+            (latex2mathml_dir / "unimathsymbols.txt").write_text(
+                "symbols",
+                encoding="utf-8",
+            )
 
             build_portable.verify_portable_application(dist)
+
+            with patch(
+                "build_portable.subprocess.run",
+                return_value=type("Completed", (), {"returncode": 0})(),
+            ) as self_check:
+                build_portable.verify_portable_application(
+                    dist,
+                    run_self_check=True,
+                )
+            self.assertIn("--self-check", self_check.call_args.args[0])
+            self.assertIn("--self-check-output", self_check.call_args.args[0])
 
             (browser_dir / "chrome.exe").unlink()
             with self.assertRaisesRegex(FileNotFoundError, "Chromium executable"):

@@ -12,7 +12,7 @@ from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Mm, Pt
 
-from .disclosure.math_to_omml import try_latex_to_omml
+from .disclosure.math_to_omml import latex_to_omml_with_fallback
 from .disclosure.models import TechnicalDisclosure
 
 
@@ -106,13 +106,18 @@ def _add_structured_disclosure(document: DocumentType, disclosure: TechnicalDisc
             _add_paragraph(document, diagram.title, alignment=WD_ALIGN_PARAGRAPH.CENTER)
         for formula in (item for item in disclosure.formulas if item.section_number == section.number):
             _add_paragraph(document, formula.description, alignment=WD_ALIGN_PARAGRAPH.JUSTIFY, first_line_chars=FIRST_LINE_CHARS)
-            math = try_latex_to_omml(formula.latex, display=True)
-            if math is None:
-                raise ValueError(f"公式无法转换为可编辑 Word 公式：{formula.label}")
-            paragraph = document.add_paragraph()
-            paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            paragraph._element.append(math)
-            _set_paragraph_spacing(paragraph)
+            rendered_formula = latex_to_omml_with_fallback(formula.latex, display=True)
+            if rendered_formula.element is not None:
+                paragraph = document.add_paragraph()
+                paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                paragraph._element.append(rendered_formula.element)
+                _set_paragraph_spacing(paragraph)
+            else:
+                _add_paragraph(
+                    document,
+                    f"原始公式表达（需人工复核）：{rendered_formula.text}",
+                    alignment=WD_ALIGN_PARAGRAPH.CENTER,
+                )
             _add_paragraph(document, formula.label, alignment=WD_ALIGN_PARAGRAPH.CENTER)
         for table in (item for item in disclosure.tables if item.section_number == section.number):
             _add_paragraph(document, table.title, alignment=WD_ALIGN_PARAGRAPH.CENTER, bold=True)
@@ -198,7 +203,13 @@ def validate_technical_disclosure_docx(path: Path, expected: TechnicalDisclosure
             item.title for item in expected.diagrams if item.section_number == section.number
         )
         for formula in (item for item in expected.formulas if item.section_number == section.number):
-            expected_texts.extend((formula.description, formula.label))
+            expected_texts.append(formula.description)
+            rendered_formula = latex_to_omml_with_fallback(formula.latex, display=True)
+            if rendered_formula.element is None:
+                expected_texts.append(
+                    f"原始公式表达（需人工复核）：{rendered_formula.text}"
+                )
+            expected_texts.append(formula.label)
         expected_texts.extend(
             item.title for item in expected.tables if item.section_number == section.number
         )
@@ -215,8 +226,12 @@ def validate_technical_disclosure_docx(path: Path, expected: TechnicalDisclosure
         if actual_rows != expected_rows:
             raise ValueError(f"技术交底书 DOCX 参数表内容不匹配：{table.title}")
     math_count = len(document.element.body.xpath(".//m:oMath"))
-    if math_count < len(expected.formulas):
-        raise ValueError("技术交底书 DOCX 的可编辑公式数量不匹配")
+    raw_formula_count = sum(
+        paragraph.text.startswith("原始公式表达（需人工复核）：")
+        for paragraph in document.paragraphs
+    )
+    if math_count + raw_formula_count < len(expected.formulas):
+        raise ValueError("技术交底书 DOCX 的公式数量不匹配")
 
 
 def _validate_legacy_document(document: DocumentType, expected: TechnicalDisclosure) -> None:

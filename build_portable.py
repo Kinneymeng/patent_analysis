@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import os
 import shutil
 import subprocess
@@ -44,7 +45,7 @@ def main() -> int:
         check=True,
     )
     copy_runtime_files(DIST_APP)
-    verify_portable_application(DIST_APP)
+    verify_portable_application(DIST_APP, run_self_check=True)
     print(f"Portable build ready: {DIST_APP}")
     return 0
 
@@ -105,12 +106,18 @@ def _verify_mermaid_runtime(data: bytes) -> None:
         raise ValueError("Downloaded Mermaid runtime failed its pinned SHA-512 integrity check")
 
 
-def verify_portable_application(dist_app: Path) -> None:
+def verify_portable_application(
+    dist_app: Path,
+    *,
+    run_self_check: bool = False,
+) -> None:
     internal = dist_app / "_internal"
     required = (
         dist_app / "PatentSummarizer.exe",
         internal / "playwright-browsers",
+        internal / "playwright" / "driver" / "node.exe",
         internal / "mermaid" / "mermaid.min.js",
+        internal / "latex2mathml" / "unimathsymbols.txt",
         internal / "patent_summarizer" / "disclosure" / "prompts" / "common.md",
         internal / "patent_summarizer" / "disclosure" / "cnipa_upstream" / "LICENSE.txt",
         internal / "patent_summarizer" / "disclosure" / "MERMAID_LICENSE.txt",
@@ -130,6 +137,37 @@ def verify_portable_application(dist_app: Path) -> None:
         raise FileNotFoundError(
             f"Portable build does not contain a Chromium executable: {browser_root}"
         )
+    if not run_self_check:
+        return
+    report_path = dist_app / "portable-self-check.json"
+    completed = subprocess.run(
+        [
+            str(dist_app / "PatentSummarizer.exe"),
+            "--self-check",
+            "--self-check-output",
+            str(report_path),
+        ],
+        cwd=dist_app,
+        timeout=180,
+        check=False,
+    )
+    if completed.returncode != 0:
+        detail = "self-check did not create a diagnostic report"
+        if report_path.is_file():
+            try:
+                report = json.loads(report_path.read_text(encoding="utf-8"))
+                detail = (
+                    f"stage={report.get('stage')}, "
+                    f"error={report.get('error_type')}: {report.get('error')}"
+                )
+            except (OSError, ValueError) as exc:
+                detail = f"diagnostic report could not be read: {exc}"
+        raise RuntimeError(
+            "Packaged application self-check failed: Playwright, Mermaid, Pillow, "
+            "latex2mathml, DOCX, or Chinese-path output is unavailable; " + detail
+        )
+    if report_path.exists():
+        report_path.unlink()
 
 
 if __name__ == "__main__":

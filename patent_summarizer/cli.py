@@ -14,6 +14,7 @@ from .disclosure import (
     CnipaPriorArtSearcher,
     ConflictPolicy,
     DisclosureAnalyzer,
+    DisclosureCheckpointStore,
     DisclosureFailure,
     DisclosureGenerationResult,
     DisclosurePreviewReviewCallback,
@@ -25,6 +26,7 @@ from .disclosure import (
     PriorArtStatus,
     attach_materials,
     disclosure_output_paths,
+    existing_disclosure_bundle_complete,
     find_candidate,
     load_idea_source,
     load_project_source,
@@ -198,6 +200,20 @@ def build_parser() -> argparse.ArgumentParser:
     disclosure_parser.add_argument("--api-rpm", type=int, help="Override PATENT_API_RPM")
     disclosure_parser.add_argument("--env-file", type=Path, default=Path(".env"), help="Path to .env config file")
     disclosure_parser.add_argument("--dry-run", action="store_true", help="Validate sources and list planned title groups without calling the API")
+    disclosure_resume = disclosure_parser.add_mutually_exclusive_group()
+    disclosure_resume.add_argument(
+        "--resume",
+        dest="resume",
+        action="store_true",
+        default=True,
+        help="Resume validated disclosure stages from the output-side work directory (default)",
+    )
+    disclosure_resume.add_argument(
+        "--no-resume",
+        dest="resume",
+        action="store_false",
+        help="Ignore semantic workflow checkpoints and regenerate model stages",
+    )
     return parser
 
 
@@ -267,6 +283,7 @@ def report(
         model=config.model,
         rpm=config.api_rpm,
         max_retries=config.max_retries,
+        timeout=config.api_timeout_seconds,
         debug_path=debug_path,
     )
     client = ReportCheckpointingClient(base_client, log_dir / f"{args.output.stem}.report.jsonl")
@@ -508,23 +525,34 @@ def disclosure(
         model=config.model,
         rpm=config.api_rpm,
         max_retries=config.max_retries,
+        timeout=config.api_timeout_seconds,
         debug_path=debug_path,
     )
-    client = ReportCheckpointingClient(
-        base_client,
-        log_dir / f"{source_key}.disclosure.jsonl",
+    client = (
+        ReportCheckpointingClient(
+            base_client,
+            log_dir / f"{source_key}.disclosure.jsonl",
+        )
+        if args.resume
+        else base_client
     )
 
     def on_validation_retry(stage: str, retry: int, error: str) -> None:
         print(f"DISCLOSURE_REPAIR\t{stage}\tretry={retry}\terror={error}")
 
     def on_validation_warning(stage: str, error: str) -> None:
-        print(f"WARNING\t{stage}\t{error}\t已完成一次修复尝试，将按当前内容继续生成")
+        print(f"WARNING\t{stage}\t{error}\t已按本地容错规则继续生成")
 
+    checkpoint_store = DisclosureCheckpointStore(
+        output_dir / ".patent_disclosure_work" / source_key / "workflow",
+        model=config.model,
+        read_enabled=args.resume,
+    )
     analyzer = DisclosureAnalyzer(
         client,
         on_validation_retry=on_validation_retry,
         on_validation_warning=on_validation_warning,
+        checkpoint_store=checkpoint_store,
     )
 
     def perform_prior_art_search(
@@ -574,7 +602,34 @@ def disclosure(
                 for candidate in proposal.candidates:
                     print(f"CANDIDATE\t{source.source_id}\t{candidate.candidate_id}\trecommended={str(candidate.recommended).lower()}\t{candidate.title}")
                 tracker.advance("正在挖掘候选发明方案", f"已完成 {source.source_id}")
-            if title_review is not None:
+            selection_key = (
+                checkpoint_store.key(
+                    "\n".join(source.context for source in sources),
+                    "confirmed-selections",
+                    {"source_ids": [source.source_id for source in sources]},
+                )
+                if checkpoint_store is not None
+                else None
+            )
+            cached_selection = (
+                checkpoint_store.load_payload(selection_key, "confirmed-selections")
+                if checkpoint_store is not None and selection_key is not None
+                else None
+            )
+            if cached_selection is not None:
+                selections = [
+                    TitleSelection(
+                        str(item["source_id"]),
+                        [str(title) for title in item["titles"]],
+                    )
+                    for item in cached_selection.get("selections", [])
+                    if isinstance(item, dict)
+                    and item.get("source_id")
+                    and isinstance(item.get("titles"), list)
+                ]
+                conflict_policy = _disclosure_conflict_policy(args)
+                print("RESUME\tconfirmed-selections")
+            elif title_review is not None:
                 tracker.set_stage("等待第一次确认", "请选择、编辑或融合候选发明方案")
                 reviewed = title_review(proposals, output_dir)
                 if reviewed is None:
@@ -586,6 +641,22 @@ def disclosure(
             else:
                 selections = _recommended_disclosure_selections(proposals)
                 conflict_policy = _disclosure_conflict_policy(args)
+            if (
+                cached_selection is None
+                and checkpoint_store is not None
+                and selection_key is not None
+            ):
+                checkpoint_store.save_payload(
+                    selection_key,
+                    "confirmed-selections",
+                    {
+                        "selections": [
+                            {"source_id": item.source_id, "titles": list(item.titles)}
+                            for item in selections
+                        ],
+                        "conflict_policy": conflict_policy.value,
+                    },
+                )
         else:
             selections = explicit_selections
             conflict_policy = _disclosure_conflict_policy(args)
@@ -597,22 +668,33 @@ def disclosure(
             return DISCLOSURE_CANCELLED_EXIT_CODE
 
         conflicts = []
+        resumed_complete = []
         for _source, title in work_items:
             paths = disclosure_output_paths(output_dir, title)
             if paths.docx.exists() or paths.markdown.exists():
-                conflicts.append(paths.docx)
+                if (
+                    args.resume
+                    and conflict_policy == ConflictPolicy.ERROR
+                    and existing_disclosure_bundle_complete(paths)
+                ):
+                    resumed_complete.append(paths.docx)
+                else:
+                    conflicts.append(paths.docx)
         if conflicts and conflict_policy == ConflictPolicy.ERROR:
             paths = "；".join(str(path) for path in conflicts)
             raise FileExistsError(f"技术交底书已经存在：{paths}")
 
-        skipped = set(conflicts) if conflict_policy == ConflictPolicy.SKIP else set()
+        skipped = set(resumed_complete)
+        if conflict_policy == ConflictPolicy.SKIP:
+            skipped.update(conflicts)
         pending = [
             (source, title, disclosure_output_paths(output_dir, title))
             for source, title in work_items
             if disclosure_output_paths(output_dir, title).docx not in skipped
         ]
         for path in sorted(skipped, key=str):
-            print(f"SKIP\t{path}")
+            reason = "resume-complete" if path in resumed_complete else "existing"
+            print(f"SKIP\t{reason}\t{path}")
 
         proposal_map = {proposal.source.source_id: proposal for proposal in proposals}
         confirmed_items = []
@@ -623,42 +705,58 @@ def disclosure(
         )
         for source, title, paths in pending:
             candidate = find_candidate(proposal_map[source.source_id], title) if source.source_id in proposal_map else None
-            prior_art = PriorArtResult.disabled()
-            if args.prior_art:
-                terms = analyzer.plan_search_terms(source, title, candidate)
-                searched = perform_prior_art_search(source.source_id, title, terms)
-                if searched is None:
-                    return DISCLOSURE_CANCELLED_EXIT_CODE
-                prior_art = searched
-
-            tracker.set_stage("正在形成完整技术方案", title)
-            preview = analyzer.build_preview(source, title, candidate=candidate, prior_art=prior_art)
-            if preview_review is not None:
-                while True:
-                    tracker.set_stage("等待第二次确认", "请核对技术方案、假设、示例参数和待确认问题")
-                    revised = preview_review(preview)
-                    if revised is None:
-                        tracker.cancel("研发技术交底书生成已取消", "第二次确认已取消，未生成正文")
-                        print("CANCELLED\t完整技术方案确认已取消，未生成正文、DOCX 或 Markdown")
+            preview = analyzer.load_confirmed_preview(
+                source,
+                title,
+                candidate,
+                prior_art_enabled=args.prior_art,
+            )
+            if preview is not None:
+                print(f"RESUME\t{source.source_id}\t{title}\tconfirmed-preview")
+            else:
+                prior_art = PriorArtResult.disabled()
+                if args.prior_art:
+                    terms = analyzer.plan_search_terms(source, title, candidate)
+                    searched = perform_prior_art_search(source.source_id, title, terms)
+                    if searched is None:
                         return DISCLOSURE_CANCELLED_EXIT_CODE
-                    if revised.title != title or revised.source_id != source.source_id:
-                        raise ValueError("完整技术方案确认结果不得改变来源编号或已确认标题")
-                    if args.prior_art and _preview_search_signature(revised) != _preview_search_signature(preview):
-                        print(f"PRIOR_ART_REQUERY\t{source.source_id}\t核心机制已修改，重新规划检索主题")
-                        terms = analyzer.plan_search_terms_for_preview(source, revised)
-                        searched = perform_prior_art_search(source.source_id, title, terms)
-                        if searched is None:
+                    prior_art = searched
+
+                tracker.set_stage("正在形成完整技术方案", title)
+                preview = analyzer.build_preview(source, title, candidate=candidate, prior_art=prior_art)
+                if preview_review is not None:
+                    while True:
+                        tracker.set_stage("等待第二次确认", "请核对技术方案、假设、示例参数和待确认问题")
+                        revised = preview_review(preview)
+                        if revised is None:
+                            tracker.cancel("研发技术交底书生成已取消", "第二次确认已取消，未生成正文")
+                            print("CANCELLED\t完整技术方案确认已取消，未生成正文、DOCX 或 Markdown")
                             return DISCLOSURE_CANCELLED_EXIT_CODE
-                        preview = replace(revised, prior_art=searched)
-                        continue
-                    preview = revised
-                    break
+                        if revised.title != title or revised.source_id != source.source_id:
+                            raise ValueError("完整技术方案确认结果不得改变来源编号或已确认标题")
+                        if args.prior_art and _preview_search_signature(revised) != _preview_search_signature(preview):
+                            print(f"PRIOR_ART_REQUERY\t{source.source_id}\t核心机制已修改，重新规划检索主题")
+                            terms = analyzer.plan_search_terms_for_preview(source, revised)
+                            searched = perform_prior_art_search(source.source_id, title, terms)
+                            if searched is None:
+                                return DISCLOSURE_CANCELLED_EXIT_CODE
+                            preview = replace(revised, prior_art=searched)
+                            continue
+                        preview = revised
+                        break
+                analyzer.save_confirmed_preview(
+                    source,
+                    preview,
+                    candidate,
+                    prior_art_enabled=args.prior_art,
+                )
             confirmed_items.append((source, title, paths, preview))
             tracker.advance("完整技术方案已经确认", title)
 
         tracker.start(len(confirmed_items) * 3, "正在生成研发技术交底书", "开始逐篇撰写、独立审校和图文导出")
         written: list[Path] = []
         failures: list[DisclosureFailure] = []
+        warnings = []
         for source, title, paths, preview in confirmed_items:
             completed_units = 0
             try:
@@ -673,31 +771,26 @@ def disclosure(
                 completed_units += 1
 
                 tracker.set_stage("正在生成图示并核验双格式文件", title)
-                try:
-                    bundle = write_disclosure_bundle(
-                        reviewed_disclosure,
-                        output_dir,
-                        overwrite=conflict_policy == ConflictPolicy.OVERWRITE,
-                    )
-                except (RuntimeError, ValueError) as first_error:
-                    if preview is None or not _delivery_repairable(first_error):
-                        raise
-                    print(f"DISCLOSURE_DELIVERY_REPAIR\t{title}\t{first_error}")
-                    repaired_disclosure = analyzer.repair_delivery(
-                        source,
-                        reviewed_disclosure,
-                        preview,
-                        str(first_error),
-                    )
-                    bundle = write_disclosure_bundle(
-                        repaired_disclosure,
-                        output_dir,
-                        overwrite=conflict_policy == ConflictPolicy.OVERWRITE,
-                    )
+                bundle = write_disclosure_bundle(
+                    reviewed_disclosure,
+                    output_dir,
+                    overwrite=conflict_policy == ConflictPolicy.OVERWRITE,
+                )
                 written.append(bundle.docx)
-                tracker.advance("正在核验并写入双格式文件", f"{title} 已保存")
+                for diagnostic in getattr(bundle, "diagnostics", ()):
+                    warnings.append(diagnostic)
+                    print(
+                        f"DISCLOSURE_WARNING\t{source.source_id}\t{title}\t"
+                        f"{diagnostic.code}\t{diagnostic.message}\t{diagnostic.action}"
+                    )
+                warning_count = len(getattr(bundle, "diagnostics", ()))
+                tracker.advance(
+                    "正在核验并写入双格式文件",
+                    f"{title} 已保存" + (f"（警告 {warning_count} 项）" if warning_count else ""),
+                )
                 completed_units += 1
-                print(f"OK\t{source.source_id}\t{bundle.docx}")
+                status = "OK_WITH_WARNINGS" if warning_count else "OK"
+                print(f"{status}\t{source.source_id}\t{bundle.docx}")
                 print(f"MARKDOWN\t{source.source_id}\t{bundle.markdown}")
             except Exception as exc:
                 failures.append(DisclosureFailure(source.source_id, title, str(exc)))
@@ -711,6 +804,7 @@ def disclosure(
             written=written,
             skipped=sorted(skipped, key=str),
             failures=failures,
+            warnings=warnings,
         )
         if result.failures:
             tracker.fail(
@@ -723,12 +817,12 @@ def disclosure(
             )
             return 1
         tracker.succeed(
-            "研发技术交底书生成完成",
-            f"已保存 {len(result.written)} 份，跳过 {len(result.skipped)} 份",
+            "研发技术交底书生成完成" if not result.warnings else "研发技术交底书生成完成（有警告）",
+            f"已保存 {len(result.written)} 份，跳过 {len(result.skipped)} 份，警告 {len(result.warnings)} 项",
         )
         print(
             f"Done. written={len(result.written)}, skipped={len(result.skipped)}, "
-            f"failed=0, output_dir={output_dir}"
+            f"failed=0, warnings={len(result.warnings)}, output_dir={output_dir}"
         )
         return 0
     except (FileNotFoundError, NotADirectoryError, OSError, RuntimeError, ValueError) as exc:
@@ -834,6 +928,7 @@ def run(args: argparse.Namespace, progress: ProgressCallback | None = None) -> i
         model=config.model,
         rpm=config.api_rpm,
         max_retries=config.max_retries,
+        timeout=config.api_timeout_seconds,
     )
     processor = PatentProcessor(
         TextExtractor(ocr_enabled=config.ocr_enabled),
@@ -907,6 +1002,7 @@ def classify(args: argparse.Namespace, progress: ProgressCallback | None = None)
         model=config.model,
         rpm=config.api_rpm,
         max_retries=config.max_retries,
+        timeout=config.api_timeout_seconds,
     )
     pipeline = PatentClassificationPipeline(
         TextExtractor(ocr_enabled=config.ocr_enabled),
@@ -978,6 +1074,7 @@ def analyze(args: argparse.Namespace, progress: ProgressCallback | None = None) 
         model=config.model,
         rpm=config.api_rpm,
         max_retries=config.max_retries,
+        timeout=config.api_timeout_seconds,
     )
     analyzer = TrendAnalyzer(client, batch_size=args.batch_size)
     checkpoint = TrendCheckpointStore(args.output.parent / ".patent_summary_logs" / f"{args.output.stem}.jsonl")
@@ -1053,6 +1150,7 @@ def compare(args: argparse.Namespace, progress: ProgressCallback | None = None) 
         model=config.model,
         rpm=config.api_rpm,
         max_retries=config.max_retries,
+        timeout=config.api_timeout_seconds,
     )
 
     classification_total = _portfolio_classification_units(portfolio_specs, args.recursive, args.refresh_classification)

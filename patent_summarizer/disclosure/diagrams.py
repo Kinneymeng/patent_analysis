@@ -6,7 +6,7 @@ from dataclasses import replace
 from pathlib import Path
 import sys
 
-from .models import DisclosureDiagram, TechnicalDisclosure
+from .models import DisclosureDiagnostic, DisclosureDiagram, TechnicalDisclosure
 
 
 _NODE_PATTERNS = (
@@ -19,22 +19,129 @@ _NODE_PATTERNS = (
 def render_disclosure_diagrams(
     disclosure: TechnicalDisclosure,
     assets_dir: Path,
+    *,
+    diagnostics: list[DisclosureDiagnostic] | None = None,
 ) -> TechnicalDisclosure:
     if not disclosure.diagrams:
         return disclosure
     assets_dir.mkdir(parents=True, exist_ok=True)
+    runtime = _mermaid_runtime_path()
+    if runtime is not None:
+        try:
+            return _render_diagrams_with_shared_browser(
+                disclosure,
+                assets_dir,
+                runtime,
+                diagnostics,
+            )
+        except RuntimeError as exc:
+            browser_error = str(exc)
+    else:
+        browser_error = "本地 Mermaid 运行时不可用"
     rendered: list[DisclosureDiagram] = []
     for index, diagram in enumerate(disclosure.diagrams, start=1):
         output = assets_dir / f"diagram_{index:02d}.png"
-        render_mermaid_flowchart(diagram.mermaid, output, diagram.title)
+        try:
+            _render_with_pillow(_normalize_mermaid(diagram.mermaid), output, diagram.title)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Mermaid 与备用图示转换均失败：{browser_error}；Pillow: {exc}"
+            ) from exc
+        _record_pillow_fallback(diagnostics, diagram.title, browser_error)
         rendered.append(replace(diagram, image_path=output))
     return replace(disclosure, diagrams=tuple(rendered))
 
 
-def render_mermaid_flowchart(source: str, output: Path, title: str = "") -> Path:
+def _render_diagrams_with_shared_browser(
+    disclosure: TechnicalDisclosure,
+    assets_dir: Path,
+    runtime: Path,
+    diagnostics: list[DisclosureDiagnostic] | None,
+) -> TechnicalDisclosure:
+    try:
+        from playwright.sync_api import sync_playwright
+        from .cnipa_upstream.browser import launch_chromium
+    except ImportError as exc:
+        raise RuntimeError("Mermaid 图示生成缺少便携包内的 Playwright 组件") from exc
+    rendered: list[DisclosureDiagram] = []
+    try:
+        with sync_playwright() as playwright:
+            browser, _label = launch_chromium(playwright, headless=True)
+            context = browser.new_context(
+                viewport={"width": 1600, "height": 1200},
+                device_scale_factor=2,
+            )
+            try:
+                page = context.new_page()
+                for index, diagram in enumerate(disclosure.diagrams, start=1):
+                    output = assets_dir / f"diagram_{index:02d}.png"
+                    errors = []
+                    for candidate in (diagram.mermaid, _normalize_mermaid(diagram.mermaid)):
+                        if candidate != diagram.mermaid or not errors:
+                            try:
+                                _render_mermaid_page(page, candidate, output, diagram.title, runtime)
+                                break
+                            except Exception as exc:
+                                errors.append(f"{type(exc).__name__}: {exc}")
+                    else:
+                        try:
+                            _render_with_pillow(
+                                _normalize_mermaid(diagram.mermaid),
+                                output,
+                                diagram.title,
+                            )
+                        except Exception as exc:
+                            raise RuntimeError(
+                                f"{diagram.title} 的 Mermaid 与 Pillow 转换均失败："
+                                + "；".join(errors)
+                                + f"；Pillow: {exc}"
+                            ) from exc
+                        _record_pillow_fallback(
+                            diagnostics,
+                            diagram.title,
+                            "；".join(errors),
+                        )
+                    rendered.append(replace(diagram, image_path=output))
+            finally:
+                context.close()
+                browser.close()
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(f"Mermaid 共享浏览器启动或渲染失败：{exc}") from exc
+    return replace(disclosure, diagrams=tuple(rendered))
+
+
+def render_mermaid_flowchart(
+    source: str,
+    output: Path,
+    title: str = "",
+    *,
+    diagnostics: list[DisclosureDiagnostic] | None = None,
+) -> Path:
     runtime = _mermaid_runtime_path()
+    normalized = _normalize_mermaid(source)
+    browser_errors: list[str] = []
     if runtime is not None:
-        return _render_with_mermaid(source, output, title, runtime)
+        for candidate in (source, normalized):
+            if candidate != source or not browser_errors:
+                try:
+                    return _render_with_mermaid(candidate, output, title, runtime)
+                except RuntimeError as exc:
+                    browser_errors.append(str(exc))
+    try:
+        result = _render_with_pillow(normalized, output, title)
+    except Exception as exc:
+        detail = "；".join(browser_errors[-2:])
+        if detail:
+            raise RuntimeError(f"Mermaid 与备用图示转换均失败：{detail}；Pillow: {exc}") from exc
+        raise
+    if diagnostics is not None:
+        _record_pillow_fallback(diagnostics, title, "浏览器渲染不可用")
+    return result
+
+
+def _render_with_pillow(source: str, output: Path, title: str) -> Path:
     try:
         from PIL import Image, ImageDraw, ImageFont
     except ImportError as exc:
@@ -89,6 +196,27 @@ def render_mermaid_flowchart(source: str, output: Path, title: str = "") -> Path
     return output
 
 
+def _normalize_mermaid(source: str) -> str:
+    lines = []
+    for index, raw in enumerate((source or "").splitlines()):
+        line = raw.strip()
+        if not line:
+            continue
+        if index == 0:
+            lines.append("flowchart TD")
+            continue
+        if line.startswith(("click ", "style ", "classDef ", "linkStyle ")):
+            continue
+        line = re.sub(r"<br\s*/?>", " ", line, flags=re.IGNORECASE)
+        line = line.replace("；", ";")
+        lines.append(line)
+    if not lines:
+        return "flowchart TD"
+    if not lines[0].startswith("flowchart"):
+        lines.insert(0, "flowchart TD")
+    return "\n".join(lines)
+
+
 def _mermaid_runtime_path() -> Path | None:
     candidates: list[Path] = []
     if getattr(sys, "frozen", False):
@@ -106,7 +234,6 @@ def _mermaid_runtime_path() -> Path | None:
 
 def _render_with_mermaid(source: str, output: Path, title: str, runtime: Path) -> Path:
     try:
-        from PIL import Image
         from playwright.sync_api import sync_playwright
         from .cnipa_upstream.browser import launch_chromium
     except ImportError as exc:
@@ -122,27 +249,10 @@ def _render_with_mermaid(source: str, output: Path, title: str, runtime: Path) -
             )
             try:
                 page = context.new_page()
-                page.set_content(
-                    "<html><body style='margin:0;padding:32px;background:white'>"
-                    "<h2 id='title'></h2><div id='graph'></div></body></html>"
-                )
-                page.add_script_tag(path=str(runtime))
-                page.evaluate(
-                    """async ({code, title, graphId}) => {
-                        document.getElementById('title').textContent = title;
-                        mermaid.initialize({startOnLoad: false, securityLevel: 'strict', theme: 'default'});
-                        const rendered = await mermaid.render(graphId, code);
-                        document.getElementById('graph').innerHTML = rendered.svg;
-                    }""",
-                    {"code": source, "title": title, "graphId": f"graph-{uuid.uuid4().hex}"},
-                )
-                graph = page.locator("body")
-                graph.screenshot(path=str(temporary), animations="disabled")
+                _render_mermaid_page(page, source, temporary, title, runtime)
             finally:
                 context.close()
                 browser.close()
-        with Image.open(temporary) as check:
-            check.verify()
         temporary.replace(output)
         return output
     except Exception as exc:
@@ -150,6 +260,45 @@ def _render_with_mermaid(source: str, output: Path, title: str, runtime: Path) -
     finally:
         if temporary.exists():
             temporary.unlink()
+
+
+def _render_mermaid_page(page, source: str, output: Path, title: str, runtime: Path) -> None:
+    from PIL import Image
+
+    page.set_content(
+        "<html><body style='margin:0;padding:32px;background:white'>"
+        "<h2 id='title'></h2><div id='graph'></div></body></html>"
+    )
+    page.add_script_tag(path=str(runtime))
+    page.evaluate(
+        """async ({code, title, graphId}) => {
+            document.getElementById('title').textContent = title;
+            mermaid.initialize({startOnLoad: false, securityLevel: 'strict', theme: 'default'});
+            const rendered = await mermaid.render(graphId, code);
+            document.getElementById('graph').innerHTML = rendered.svg;
+        }""",
+        {"code": source, "title": title, "graphId": f"graph-{uuid.uuid4().hex}"},
+    )
+    page.locator("body").screenshot(path=str(output), animations="disabled")
+    with Image.open(output) as check:
+        check.verify()
+
+
+def _record_pillow_fallback(
+    diagnostics: list[DisclosureDiagnostic] | None,
+    title: str,
+    reason: str,
+) -> None:
+    if diagnostics is None:
+        return
+    diagnostics.append(
+        DisclosureDiagnostic(
+            stage="diagram-export",
+            code="pillow-fallback",
+            message=f"{title or '图示'} 的 Mermaid 浏览器渲染未完成：{reason}",
+            action="已使用本地 Pillow 备用渲染器生成有效 PNG",
+        )
+    )
 
 
 def _parse_flowchart(source: str):

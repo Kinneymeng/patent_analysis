@@ -17,6 +17,7 @@ class AppConfig:
     model: str
     api_rpm: int = 10
     max_retries: int = 5
+    api_timeout_seconds: float = 300.0
     ocr_enabled: bool = True
 
 
@@ -50,6 +51,10 @@ def load_config(
         model=model,
         api_rpm=_positive_int(api_rpm if api_rpm is not None else source.get("PATENT_API_RPM", "10"), "PATENT_API_RPM"),
         max_retries=_positive_int(source.get("PATENT_MAX_RETRIES", "5"), "PATENT_MAX_RETRIES"),
+        api_timeout_seconds=_positive_float(
+            source.get("PATENT_API_TIMEOUT_SECONDS", "300"),
+            "PATENT_API_TIMEOUT_SECONDS",
+        ),
         ocr_enabled=_bool(source.get("PATENT_OCR_ENABLED", "true")),
     )
 
@@ -79,6 +84,16 @@ def _positive_int(value: int | str, name: str) -> int:
         raise ConfigError(f"{name} must be a positive integer") from exc
     if parsed <= 0:
         raise ConfigError(f"{name} must be a positive integer")
+    return parsed
+
+
+def _positive_float(value: float | str, name: str) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"{name} must be a positive number") from exc
+    if parsed <= 0:
+        raise ConfigError(f"{name} must be a positive number")
     return parsed
 
 

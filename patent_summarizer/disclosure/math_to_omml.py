@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import re
 from copy import deepcopy
+from dataclasses import dataclass
 from xml.etree import ElementTree
 
 from docx.oxml import OxmlElement
@@ -43,6 +44,14 @@ _CIRC_UNIT_PATTERNS: tuple[str, ...] = (
     r"\^\s*\\circ\s*([A-Z])\b",
 )
 _CIRC_UNIT_CHARS = {"C": "℃", "F": "℉"}
+
+
+@dataclass(frozen=True)
+class FormulaRenderResult:
+    element: object | None
+    mode: str
+    text: str
+    error: str = ""
 
 
 def _circ_unit_repl(match: re.Match[str]) -> str:
@@ -274,6 +283,47 @@ def try_latex_to_omml(latex: str, *, display: bool = True):
         return None
 
 
+def latex_to_omml_with_fallback(
+    latex: str,
+    *,
+    display: bool = True,
+) -> FormulaRenderResult:
+    """Return structured OMML, then editable linear OMML, then raw text."""
+
+    try:
+        return FormulaRenderResult(
+            latex_to_omml(latex, display=display),
+            "structured",
+            latex,
+        )
+    except Exception as exc:
+        structured_error = f"{type(exc).__name__}: {exc}"
+
+    linear = normalize_latex_for_omml(latex) or (latex or "").strip()
+    if linear:
+        try:
+            math = _element("oMath")
+            math.append(_text_run(linear))
+            if display:
+                paragraph = _element("oMathPara")
+                paragraph.append(math)
+                math = paragraph
+            return FormulaRenderResult(
+                math,
+                "linear",
+                linear,
+                structured_error,
+            )
+        except Exception as exc:
+            return FormulaRenderResult(
+                None,
+                "raw",
+                (latex or "").strip(),
+                structured_error + f"; {type(exc).__name__}: {exc}",
+            )
+    return FormulaRenderResult(None, "raw", latex or "", structured_error)
+
+
 def clone_omml(element):
     return deepcopy(element)
 
@@ -285,4 +335,3 @@ def omml_available() -> bool:
         return True
     except ImportError:
         return False
-

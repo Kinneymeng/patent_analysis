@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from typing import Any, Mapping
 
 from .legacy import parse_technical_disclosure as parse_legacy_technical_disclosure
 from .legacy import parse_title_proposal, validate_disclosure_title
 from .models import (
     DisclosureDiagram,
+    DisclosureDiagnostic,
     DisclosureFormula,
     DisclosurePreview,
     DisclosureSection,
@@ -20,6 +21,7 @@ from .models import (
     PriorArtResult,
     PriorArtStatus,
     TechnicalDisclosure,
+    ValidationSeverity,
 )
 
 
@@ -88,7 +90,13 @@ def parse_invention_candidates(
     if len({item.title.casefold() for item in candidates}) != len(candidates):
         raise ValueError("候选方案标题不得重复")
     if sum(item.recommended for item in candidates) > 1:
-        raise ValueError("每组候选方案只能推荐一项")
+        first_recommended = next(
+            index for index, item in enumerate(candidates) if item.recommended
+        )
+        candidates = [
+            replace(item, recommended=index == first_recommended)
+            for index, item in enumerate(candidates)
+        ]
     if not any(item.recommended for item in candidates):
         first = candidates[0]
         candidates[0] = InventionCandidate(**{**asdict(first), "recommended": True, "recommendation_reason": first.recommendation_reason or "技术闭环和材料依据较完整"})
@@ -237,12 +245,16 @@ def validate_disclosure_against_preview(
         required_terms.extend(("模块输出", value) for value in module.outputs)
     required_terms.extend(("技术关键点", value) for value in preview.key_points)
     required_terms.extend(("参数", value.name) for value in preview.suggested_parameters)
-    required_terms.extend(
-        ("参数符号", value.symbol)
+    missing = [
+        f"{kind}“{value}”"
+        for kind, value in required_terms
+        if not _contains_normalized(corpus, value)
+    ]
+    missing.extend(
+        f"参数符号“{value.symbol}”"
         for value in preview.suggested_parameters
-        if value.symbol
+        if value.symbol and not _contains_symbols(corpus, value.symbol)
     )
-    missing = [f"{kind}“{value}”" for kind, value in required_terms if value not in corpus]
     if missing:
         raise ValueError("正文遗漏或改写了用户确认的核心内容：" + "、".join(missing[:12]))
 
@@ -293,6 +305,254 @@ def validate_disclosure_against_preview(
         missing_details = [value for value in required_record_details if value and value not in corpus]
         if missing_details:
             raise ValueError("查新对比遗漏检索信息或已选记录字段：" + "、".join(missing_details[:16]))
+
+
+def reconcile_disclosure_with_preview(
+    disclosure: TechnicalDisclosure,
+    preview: DisclosurePreview,
+) -> TechnicalDisclosure:
+    """Restore confirmed facts locally and report non-fatal model omissions."""
+
+    corpus = _disclosure_corpus(disclosure)
+    diagnostics = list(disclosure.diagnostics)
+    tables = list(disclosure.tables)
+    sections = list(disclosure.sections)
+    diagrams = list(disclosure.diagrams)
+
+    missing_modules = [
+        item for item in preview.modules if not _contains_normalized(corpus, item.name)
+    ]
+    missing_interfaces = [
+        value
+        for module in preview.modules
+        for value in (*module.inputs, *module.outputs)
+        if not _contains_normalized(corpus, value)
+    ]
+    if missing_modules or missing_interfaces:
+        tables.append(
+            DisclosureTable(
+                section_number="三",
+                title="确认模块职责与输入输出",
+                headers=("编号", "模块", "职责", "输入", "输出"),
+                rows=tuple(
+                    (
+                        f"M{index}",
+                        module.name,
+                        module.responsibility,
+                        "；".join(module.inputs),
+                        "；".join(module.outputs),
+                    )
+                    for index, module in enumerate(preview.modules, start=1)
+                ),
+            )
+        )
+        diagnostics.append(
+            DisclosureDiagnostic(
+                stage="confirmed-baseline",
+                code="confirmed-modules-restored",
+                message="模型正文遗漏了已确认的核心模块或输入输出",
+                action="已从第二次确认结果补入第三章模块表",
+            )
+        )
+
+    missing_parameters = [
+        item
+        for item in preview.suggested_parameters
+        if not _contains_normalized(corpus, item.name)
+        or (item.symbol and not _contains_symbols(corpus, item.symbol))
+        or (item.is_example and item.value_or_range not in corpus)
+    ]
+    if missing_parameters:
+        tables.append(
+            DisclosureTable(
+                section_number="三",
+                title="确认方案参数",
+                headers=("编号", "参数", "符号", "含义", "值或范围", "确定依据"),
+                rows=tuple(
+                    (
+                        f"P{index}",
+                        item.name,
+                        item.symbol or "—",
+                        item.meaning,
+                        item.value_or_range,
+                        item.basis,
+                    )
+                    for index, item in enumerate(preview.suggested_parameters, start=1)
+                ),
+            )
+        )
+        diagnostics.append(
+            DisclosureDiagnostic(
+                stage="confirmed-baseline",
+                code="confirmed-parameters-restored",
+                message="模型正文遗漏或改写了已确认参数",
+                action="已从第二次确认结果补入第三章参数表",
+            )
+        )
+
+    missing_key_points = [
+        (index, value)
+        for index, value in enumerate(preview.key_points, start=1)
+        if not _contains_normalized(corpus, value)
+    ]
+    if missing_key_points:
+        section_index = next(
+            (index for index, section in enumerate(sections) if section.number == "五"),
+            None,
+        )
+        if section_index is not None:
+            section = sections[section_index]
+            start = len(section.subsections) + 1
+            additions = tuple(
+                DisclosureSubsection(
+                    number=f"5.{start + offset}",
+                    title=f"KP{key_index} 已确认技术关键点",
+                    paragraphs=(value,),
+                )
+                for offset, (key_index, value) in enumerate(missing_key_points)
+            )
+            sections[section_index] = replace(
+                section,
+                subsections=(*section.subsections, *additions),
+            )
+            diagnostics.append(
+                DisclosureDiagnostic(
+                    stage="confirmed-baseline",
+                    code="confirmed-key-points-restored",
+                    message="模型正文遗漏或改写了已确认技术关键点",
+                    action="已按 KP 编号补入第五章",
+                )
+            )
+
+    diagrams = _restore_confirmed_diagram_nodes(diagrams, preview, diagnostics)
+    return replace(
+        disclosure,
+        sections=tuple(sections),
+        tables=tuple(tables),
+        diagrams=tuple(diagrams),
+        diagnostics=tuple(_dedupe_diagnostics(diagnostics)),
+    )
+
+
+def _restore_confirmed_diagram_nodes(
+    diagrams: list[DisclosureDiagram],
+    preview: DisclosurePreview,
+    diagnostics: list[DisclosureDiagnostic],
+) -> list[DisclosureDiagram]:
+    architecture_index = next(
+        (index for index, item in enumerate(diagrams) if item.kind == "系统架构图"),
+        None,
+    )
+    if architecture_index is not None:
+        diagram = diagrams[architecture_index]
+        missing = [item for item in preview.modules if item.name not in diagram.mermaid]
+        if missing:
+            lines = [diagram.mermaid.rstrip()]
+            node_ids: list[str] = []
+            for index, module in enumerate(missing, start=1):
+                node_id = f"CM{index}"
+                node_ids.append(node_id)
+                lines.append(f'{node_id}["{_mermaid_label(module.name)}"]')
+            lines.extend(
+                f"{start} --> {end}" for start, end in zip(node_ids, node_ids[1:])
+            )
+            if len(node_ids) == 1:
+                lines.append(f'{node_ids[0]} --> CMO["确认模块输出"]')
+            diagrams[architecture_index] = replace(diagram, mermaid="\n".join(lines))
+            diagnostics.append(
+                DisclosureDiagnostic(
+                    stage="confirmed-baseline",
+                    code="architecture-modules-restored",
+                    message="系统架构图遗漏已确认模块",
+                    action="已将缺失模块补入架构图",
+                )
+            )
+
+    flow_index = next(
+        (index for index, item in enumerate(diagrams) if item.kind == "流程图"),
+        None,
+    )
+    if flow_index is not None:
+        diagram = diagrams[flow_index]
+        missing = []
+        for index, step in enumerate(preview.process_steps, start=1):
+            match = re.match(r"\s*(S\d+)\b", step, flags=re.IGNORECASE)
+            step_id = match.group(1).upper() if match else f"S{index}"
+            if step_id not in diagram.mermaid.upper():
+                missing.append((step_id, step))
+        if missing:
+            lines = [diagram.mermaid.rstrip()]
+            node_ids = []
+            for index, (step_id, step) in enumerate(missing, start=1):
+                node_id = f"CS{index}"
+                node_ids.append(node_id)
+                lines.append(f'{node_id}["{_mermaid_label(step_id + " " + step)}"]')
+            lines.extend(
+                f"{start} --> {end}" for start, end in zip(node_ids, node_ids[1:])
+            )
+            if len(node_ids) == 1:
+                lines.append(f'{node_ids[0]} --> CSO["确认流程输出"]')
+            diagrams[flow_index] = replace(diagram, mermaid="\n".join(lines))
+            diagnostics.append(
+                DisclosureDiagnostic(
+                    stage="confirmed-baseline",
+                    code="flow-steps-restored",
+                    message="流程图遗漏已确认步骤",
+                    action="已将缺失步骤补入流程图",
+                )
+            )
+    return diagrams
+
+
+def _disclosure_corpus(disclosure: TechnicalDisclosure) -> str:
+    return "\n".join(
+        [
+            disclosure.abstract,
+            *disclosure.all_paragraphs(),
+            *[item.mermaid for item in disclosure.diagrams],
+            *[
+                cell
+                for table in disclosure.tables
+                for row in (table.headers, *table.rows)
+                for cell in row
+            ],
+            *[item.description for item in disclosure.formulas],
+        ]
+    )
+
+
+def _normalized_text(value: str) -> str:
+    return re.sub(r"[\W_]+", "", (value or "").casefold(), flags=re.UNICODE)
+
+
+def _contains_normalized(corpus: str, value: str) -> bool:
+    needle = _normalized_text(value)
+    return bool(needle) and needle in _normalized_text(corpus)
+
+
+def _contains_symbols(corpus: str, value: str) -> bool:
+    tokens = [
+        _normalized_text(token)
+        for token in re.split(r"[,，;；、\s]+", value or "")
+        if _normalized_text(token)
+    ]
+    normalized = _normalized_text(corpus)
+    return bool(tokens) and all(token in normalized for token in tokens)
+
+
+def _mermaid_label(value: str) -> str:
+    return re.sub(r'["\[\]{}]', " ", value).strip()[:100]
+
+
+def _dedupe_diagnostics(values: list[DisclosureDiagnostic]) -> list[DisclosureDiagnostic]:
+    result: list[DisclosureDiagnostic] = []
+    seen: set[tuple[str, str]] = set()
+    for item in values:
+        key = (item.stage, item.code)
+        if key not in seen:
+            seen.add(key)
+            result.append(item)
+    return result
 
 
 def validate_effect_claims(disclosure: TechnicalDisclosure, source_context: str) -> None:
@@ -376,6 +636,80 @@ def mapping_payload(response: str | Mapping[str, Any]) -> Mapping[str, Any]:
     if not isinstance(payload, Mapping):
         raise ValueError("模型响应顶层必须是 JSON 对象")
     return payload
+
+
+def parse_disclosure_section(
+    response: str | Mapping[str, Any],
+    expected_number: str,
+) -> DisclosureSection:
+    payload = mapping_payload(response)
+    if set(payload) != {"章节"} or not isinstance(payload["章节"], Mapping):
+        raise ValueError("分章节响应必须且只能包含一个“章节”对象")
+    value = payload["章节"]
+    number = required_string(value, "编号", "章节")
+    title = required_string(value, "标题", "章节")
+    if number != expected_number or SECTION_TITLES.get(number) != title:
+        raise ValueError(
+            f"当前响应必须是：{expected_number}、{SECTION_TITLES[expected_number]}"
+        )
+    paragraphs = tuple(
+        string_list(value.get("段落", []), "章节段落", allow_empty=True)
+    )
+    raw_subsections = value.get("小节", [])
+    if not isinstance(raw_subsections, list):
+        raise ValueError("章节小节必须是数组")
+    subsections = []
+    for index, sub in enumerate(raw_subsections, start=1):
+        if not isinstance(sub, Mapping):
+            raise ValueError(f"第 {index} 个小节必须是对象")
+        subsections.append(
+            DisclosureSubsection(
+                required_string(sub, "编号", "小节"),
+                required_string(sub, "标题", "小节"),
+                tuple(string_list(sub.get("段落"), "小节段落")),
+            )
+        )
+    if not paragraphs and not subsections:
+        raise ValueError("章节没有正文内容")
+    return DisclosureSection(number, title, paragraphs, tuple(subsections))
+
+
+def parse_disclosure_artifacts(
+    response: str | Mapping[str, Any],
+) -> tuple[str, tuple[DisclosureDiagram, ...], tuple[DisclosureTable, ...], tuple[DisclosureFormula, ...]]:
+    payload = mapping_payload(response)
+    expected = {"摘要", "图示", "参数表", "公式"}
+    if set(payload) != expected:
+        raise ValueError("图文响应必须且只能包含摘要、图示、参数表和公式")
+    abstract = required_string(payload, "摘要", "技术交底书")
+    if "\n" in abstract or "\r" in abstract:
+        raise ValueError("摘要必须是单一自然段")
+    if len(re.sub(r"\s+", "", abstract)) < 100:
+        raise ValueError("摘要应至少包含 100 个非空白字符")
+    return (
+        abstract,
+        _parse_diagrams(payload["图示"]),
+        _parse_tables(payload["参数表"]),
+        _parse_formulas(payload["公式"]),
+    )
+
+
+def disclosure_section_to_payload(section: DisclosureSection) -> dict[str, Any]:
+    return {
+        "章节": {
+            "编号": section.number,
+            "标题": section.title,
+            "段落": list(section.paragraphs),
+            "小节": [
+                {
+                    "编号": item.number,
+                    "标题": item.title,
+                    "段落": list(item.paragraphs),
+                }
+                for item in section.subsections
+            ],
+        }
+    }
 
 
 def _parse_sections(raw: Any) -> tuple[DisclosureSection, ...]:
@@ -571,6 +905,9 @@ __all__ = [
     "disclosure_to_payload",
     "mapping_payload",
     "parse_disclosure_preview",
+    "parse_disclosure_section",
+    "parse_disclosure_artifacts",
+    "disclosure_section_to_payload",
     "parse_invention_candidates",
     "parse_technical_disclosure",
     "parse_title_proposal",

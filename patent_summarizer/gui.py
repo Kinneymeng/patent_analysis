@@ -325,6 +325,7 @@ def build_disclosure_cli_argv(
     project_dir: Path | None = None,
     material_dirs: list[Path] | None = None,
     prior_art: bool = False,
+    resume: bool = True,
 ) -> list[str]:
     argv = ["disclosure"]
     if source_type == DISCLOSURE_SOURCE_REPORT:
@@ -343,6 +344,8 @@ def build_disclosure_cli_argv(
         argv.extend(["--material-dir", str(material_dir)])
     if prior_art:
         argv.append("--prior-art")
+    if not resume:
+        argv.append("--no-resume")
     argv.extend(
         [
             "--output-dir",
@@ -393,6 +396,7 @@ class PatentSummarizerApp(ctk.CTk):
         self.disclosure_project_var = ctk.StringVar()
         self.disclosure_material_var = ctk.StringVar()
         self.disclosure_prior_art_var = ctk.BooleanVar(value=False)
+        self.disclosure_resume_var = ctk.BooleanVar(value=True)
         self.disclosure_output_dir_var = ctk.StringVar()
         self.disclosure_idea = ""
         self.disclosure_idea_editor: ctk.CTkTextbox | None = None
@@ -755,6 +759,18 @@ class PatentSummarizerApp(ctk.CTk):
             text_color=DESKTOP_EDITORIAL_PALETTE["body_strong"],
             font=ctk.CTkFont(family="Microsoft YaHei UI", size=12),
         ).grid(row=0, column=0, sticky="w")
+        ctk.CTkCheckBox(
+            novelty_section,
+            text="从上次有效进度继续（取消勾选将重新生成）",
+            variable=self.disclosure_resume_var,
+            onvalue=True,
+            offvalue=False,
+            fg_color=DESKTOP_EDITORIAL_PALETTE["primary"],
+            hover_color=DESKTOP_EDITORIAL_PALETTE["primary_hover"],
+            border_color=DESKTOP_EDITORIAL_PALETTE["hairline"],
+            text_color=DESKTOP_EDITORIAL_PALETTE["body_strong"],
+            font=ctk.CTkFont(family="Microsoft YaHei UI", size=12),
+        ).grid(row=1, column=0, sticky="w", pady=(8, 0))
 
         output_section = ctk.CTkFrame(self.config_frame, fg_color="transparent")
         output_section.grid(row=4, column=0, sticky="ew", pady=(16, 0))
@@ -1124,6 +1140,7 @@ class PatentSummarizerApp(ctk.CTk):
             project_dir=project_dir,
             material_dirs=material_dirs,
             prior_art=bool(self.disclosure_prior_art_var.get()),
+            resume=bool(self.disclosure_resume_var.get()),
         )
         self._set_running(True)
         self._clear_log()
@@ -1921,8 +1938,20 @@ class PatentSummarizerApp(ctk.CTk):
                         total=1,
                     )
                 )
-            self.status_var.set("运行完成")
-            self._append_log("\n完成。\n")
+            completed_with_warnings = bool(
+                self.last_progress_update
+                and "有警告" in self.last_progress_update.stage
+            )
+            self.status_var.set(
+                "运行完成（有警告）" if completed_with_warnings else "运行完成"
+            )
+            self._append_log(
+                "\n完成，但存在需要复核的警告。\n"
+                if completed_with_warnings
+                else "\n完成。\n"
+            )
+            if finished_mode == MODE_DISCLOSURE:
+                self.start_button.configure(text="生成候选方案")
             if finished_mode == MODE_REPORT and self.output_file_var.get().strip():
                 if messagebox.askyesno(
                     "报告生成完成",
@@ -1948,6 +1977,8 @@ class PatentSummarizerApp(ctk.CTk):
             )
             self.status_var.set(f"运行结束，退出码 {exit_code}")
             self._append_log(f"\n运行结束，退出码 {exit_code}。\n")
+            if finished_mode == MODE_DISCLOSURE:
+                self.start_button.configure(text="只重试失败项")
 
     def _set_progress_preparing(self, stage: str, detail: str) -> None:
         self._apply_progress(

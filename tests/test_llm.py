@@ -1,4 +1,5 @@
 import json
+import http.client
 import tempfile
 import unittest
 from pathlib import Path
@@ -107,6 +108,53 @@ class LlmTests(unittest.TestCase):
 
         self.assertEqual(client.chat("system", "user"), "ok")
         self.assertEqual(clock.sleeps, [12])
+
+    def test_retries_incomplete_reads_and_passes_configured_timeout(self):
+        calls = []
+
+        def transport(_url, _headers, _payload, timeout):
+            calls.append(timeout)
+            if len(calls) == 1:
+                raise http.client.IncompleteRead(b"")
+            return {"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]}
+
+        client = RateLimitedOpenAIClient(
+            base_url="https://example.test/v1",
+            api_key="key",
+            model="model",
+            rpm=600,
+            max_retries=1,
+            timeout=321.5,
+            transport=transport,
+            sleeper=lambda _seconds: None,
+            jitter=lambda _attempt: 0,
+        )
+
+        self.assertEqual("ok", client.chat("system", "user"))
+        self.assertEqual([321.5, 321.5], calls)
+
+    def test_retries_length_truncated_model_response(self):
+        calls = []
+
+        def transport(_url, _headers, _payload, _timeout):
+            calls.append(1)
+            if len(calls) == 1:
+                return {"choices": [{"message": {"content": "partial"}, "finish_reason": "length"}]}
+            return {"choices": [{"message": {"content": "complete"}, "finish_reason": "stop"}]}
+
+        client = RateLimitedOpenAIClient(
+            base_url="https://example.test/v1",
+            api_key="key",
+            model="model",
+            rpm=600,
+            max_retries=1,
+            transport=transport,
+            sleeper=lambda _seconds: None,
+            jitter=lambda _attempt: 0,
+        )
+
+        self.assertEqual("complete", client.chat("system", "user"))
+        self.assertEqual(2, len(calls))
 
     def test_debug_log_records_payload_and_attempts_without_api_key(self):
         calls = []

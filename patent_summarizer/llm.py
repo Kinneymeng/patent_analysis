@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import http.client
 import json
 import random
+import socket
 import threading
 import time
 import urllib.error
@@ -19,6 +21,10 @@ class HttpResponseError(RuntimeError):
         super().__init__(f"HTTP {status_code}: {message}")
         self.status_code = status_code
         self.retry_after = retry_after
+
+
+class IncompleteModelResponseError(ConnectionError):
+    """Raised when the provider reports a token-truncated response."""
 
 
 class RateLimiter:
@@ -101,12 +107,17 @@ class RateLimitedOpenAIClient:
             attempt += 1
             try:
                 response = self._transport(url, headers, payload, self.timeout)
+                if _finish_reason(response) == "length":
+                    raise IncompleteModelResponseError(
+                        "模型响应因长度限制被截断，请缩短当前阶段或提高模型输出上限"
+                    )
                 content = _extract_content(response)
                 self._record_debug_event(
                     {
                         "event": "attempt",
                         "request_id": request_id,
                         "attempt": attempt,
+                        "max_retries": self.max_retries,
                         "outcome": "success",
                         "response_model": response.get("model"),
                         "system_fingerprint": response.get("system_fingerprint"),
@@ -218,7 +229,18 @@ def _finish_reason(response: dict[str, Any]) -> Any:
 def _is_retryable(exc: Exception) -> bool:
     if isinstance(exc, HttpResponseError):
         return exc.status_code in {408, 409, 429} or 500 <= exc.status_code <= 599
-    return isinstance(exc, (TimeoutError, ConnectionError))
+    return isinstance(
+        exc,
+        (
+            TimeoutError,
+            socket.timeout,
+            ConnectionError,
+            ConnectionResetError,
+            ConnectionAbortedError,
+            http.client.IncompleteRead,
+            http.client.RemoteDisconnected,
+        ),
+    )
 
 
 def _retry_delay(exc: Exception, attempt: int, jitter: Callable[[int], float]) -> float:

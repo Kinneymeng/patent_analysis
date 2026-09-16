@@ -16,9 +16,11 @@ from patent_summarizer.cli import build_parser, main
 from patent_summarizer.config import AppConfig
 from patent_summarizer.disclosure import (
     DisclosureAnalyzer,
+    DisclosureCheckpointStore,
     DisclosurePreview,
     DisclosureSourceItem,
     ModuleDefinition,
+    ParameterDefinition,
     PriorArtResult,
     PriorArtStatus,
     TechnicalDisclosure,
@@ -29,10 +31,14 @@ from patent_summarizer.disclosure import (
     load_report_sources,
     load_title_selections,
     parse_technical_disclosure,
+    parse_invention_candidates,
     parse_title_proposal,
+    reconcile_disclosure_with_preview,
     selected_work_items,
     validate_disclosure_title,
+    validate_disclosure_against_preview,
     validate_title_selections,
+    write_disclosure_bundle,
 )
 from patent_summarizer.disclosure_docx import (
     BODY_OUTLINE_LEVEL,
@@ -72,6 +78,31 @@ def _valid_preview(title: str = "一种冗余制动控制方法") -> DisclosureP
         assumptions=("控制周期稳定",),
         open_questions=("故障阈值需要标定",),
     )
+
+
+def _structured_reliability_payload(title: str = "车辆姿态融合阻尼控制方法") -> dict:
+    section_titles = (
+        ("一", "技术背景与现有方案", "现有控制方案依赖单一信号，扰动条件下容易产生误判。"),
+        ("二", "需要解决的技术问题", "方案需要在传感器短时失效时继续稳定计算目标阻尼。"),
+        ("三", "技术方案详细说明", "姿态融合模块的输入为车速，输出为路面状态；阻尼计算模块输出目标阻尼。信号异常或超过边界时进入保持流程。"),
+        ("四", "技术效果与适用边界", "多信号判断可降低阻尼跳变，属于待验证的预期效果。"),
+        ("五", "技术关键点", "姿态融合模块先计算信号可信度，再选择阻尼标定区间。"),
+        ("六", "实施例与验证方法", "正常用例输入有效车速并检查目标阻尼；异常用例断开传感器并检查保持输出。"),
+    )
+    return {
+        "标题": title,
+        "摘要": "本方案采集车辆速度和车身垂向加速度，计算信号可信度与路面状态，再根据路面状态计算目标悬架阻尼。系统在信号缺失、超时或越界时进入保持或降级流程，并记录触发原因。工程人员可以按照模块输入输出、计算顺序、参数设置和验证用例完成控制器实现与台架复现。",
+        "章节": [
+            {"编号": number, "标题": section_title, "段落": [paragraph], "小节": []}
+            for number, section_title, paragraph in section_titles
+        ],
+        "图示": [
+            {"章节": "三", "类型": "系统架构图", "标题": "图1 系统架构", "mermaid": "flowchart TD\nA[车辆信号] --> B[姿态融合模块]\nB --> C[阻尼计算模块]"},
+            {"章节": "三", "类型": "流程图", "标题": "图2 控制流程", "mermaid": "flowchart TD\nS1[S1 采集信号] --> S2[S2 检查有效性]\nS2 --> S3[S3 计算目标阻尼]"},
+        ],
+        "参数表": [],
+        "公式": [],
+    }
 
 
 def _add_two_column_table(document, headers, fields):
@@ -574,7 +605,7 @@ class DisclosureCliTests(unittest.TestCase):
         self.assertEqual(2, len(review_calls))
         self.assertEqual(PriorArtStatus.SUCCESS, review_calls[1].prior_art.status)
 
-    def test_diagram_or_formula_export_failure_gets_one_repair_attempt(self):
+    def test_unhandled_export_failure_does_not_rewrite_the_whole_document(self):
         title = "一种冗余制动控制方法"
         disclosure = _valid_disclosure(title)
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -606,7 +637,7 @@ class DisclosureCliTests(unittest.TestCase):
                 return_value=disclosure,
             ) as repair, patch(
                 "patent_summarizer.cli.write_disclosure_bundle",
-                side_effect=[ValueError("公式无法转换为可编辑 Word 公式"), bundle],
+                side_effect=ValueError("DOCX 文件损坏"),
             ) as write:
                 exit_code = main([
                     "disclosure",
@@ -615,9 +646,143 @@ class DisclosureCliTests(unittest.TestCase):
                     "--titles-file", str(titles),
                 ])
 
-        self.assertEqual(0, exit_code)
-        self.assertEqual(2, write.call_count)
-        repair.assert_called_once()
+        self.assertEqual(1, exit_code)
+        self.assertEqual(1, write.call_count)
+        repair.assert_not_called()
+
+
+class DisclosureReliabilityTests(unittest.TestCase):
+    def test_multiple_recommendations_are_normalized_without_model_repair(self):
+        payload = {
+            "候选方案": [
+                {
+                    "编号": f"C{index}",
+                    "标题": f"车辆阻尼控制方法{index}",
+                    "技术问题": "阻尼控制不稳定",
+                    "核心创新": "按路面状态调节阻尼",
+                    "初步区别": "增加状态判断",
+                    "可实施性": "使用现有控制器实现",
+                    "材料依据": [],
+                    "推荐": True,
+                    "推荐理由": "技术闭环完整",
+                }
+                for index in (1, 2)
+            ]
+        }
+
+        candidates = parse_invention_candidates(payload)
+
+        self.assertEqual([True, False], [item.recommended for item in candidates])
+
+    def test_missing_confirmed_content_is_restored_as_diagnostics(self):
+        payload = _structured_reliability_payload()
+        payload["章节"][2]["段落"] = [
+            "控制器接收输入并产生输出，信号异常或超过边界时保持上一周期结果。"
+        ]
+        payload["章节"][4]["段落"] = ["控制器执行状态判断和阻尼计算。"]
+        payload["图示"][0]["mermaid"] = "flowchart TD\nA[输入] --> B[计算]\nB --> C[输出]"
+        disclosure = parse_technical_disclosure(payload, payload["标题"])
+        preview = DisclosurePreview(
+            source_id="manual",
+            title=payload["标题"],
+            technical_problems=("异常时阻尼跳变",),
+            modules=(
+                ModuleDefinition("姿态融合模块", "判断路面状态", ("垂向加速度",), ("路面状态",)),
+                ModuleDefinition("阻尼计算模块", "计算阻尼", ("路面状态",), ("目标阻尼",)),
+            ),
+            process_steps=("S1 采集信号", "S2 检查有效性", "S3 计算目标阻尼"),
+            key_points=("信号可信度融合后选择阻尼标定区间",),
+            evidence_refs=(),
+            suggested_parameters=(
+                ParameterDefinition("反馈控制器增益", "Kp, Ki, Kd", "PID增益", "示例值：待标定", "台架验证", True),
+            ),
+            assumptions=(),
+            open_questions=(),
+        )
+
+        restored = reconcile_disclosure_with_preview(disclosure, preview)
+        validate_disclosure_against_preview(restored, preview)
+
+        codes = {item.code for item in restored.diagnostics}
+        self.assertIn("confirmed-modules-restored", codes)
+        self.assertIn("confirmed-key-points-restored", codes)
+        self.assertIn("confirmed-parameters-restored", codes)
+
+    def test_formula_failure_delivers_editable_linear_formula_with_warning(self):
+        payload = _structured_reliability_payload()
+        payload["公式"] = [{
+            "章节": "三",
+            "编号": "式（1）",
+            "LaTeX": "y=x",
+            "说明": "y 表示目标输出，x 表示输入信号。",
+            "来源": "agent",
+            "材料依据": "",
+        }]
+        disclosure = parse_technical_disclosure(payload, payload["标题"])
+        with tempfile.TemporaryDirectory() as temp_dir, patch(
+            "patent_summarizer.disclosure.math_to_omml.latex_to_omml",
+            side_effect=ValueError("unsupported formula"),
+        ):
+            paths = write_disclosure_bundle(disclosure, Path(temp_dir))
+
+            self.assertTrue(paths.docx.is_file())
+            self.assertTrue(any(item.code == "formula-linear" for item in paths.diagnostics))
+            document = Document(paths.docx)
+            self.assertGreaterEqual(len(document.element.body.xpath(".//m:oMath")), 1)
+
+    def test_failed_chapter_resumes_without_repeating_completed_chapters(self):
+        payload = _structured_reliability_payload()
+        sections = {item["编号"]: {"章节": item} for item in payload["章节"]}
+        artifacts = {key: payload[key] for key in ("摘要", "图示", "参数表", "公式")}
+
+        class ChapterClient:
+            def __init__(self, fail_on=None):
+                self.fail_on = fail_on
+                self.calls = []
+
+            def chat(self, _system, prompt):
+                self.calls.append(prompt)
+                for number in ("一", "二", "三", "四", "五", "六"):
+                    if f"当前只撰写：{number}、" in prompt:
+                        if self.fail_on == number:
+                            raise ConnectionError("simulated interruption")
+                        return sections[number]
+                if "图文与摘要生成" in prompt:
+                    return artifacts
+                raise AssertionError("unexpected prompt")
+
+        preview = DisclosurePreview(
+            source_id="manual",
+            title=payload["标题"],
+            technical_problems=("异常时保持稳定输出",),
+            modules=(
+                ModuleDefinition("姿态融合模块", "判断状态", ("车速",), ("路面状态",)),
+                ModuleDefinition("阻尼计算模块", "计算阻尼", ("路面状态",), ("目标阻尼",)),
+            ),
+            process_steps=("S1 采集信号", "S2 检查有效性", "S3 计算目标阻尼"),
+            key_points=("信号可信度融合",),
+            evidence_refs=(),
+            suggested_parameters=(),
+            assumptions=(),
+            open_questions=(),
+        )
+        source = DisclosureSourceItem("manual", "构思", "摘要", "材料上下文")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = DisclosureCheckpointStore(Path(temp_dir), model="model")
+            first = ChapterClient(fail_on="三")
+            with self.assertRaises(ConnectionError):
+                DisclosureAnalyzer(first, checkpoint_store=store).draft(
+                    source, payload["标题"], preview
+                )
+            second = ChapterClient()
+            result = DisclosureAnalyzer(second, checkpoint_store=store).draft(
+                source, payload["标题"], preview
+            )
+
+        self.assertEqual(6, len(result.sections))
+        self.assertFalse(any("当前只撰写：一、" in prompt for prompt in second.calls))
+        self.assertFalse(any("当前只撰写：二、" in prompt for prompt in second.calls))
+        self.assertTrue(any("当前只撰写：三、" in prompt for prompt in second.calls))
 
 
 if __name__ == "__main__":

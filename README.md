@@ -28,10 +28,11 @@ OPENAI_API_KEY=your_key_here
 OPENAI_MODEL=your_model_id
 PATENT_API_RPM=10
 PATENT_MAX_RETRIES=5
+PATENT_API_TIMEOUT_SECONDS=300
 PATENT_OCR_ENABLED=true
 ```
 
-`PATENT_API_RPM=10` 会让客户端全局控制请求速度，默认每次请求之间至少间隔约 6.5 秒，并对 `408/409/429/5xx`、连接错误和超时执行重试。
+`PATENT_API_RPM=10` 会让客户端全局控制请求速度，默认每次请求之间至少间隔约 6.5 秒。`PATENT_MAX_RETRIES` 表示首次请求失败后的网络重试次数；`PATENT_API_TIMEOUT_SECONDS` 控制单次接口读取超时。程序会重试 `408/409/429/5xx`、连接错误、读取超时、连接重置和不完整响应。
 
 ## 使用
 
@@ -241,7 +242,9 @@ Project Scan 递归读取 DOCX、PPTX、文字型 PDF、Markdown、文本和常�
 
 候选确认后先形成完整技术方案预览，集中展示技术问题、具体模块及输入输出、流程、材料依据、示例参数、假设和未决问题。GUI 第二次确认可直接编辑这些结构化内容。成文固定使用六章：技术背景与现有方案、需要解决的技术问题、技术方案详细说明、技术效果与适用边界、技术关键点、实施例与验证方法。全文采用工程设计文档表达，检查权利要求式措辞、术语、图文、公式、参数、异常路径和验证方法的一致性，不设置固定字数上限。
 
-每项输出 `<标题>_技术交底书.docx`、同名 `.md` 和 `_assets` 图片目录。Markdown 保留 Mermaid 图源，Word 嵌入本地生成的 PNG；参数使用 Word 表格，必要公式转换为可编辑 Word 公式。图示、公式或双格式校验失败时该篇标记失败，不把损坏内容作为正常交付。默认遇到同名 DOCX 或 Markdown 即停止；可使用 `--skip-existing` 或 `--overwrite`。
+每项输出 `<标题>_技术交底书.docx`、同名 `.md` 和 `_assets` 图片目录。Markdown 保留 Mermaid 图源，Word 嵌入本地生成的 PNG；参数使用 Word 表格，必要公式转换为可编辑 Word 公式。结构化公式失败时自动使用可编辑线性公式，仍失败则保留原始 LaTeX 并标记需人工复核。Mermaid 失败时使用 Pillow 备用渲染。确认模块、参数或技术关键点被模型遗漏时由程序从第二次确认结果补回，交付状态显示为“成功但有警告”。
+
+六章正文、图文附件、确认方案和审校结果保存到输出侧 `.patent_disclosure_work`。`--resume` 默认开启，再次运行会跳过已经完整交付的篇目并从失败章节继续；`--no-resume` 忽略这些工作流检查点并重新生成。默认遇到无法验证为完整交付的同名 DOCX 或 Markdown 仍会停止；可使用 `--skip-existing` 或 `--overwrite`。
 
 查新通过 `--prior-art` 显式开启，默认关闭。开启时只访问国知局专利公布公告系统，先按技术关键词召回，再按 IPC 收敛，保留约 4 至 6 条可核验中国发明记录。CLI 查新失败默认停止，只有同时传入 `--prior-art-failure skip` 才明确跳过并继续。关闭时不发起查新公网请求。`--dry-run` 只检查来源与材料清单，不调用模型、查新或写入交付文件。
 
@@ -259,7 +262,7 @@ conda run -n temp python -m pip install pypandoc-binary pyinstaller customtkinte
 conda run -n temp python build_portable.py
 ```
 
-构建结果位于 `dist\PatentSummarizer\`，包含：
+构建脚本在完成后运行打包 EXE 自检，实际启动随包 Chromium，并检查 Mermaid、Pillow、`latex2mathml`、DOCX 和中文路径写入。自检失败时不会把该目录报告为可交付版本。构建结果位于 `dist\PatentSummarizer\`，包含：
 
 - `PatentSummarizer.exe`：主程序。
 - `.env`：API 配置。若项目根目录没有 `.env`，构建脚本会复制 `.env.example` 作为模板。

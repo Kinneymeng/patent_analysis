@@ -11,6 +11,7 @@ pypandoc_hiddenimports = collect_submodules("pypandoc")
 customtkinter_datas = collect_data_files("customtkinter")
 customtkinter_hiddenimports = collect_submodules("customtkinter")
 disclosure_datas = collect_data_files("patent_summarizer.disclosure")
+latex2mathml_datas = collect_data_files("latex2mathml")
 playwright_browsers = ROOT / "build" / "playwright-browsers"
 mermaid_runtime = ROOT / "build" / "vendor" / "mermaid.min.js"
 browser_datas = (
@@ -27,13 +28,14 @@ dynamic_hiddenimports = [
 ]
 
 a = Analysis(
-    ["patent_summarizer/gui.py"],
+    ["patent_summarizer/entrypoint.py"],
     pathex=[str(ROOT)],
     binaries=[],
     datas=(
         pypandoc_datas
         + customtkinter_datas
         + disclosure_datas
+        + latex2mathml_datas
         + browser_datas
         + mermaid_datas
     ),
