@@ -47,6 +47,9 @@ MODE_LABELS = {
     MODE_REPORT: "报告",
     MODE_DISCLOSURE: "技术交底书",
 }
+VISIBLE_MODE_LABELS = {
+    mode: label for mode, label in MODE_LABELS.items() if mode != MODE_COMPARE
+}
 REPORT_TEMPLATE_NAME = "汽车底盘领域专利布局分析报告模板.docx"
 APP_ICON_NAME = "patent-summarizer.ico"
 COPYRIGHT_TEXT = "© 2026 平台及模组开发部 · 线控底盘所 版权所有"
@@ -109,7 +112,7 @@ DISCLOSURE_IDEA_PLACEHOLDER = """示例（开始输入后自动隐藏）：
 预期结构与流程：由 EPS 控制器融合方向盘转矩、转角、车速和电机状态，识别路面及传感器可信度，动态计算基础助力、补偿助力与降级控制量，并向助力电机输出目标转矩。
 输入与输出：输入包括方向盘转矩、方向盘转角、车辆速度、电机电流及故障状态；输出包括目标助力转矩、补偿指令和故障降级指令。
 使用场景与约束：适用于低速泊车、高速直行、低附着路面及单路传感器异常场景，并需兼顾实时性、控制平顺性和功能安全要求。"""
-MODE_OPTIONS = list(MODE_LABELS.values())
+MODE_OPTIONS = list(VISIBLE_MODE_LABELS.values())
 MODERN_APPEARANCE_MODE = "light"
 MODERN_COLOR_THEME = "green"
 DESKTOP_EDITORIAL_PALETTE = {
@@ -142,6 +145,19 @@ DESKTOP_EDITORIAL_PALETTE = {
     "warning_surface": "#FFF4D6",
     "error": "#C64545",
     "error_surface": "#FDE8E7",
+}
+LOG_PANEL_STYLE: dict[str, object] = {
+    "fg_color": DESKTOP_EDITORIAL_PALETTE["surface"],
+    "border_width": 1,
+    "border_color": DESKTOP_EDITORIAL_PALETTE["hairline"],
+}
+LOG_TEXT_STYLE: dict[str, object] = {
+    "fg_color": DESKTOP_EDITORIAL_PALETTE["surface_input"],
+    "text_color": DESKTOP_EDITORIAL_PALETTE["body_strong"],
+    "border_width": 1,
+    "border_color": DESKTOP_EDITORIAL_PALETTE["hairline_soft"],
+    "scrollbar_button_color": DESKTOP_EDITORIAL_PALETTE["hairline"],
+    "scrollbar_button_hover_color": DESKTOP_EDITORIAL_PALETTE["primary_hover"],
 }
 
 
@@ -230,6 +246,32 @@ def _disclosure_preview_payload(preview: DisclosurePreview) -> dict[str, object]
         "假设": list(preview.assumptions),
         "待确认问题": list(preview.open_questions),
     }
+
+
+def mouse_wheel_scroll_units(delta: int) -> int:
+    """Translate a Windows mouse-wheel delta into a readable text scroll."""
+
+    if delta == 0:
+        return 0
+    notches = max(1, abs(delta) // 120)
+    return (-1 if delta > 0 else 1) * notches * 3
+
+
+def handle_textbox_mousewheel(textbox, event) -> str:
+    """Scroll only ``textbox`` and stop the event from reaching page scrolling."""
+
+    units = mouse_wheel_scroll_units(int(getattr(event, "delta", 0)))
+    if units:
+        textbox.yview_scroll(units, "units")
+    return "break"
+
+
+def bind_mousewheel_tree(widget, callback) -> None:
+    """Bind one exclusive wheel callback to a widget and all of its children."""
+
+    widget.bind("<MouseWheel>", callback, add=True)
+    for child in widget.winfo_children():
+        bind_mousewheel_tree(child, callback)
 
 
 def disclosure_material_paths(value: str) -> list[Path]:
@@ -487,7 +529,7 @@ class PatentSummarizerApp(ctk.CTk):
             corner_radius=12,
         )
         self.mode_group.grid(row=0, column=1, sticky="w")
-        for index, (mode, label) in enumerate(MODE_LABELS.items()):
+        for index, (mode, label) in enumerate(VISIBLE_MODE_LABELS.items()):
             button = ctk.CTkButton(
                 self.mode_group,
                 text=label,
@@ -559,7 +601,7 @@ class PatentSummarizerApp(ctk.CTk):
         self.progress_bar.grid(row=1, column=0, sticky="ew")
         self.progress_bar.set(0)
 
-        log_panel = ctk.CTkFrame(panel, corner_radius=14, fg_color=DESKTOP_EDITORIAL_PALETTE["dark"])
+        log_panel = ctk.CTkFrame(panel, corner_radius=14, **LOG_PANEL_STYLE)
         log_panel.grid(row=4, column=0, sticky="nsew", padx=22, pady=(0, 22))
         log_panel.grid_columnconfigure(0, weight=1)
         log_panel.grid_rowconfigure(1, weight=1)
@@ -568,21 +610,18 @@ class PatentSummarizerApp(ctk.CTk):
             log_panel,
             text="运行日志",
             font=ctk.CTkFont(family="Microsoft YaHei UI", size=13, weight="bold"),
-            text_color=DESKTOP_EDITORIAL_PALETTE["on_dark"],
+            text_color=DESKTOP_EDITORIAL_PALETTE["body_strong"],
         ).grid(row=0, column=0, sticky="w", padx=16, pady=(14, 6))
 
         self.log_text = ctk.CTkTextbox(
             log_panel,
             wrap="word",
             corner_radius=10,
-            border_width=0,
-            fg_color=DESKTOP_EDITORIAL_PALETTE["dark_soft"],
-            text_color=DESKTOP_EDITORIAL_PALETTE["on_dark"],
-            scrollbar_button_color=DESKTOP_EDITORIAL_PALETTE["dark_elevated"],
-            scrollbar_button_hover_color=DESKTOP_EDITORIAL_PALETTE["primary_pressed"],
             font=ctk.CTkFont(family="Consolas", size=12),
+            **LOG_TEXT_STYLE,
         )
         self.log_text.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 12))
+        bind_mousewheel_tree(log_panel, self._scroll_log)
 
         self._render_mode_config()
 
@@ -1872,6 +1911,9 @@ class PatentSummarizerApp(ctk.CTk):
     def _append_log(self, text: str) -> None:
         self.log_text.insert("end", text)
         self.log_text.see("end")
+
+    def _scroll_log(self, event) -> str:
+        return handle_textbox_mousewheel(self.log_text, event)
 
     def _clear_log(self) -> None:
         self.log_text.delete("1.0", "end")

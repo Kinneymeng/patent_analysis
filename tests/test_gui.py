@@ -3,7 +3,8 @@ import runpy
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import build_portable
 from docx import Document
@@ -14,6 +15,8 @@ from patent_summarizer.gui import (
     COPYRIGHT_TEXT,
     DESKTOP_EDITORIAL_PALETTE,
     DISCLOSURE_IDEA_PLACEHOLDER,
+    LOG_PANEL_STYLE,
+    LOG_TEXT_STYLE,
     MODE_ANALYZE,
     MODE_CLASSIFY,
     MODE_COMPARE,
@@ -25,15 +28,19 @@ from patent_summarizer.gui import (
     MODERN_APPEARANCE_MODE,
     MODERN_COLOR_THEME,
     MODE_OPTIONS,
+    VISIBLE_MODE_LABELS,
     PortfolioInput,
+    bind_mousewheel_tree,
     build_cli_argv,
     build_disclosure_cli_argv,
     build_portfolio_cli_argv,
     default_output_path,
     disclosure_idea_value,
     disclosure_material_paths,
+    handle_textbox_mousewheel,
     mode_from_label,
     mode_button_style,
+    mouse_wheel_scroll_units,
     progress_display,
 )
 from patent_summarizer.progress import ProgressUpdate
@@ -134,7 +141,8 @@ class GuiCommandTests(unittest.TestCase):
             build_cli_argv("unknown", Path("D:/patents"), Path("D:/app"))
 
     def test_segmented_mode_options_map_labels_to_cli_modes(self):
-        self.assertEqual(MODE_OPTIONS, ["批量总结", "分类", "趋势分析", "对比", "报告", "技术交底书"])
+        self.assertEqual(MODE_OPTIONS, ["批量总结", "分类", "趋势分析", "报告", "技术交底书"])
+        self.assertNotIn(MODE_COMPARE, VISIBLE_MODE_LABELS)
         self.assertEqual(mode_from_label("批量总结"), MODE_SUMMARIZE)
         self.assertEqual(mode_from_label("分类"), MODE_CLASSIFY)
         self.assertEqual(mode_from_label("趋势分析"), MODE_ANALYZE)
@@ -283,6 +291,66 @@ class GuiCommandTests(unittest.TestCase):
         self.assertEqual(unselected["text_color"], DESKTOP_EDITORIAL_PALETTE["ink"])
         self.assertNotEqual(unselected["text_color"], unselected["fg_color"])
 
+    def test_log_panel_uses_light_surface_and_hairline_borders(self):
+        self.assertEqual(LOG_PANEL_STYLE["fg_color"], DESKTOP_EDITORIAL_PALETTE["surface"])
+        self.assertEqual(LOG_PANEL_STYLE["border_width"], 1)
+        self.assertEqual(LOG_PANEL_STYLE["border_color"], DESKTOP_EDITORIAL_PALETTE["hairline"])
+        self.assertEqual(LOG_TEXT_STYLE["fg_color"], DESKTOP_EDITORIAL_PALETTE["surface_input"])
+        self.assertEqual(LOG_TEXT_STYLE["text_color"], DESKTOP_EDITORIAL_PALETTE["body_strong"])
+        self.assertEqual(LOG_TEXT_STYLE["border_width"], 1)
+        self.assertNotIn(
+            LOG_TEXT_STYLE["fg_color"],
+            {DESKTOP_EDITORIAL_PALETTE["dark"], DESKTOP_EDITORIAL_PALETTE["dark_soft"]},
+        )
+
+    def test_log_mouse_wheel_scrolls_text_and_consumes_event(self):
+        textbox = Mock()
+
+        result = handle_textbox_mousewheel(textbox, SimpleNamespace(delta=120))
+
+        textbox.yview_scroll.assert_called_once_with(-3, "units")
+        self.assertEqual("break", result)
+
+        textbox.reset_mock()
+        result = handle_textbox_mousewheel(textbox, SimpleNamespace(delta=-240))
+
+        textbox.yview_scroll.assert_called_once_with(6, "units")
+        self.assertEqual("break", result)
+
+    def test_log_mouse_wheel_is_consumed_even_without_delta(self):
+        textbox = Mock()
+
+        result = handle_textbox_mousewheel(textbox, SimpleNamespace(delta=0))
+
+        textbox.yview_scroll.assert_not_called()
+        self.assertEqual("break", result)
+        self.assertEqual(-3, mouse_wheel_scroll_units(60))
+        self.assertEqual(3, mouse_wheel_scroll_units(-60))
+
+    def test_log_mouse_wheel_binding_covers_the_entire_widget_tree(self):
+        class FakeWidget:
+            def __init__(self, *children):
+                self.children = list(children)
+                self.bindings = []
+
+            def bind(self, sequence, callback, add=False):
+                self.bindings.append((sequence, callback, add))
+
+            def winfo_children(self):
+                return self.children
+
+        title = FakeWidget()
+        textbox = FakeWidget(FakeWidget())
+        scrollbar = FakeWidget()
+        panel = FakeWidget(title, textbox, scrollbar)
+        callback = Mock()
+
+        bind_mousewheel_tree(panel, callback)
+
+        widgets = [panel, title, textbox, textbox.children[0], scrollbar]
+        for widget in widgets:
+            self.assertEqual([("<MouseWheel>", callback, True)], widget.bindings)
+
     def test_progress_display_uses_running_success_and_error_colors(self):
         running = ProgressUpdate("summarize", "running", "正在总结专利", "", 2, 4)
         success = ProgressUpdate("summarize", "success", "批量总结完成", "已完成 4 篇", 4, 4)
@@ -316,6 +384,7 @@ class GuiCommandTests(unittest.TestCase):
         self.assertIn("log_panel = ctk.CTkFrame(panel,", source)
         self.assertIn("baseline_list = ctk.CTkScrollableFrame(", source)
         self.assertIn("self.log_text = ctk.CTkTextbox(", source)
+        self.assertIn("bind_mousewheel_tree(log_panel, self._scroll_log)", source)
 
 
 class PortableRuntimeFilesTests(unittest.TestCase):
@@ -411,18 +480,20 @@ class PortableRuntimeFilesTests(unittest.TestCase):
             with self.assertRaisesRegex(FileNotFoundError, "Chromium executable"):
                 build_portable.verify_portable_application(dist)
 
-    def test_user_guide_covers_all_six_gui_tasks(self):
+    def test_user_guide_covers_all_five_visible_gui_tasks(self):
         guide = Path("使用说明.md").read_text(encoding="utf-8")
 
         for heading in [
             "## 四、批量总结",
             "## 五、分类",
             "## 六、趋势分析",
-            "## 七、对比",
-            "## 八、报告",
-            "## 九、技术交底书",
+            "## 七、报告",
+            "## 八、技术交底书",
         ]:
             self.assertIn(heading, guide)
+        self.assertNotIn("## 七、对比", guide)
+        self.assertIn("五个任务标签", guide)
+        self.assertIn("无需先生成独立的对比 Excel", guide)
         self.assertIn("前置条件", guide)
         self.assertIn("使用方法", guide)
 
