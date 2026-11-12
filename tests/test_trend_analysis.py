@@ -1,11 +1,21 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import Mock
 
 from openpyxl import Workbook, load_workbook
 
 from patent_summarizer.metadata import infer_patent_year, normalize_patent_date, parse_bibliographic_metadata
-from patent_summarizer.trend_analysis import TrendAnalyzer, TrendPatentRecord, build_trend_groups, load_classification_workbook, trend_work_units
+from patent_summarizer.report_analysis import ReportCheckpointingClient
+from patent_summarizer.trend_analysis import (
+    TrendAnalyzer,
+    TrendPatentRecord,
+    build_trend_groups,
+    load_classification_workbook,
+    parse_trend_response,
+    trend_work_units,
+)
 from patent_summarizer.trend_excel_export import write_trend_workbook
 
 
@@ -169,6 +179,16 @@ class FakeTrendClient:
 
 
 class TrendAnalyzerTests(unittest.TestCase):
+    def test_representative_count_matches_available_evidence(self):
+        for count, expected in [(1, "1"), (2, "2"), (3, "3"), (4, "3 到 4"), (6, "3 到 5")]:
+            with self.subTest(count=count):
+                client = FakeTrendClient()
+                records = [make_record(filename=f"patent-{index}.pdf") for index in range(count)]
+
+                TrendAnalyzer(client).analyze(records)
+
+                self.assertIn(f"从本次提供的摘要证据中选取 {expected} 件", client.calls[0][1])
+
     def test_analyzes_and_writes_trend_workbook(self):
         client = FakeTrendClient()
         analyzer = TrendAnalyzer(client, batch_size=40)
@@ -196,9 +216,73 @@ class TrendAnalyzerTests(unittest.TestCase):
         result = analyzer.analyze(records, on_operation=lambda detail, started: operations.append((detail, started)))
 
         self.assertEqual(len(client.calls), 3)
+        self.assertIn("从本次提供的摘要证据中选取 3 到 5 件", client.calls[0][1])
+        self.assertIn("从本次提供的摘要证据中选取 1 件", client.calls[1][1])
         self.assertEqual(trend_work_units(records, batch_size=40), 3)
         self.assertEqual([started for _detail, started in operations], [True, False, True, False, True, False])
         self.assertEqual(result.reports[0].stats.patent_count, 41)
+
+    def test_retries_with_parse_error_and_reuses_repaired_response(self):
+        valid = FakeTrendClient().chat("", "")
+        delegate = Mock()
+        delegate.chat.side_effect = ['{\n  "发展现状": "未转义\n的换行"\n}', valid]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_path = Path(tmp) / "report.jsonl"
+            client = ReportCheckpointingClient(delegate, cache_path)
+            result = TrendAnalyzer(client).analyze([make_record()])
+            original, repair = delegate.chat.call_args_list
+            resumed = ReportCheckpointingClient(delegate, cache_path)
+
+            self.assertEqual(resumed.chat(*original.args), valid)
+
+        self.assertEqual(result.reports[0].representative_patents, valid["代表专利"])
+        self.assertTrue(repair.args[1].startswith(original.args[1]))
+        self.assertIn("Invalid control character", repair.args[1])
+        self.assertEqual(delegate.chat.call_count, 2)
+
+    def test_retries_batch_merge_once_without_advancing_progress_twice(self):
+        valid = FakeTrendClient().chat("", "")
+        client = Mock()
+        client.chat.side_effect = [valid, valid, "{未闭合", valid]
+        operations = []
+        records = [make_record(filename=f"patent-{index}.pdf") for index in range(2)]
+
+        TrendAnalyzer(client, batch_size=1).analyze(records, on_operation=lambda *event: operations.append(event))
+
+        original_merge, repair = client.chat.call_args_list[-2:]
+        self.assertIn("批次趋势摘要", original_merge.args[1])
+        self.assertTrue(repair.args[1].startswith(original_merge.args[1]))
+        self.assertIn("未找到完整的 JSON 对象", repair.args[1])
+        self.assertEqual([started for _detail, started in operations], [True, False] * 3)
+
+    def test_stops_after_one_failed_retry_and_invalidates_both_cached_responses(self):
+        delegate = Mock()
+        delegate.chat.return_value = "{未闭合"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_path = Path(tmp) / "report.jsonl"
+            client = ReportCheckpointingClient(delegate, cache_path)
+            with self.assertRaisesRegex(ValueError, "已重试一次"):
+                TrendAnalyzer(client).analyze([make_record()])
+            entries = [json.loads(line) for line in cache_path.read_text(encoding="utf-8").splitlines()]
+
+        self.assertEqual(delegate.chat.call_count, 2)
+        self.assertEqual([entry.get("invalid", False) for entry in entries], [False, True, False, True])
+
+
+class TrendResponseTests(unittest.TestCase):
+    def test_recovers_complete_object_after_unclosed_string(self):
+        complete = FakeTrendClient().chat("", "")
+        response = '{\n  "发展现状": "未闭合的文本\n\n' + json.dumps(complete, ensure_ascii=False)
+
+        self.assertEqual(parse_trend_response(response), parse_trend_response(complete))
+
+    def test_rejects_restart_without_all_trend_fields(self):
+        response = '{\n  "发展现状": "未闭合的文本\n\n{"发展现状": "缺少其他字段"}'
+
+        with self.assertRaises(json.JSONDecodeError):
+            parse_trend_response(response)
 
 
 if __name__ == "__main__":

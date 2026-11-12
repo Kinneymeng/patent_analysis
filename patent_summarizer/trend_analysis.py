@@ -140,18 +140,24 @@ class TrendAnalyzer:
         on_operation: Callable[[str, bool], None] | None,
     ) -> TrendReport:
         detail = f"{stats.first_level} / {stats.second_level}（{scope}）"
+        min_representatives = min(3, len(records))
+        max_representatives = min(5, len(records))
+        representative_count = str(min_representatives)
+        if min_representatives < max_representatives:
+            representative_count = f"{min_representatives} 到 {max_representatives}"
         _notify_operation(on_operation, detail, started=True)
-        response = self.client.chat(
-            TREND_SYSTEM_PROMPT,
+        payload = self._request_trend_payload(
+            detail,
             TREND_ANALYSIS_PROMPT.format(
                 scope=scope,
                 first_level=stats.first_level,
                 second_level=stats.second_level,
                 stats=json.dumps(_stats_payload(stats), ensure_ascii=False, indent=2),
                 patents=_patent_digest(records),
+                representative_count=representative_count,
             ),
         )
-        report = _report_from_payload(stats, parse_trend_response(response))
+        report = _report_from_payload(stats, payload)
         _notify_operation(on_operation, detail, started=False)
         return report
 
@@ -163,8 +169,8 @@ class TrendAnalyzer:
     ) -> TrendReport:
         detail = f"{stats.first_level} / {stats.second_level}（合并批次）"
         _notify_operation(on_operation, detail, started=True)
-        response = self.client.chat(
-            TREND_SYSTEM_PROMPT,
+        payload = self._request_trend_payload(
+            detail,
             TREND_MERGE_PROMPT.format(
                 first_level=stats.first_level,
                 second_level=stats.second_level,
@@ -172,9 +178,34 @@ class TrendAnalyzer:
                 batch_reports=json.dumps([_report_payload(report) for report in batch_reports], ensure_ascii=False, indent=2),
             ),
         )
-        report = _report_from_payload(stats, parse_trend_response(response))
+        report = _report_from_payload(stats, payload)
         _notify_operation(on_operation, detail, started=False)
         return report
+
+    def _request_trend_payload(self, detail: str, user_prompt: str) -> dict[str, str]:
+        prompt = user_prompt
+        for attempt in range(2):
+            response = self.client.chat(TREND_SYSTEM_PROMPT, prompt)
+            try:
+                payload = parse_trend_response(response)
+            except ValueError as exc:
+                invalidate = getattr(self.client, "invalidate", None)
+                if callable(invalidate):
+                    invalidate(TREND_SYSTEM_PROMPT, prompt, str(exc), response)
+                if attempt > 0:
+                    raise ValueError(f"{detail}的趋势 JSON 校验失败（已重试一次）：{exc}") from exc
+                prompt = (
+                    f"{user_prompt}\n\n上一次输出未通过 JSON 校验。解析错误为 {exc}。\n"
+                    "请根据原始证据重新生成一个完整的 JSON 对象。"
+                    "确保字符串正确闭合，转义字符串中的换行和制表符。"
+                )
+                continue
+            if attempt > 0:
+                store_validated = getattr(self.client, "store_validated", None)
+                if callable(store_validated):
+                    store_validated(TREND_SYSTEM_PROMPT, user_prompt, response)
+            return payload
+        raise AssertionError("unreachable")
 
 
 class TrendCheckpointStore:
@@ -292,7 +323,7 @@ def build_trend_groups(records: Iterable[TrendPatentRecord]) -> list[tuple[Trend
 
 
 def parse_trend_response(response: str | Mapping[str, Any]) -> dict[str, str]:
-    payload = response if isinstance(response, Mapping) else json.loads(_extract_json(response))
+    payload = response if isinstance(response, Mapping) else _load_trend_json(response)
     return {field: _stringify(payload.get(field, "")) for field in TREND_REPORT_FIELDS}
 
 
@@ -444,8 +475,24 @@ def _extract_json(text: str) -> str:
     start = stripped.find("{")
     end = stripped.rfind("}")
     if start == -1 or end == -1 or end < start:
-        raise ValueError(f"Trend response is not JSON: {text}")
+        raise ValueError("趋势响应中未找到完整的 JSON 对象")
     return stripped[start : end + 1]
+
+
+def _load_trend_json(text: str) -> Mapping[str, Any]:
+    candidate = _extract_json(text)
+    try:
+        return json.loads(candidate)
+    except json.JSONDecodeError:
+        # A model can restart the object on a new line after a malformed prefix.
+        for start in reversed(list(re.finditer(r"\n[ \t]*(?=\{)", candidate))):
+            try:
+                payload = json.loads(candidate[start.end() :])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict) and all(field in payload for field in TREND_REPORT_FIELDS):
+                return payload
+        raise
 
 
 def _optional_float(value: object) -> float | None:
