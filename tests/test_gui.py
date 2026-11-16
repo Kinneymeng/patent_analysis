@@ -22,6 +22,7 @@ from patent_summarizer.gui import (
     MODE_COMPARE,
     MODE_DISCLOSURE,
     MODE_ELEPHANT_HORSE,
+    MODE_POLISH,
     MODE_REPORT,
     MODE_SUMMARIZE,
     DISCLOSURE_SOURCE_IDEA,
@@ -143,7 +144,7 @@ class GuiCommandTests(unittest.TestCase):
             build_cli_argv("unknown", Path("D:/patents"), Path("D:/app"))
 
     def test_segmented_mode_options_map_labels_to_cli_modes(self):
-        self.assertEqual(MODE_OPTIONS, ["批量总结", "分类", "趋势分析", "报告", "技术交底书", "象马组合"])
+        self.assertEqual(MODE_OPTIONS, ["批量总结", "分类", "趋势分析", "报告", "技术交底书", "润色", "象马组合"])
         self.assertNotIn(MODE_COMPARE, VISIBLE_MODE_LABELS)
         self.assertEqual(mode_from_label("批量总结"), MODE_SUMMARIZE)
         self.assertEqual(mode_from_label("分类"), MODE_CLASSIFY)
@@ -151,6 +152,7 @@ class GuiCommandTests(unittest.TestCase):
         self.assertEqual(mode_from_label("对比"), MODE_COMPARE)
         self.assertEqual(mode_from_label("报告"), MODE_REPORT)
         self.assertEqual(mode_from_label("技术交底书"), MODE_DISCLOSURE)
+        self.assertEqual(mode_from_label("润色"), MODE_POLISH)
         self.assertEqual(mode_from_label("象马组合"), MODE_ELEPHANT_HORSE)
 
         with self.assertRaises(ValueError):
@@ -469,8 +471,11 @@ class PortableRuntimeFilesTests(unittest.TestCase):
                 directory.mkdir(parents=True)
             (dist / "PatentSummarizer.exe").write_bytes(b"exe")
             (prompt_dir / "common.md").write_text("rules", encoding="utf-8")
+            (prompt_dir / "polish.md").write_text("polishing rules", encoding="utf-8")
+            skill_path = prompt_dir / "humanizer-zh" / "SKILL.md"
             (license_dir / "LICENSE.txt").write_text("MIT", encoding="utf-8")
             (mermaid_license_dir / "MERMAID_LICENSE.txt").write_text("MIT", encoding="utf-8")
+            humanizer_license = mermaid_license_dir / "HUMANIZER_ZH_LICENSE.txt"
             (mermaid_license_dir / "THIRD_PARTY_NOTICES.md").write_text("notices", encoding="utf-8")
             (browser_dir / "chrome.exe").write_bytes(b"browser")
             (playwright_driver_dir / "node.exe").write_bytes(b"node")
@@ -480,6 +485,13 @@ class PortableRuntimeFilesTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
+            with self.assertRaisesRegex(FileNotFoundError, r"SKILL\.md"):
+                build_portable.verify_portable_application(dist)
+            skill_path.parent.mkdir()
+            skill_path.write_text("upstream polishing rules", encoding="utf-8")
+            with self.assertRaisesRegex(FileNotFoundError, "HUMANIZER_ZH_LICENSE.txt"):
+                build_portable.verify_portable_application(dist)
+            humanizer_license.write_text("MIT", encoding="utf-8")
             build_portable.verify_portable_application(dist)
 
             with patch(
@@ -497,7 +509,7 @@ class PortableRuntimeFilesTests(unittest.TestCase):
             with self.assertRaisesRegex(FileNotFoundError, "Chromium executable"):
                 build_portable.verify_portable_application(dist)
 
-    def test_user_guide_covers_all_five_visible_gui_tasks(self):
+    def test_user_guide_covers_disclosure_polishing(self):
         guide = Path("使用说明.md").read_text(encoding="utf-8")
 
         for heading in [
@@ -506,10 +518,11 @@ class PortableRuntimeFilesTests(unittest.TestCase):
             "## 六、趋势分析",
             "## 七、报告",
             "## 八、技术交底书",
+            "## 九、润色技术交底书",
         ]:
             self.assertIn(heading, guide)
         self.assertNotIn("## 七、对比", guide)
-        self.assertIn("五个任务标签", guide)
+        self.assertIn("_润色版.docx", guide)
         self.assertIn("无需先生成独立的对比 Excel", guide)
         self.assertIn("前置条件", guide)
         self.assertIn("使用方法", guide)

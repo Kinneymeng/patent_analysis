@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import base64
 import hashlib
 import json
@@ -23,14 +24,23 @@ MERMAID_URL = "https://cdnjs.cloudflare.com/ajax/libs/mermaid/11.12.0/mermaid.mi
 MERMAID_SHA512 = "5TKaYvhenABhlGIKSxAWLFJBZCSQw7HTV7aL1dJcBokM/+3PNtfgJFlv8E6Us/B1VMlQ4u8sPzjudL9TEQ06ww=="
 
 
-def main() -> int:
-    if DIST_APP.exists():
-        print(f"Output already exists: {DIST_APP}")
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Build the Windows portable application")
+    parser.add_argument("--distpath", type=Path, help="Parent directory for the new portable application")
+    parser.add_argument("--workpath", type=Path, help="Directory for PyInstaller build files")
+    args = parser.parse_args(argv)
+    dist_app = args.distpath.resolve() / DIST_APP.name if args.distpath else DIST_APP
+    if dist_app.exists():
+        print(f"Output already exists: {dist_app}")
         print("Move or remove that folder explicitly before rebuilding.")
         return 2
 
     build_env = os.environ.copy()
     build_env["PLAYWRIGHT_BROWSERS_PATH"] = str(PLAYWRIGHT_BROWSERS)
+    conda_bin = Path(sys.prefix) / "Library" / "bin"
+    if conda_bin.is_dir():
+        # Keep Tcl/Tk DLLs and scripts from the same environment when PyInstaller resolves imports.
+        build_env["PATH"] = os.pathsep.join((str(conda_bin), build_env.get("PATH", "")))
     ensure_mermaid_runtime()
     subprocess.run(
         [sys.executable, "-m", "playwright", "install", "chromium"],
@@ -38,15 +48,18 @@ def main() -> int:
         env=build_env,
         check=True,
     )
+    command = [sys.executable, "-m", "PyInstaller", "--distpath", str(dist_app.parent)]
+    if args.workpath:
+        command.extend(["--workpath", str(args.workpath.resolve())])
     subprocess.run(
-        [sys.executable, "-m", "PyInstaller", str(SPEC_FILE)],
+        [*command, str(SPEC_FILE)],
         cwd=ROOT,
         env=build_env,
         check=True,
     )
-    copy_runtime_files(DIST_APP)
-    verify_portable_application(DIST_APP, run_self_check=True)
-    print(f"Portable build ready: {DIST_APP}")
+    copy_runtime_files(dist_app)
+    verify_portable_application(dist_app, run_self_check=True)
+    print(f"Portable build ready: {dist_app}")
     return 0
 
 
@@ -119,8 +132,11 @@ def verify_portable_application(
         internal / "mermaid" / "mermaid.min.js",
         internal / "latex2mathml" / "unimathsymbols.txt",
         internal / "patent_summarizer" / "disclosure" / "prompts" / "common.md",
+        internal / "patent_summarizer" / "disclosure" / "prompts" / "polish.md",
+        internal / "patent_summarizer" / "disclosure" / "prompts" / "humanizer-zh" / "SKILL.md",
         internal / "patent_summarizer" / "disclosure" / "cnipa_upstream" / "LICENSE.txt",
         internal / "patent_summarizer" / "disclosure" / "MERMAID_LICENSE.txt",
+        internal / "patent_summarizer" / "disclosure" / "HUMANIZER_ZH_LICENSE.txt",
         internal / "patent_summarizer" / "disclosure" / "THIRD_PARTY_NOTICES.md",
     )
     missing = [path for path in required if not path.exists()]
@@ -163,8 +179,7 @@ def verify_portable_application(
             except (OSError, ValueError) as exc:
                 detail = f"diagnostic report could not be read: {exc}"
         raise RuntimeError(
-            "Packaged application self-check failed: Playwright, Mermaid, Pillow, "
-            "latex2mathml, DOCX, or Chinese-path output is unavailable; " + detail
+            "Packaged application self-check failed: " + detail
         )
     if report_path.exists():
         report_path.unlink()

@@ -43,6 +43,7 @@ MODE_ANALYZE = "analyze"
 MODE_COMPARE = "compare"
 MODE_REPORT = "report"
 MODE_DISCLOSURE = "disclosure"
+MODE_POLISH = "polish"
 MODE_ELEPHANT_HORSE = "elephant-horse"
 
 MODE_LABELS = {
@@ -52,6 +53,7 @@ MODE_LABELS = {
     MODE_COMPARE: "对比",
     MODE_REPORT: "报告",
     MODE_DISCLOSURE: "技术交底书",
+    MODE_POLISH: "润色",
     MODE_ELEPHANT_HORSE: "象马组合",
 }
 VISIBLE_MODE_LABELS = {
@@ -481,6 +483,7 @@ class PatentSummarizerApp(ctk.CTk):
         self.disclosure_prior_art_var = ctk.BooleanVar(value=False)
         self.disclosure_resume_var = ctk.BooleanVar(value=True)
         self.disclosure_output_dir_var = ctk.StringVar()
+        self.polish_input_var = ctk.StringVar()
         self.elephant_horse_report_var = ctk.StringVar()
         self.elephant_horse_output_var = ctk.StringVar()
         self.elephant_horse_expanded_var = ctk.BooleanVar(value=False)
@@ -503,6 +506,7 @@ class PatentSummarizerApp(ctk.CTk):
         self.disclosure_project_var.trace_add("write", lambda *_args: self.after_idle(self._refresh_start_state))
         self.disclosure_material_var.trace_add("write", lambda *_args: self.after_idle(self._refresh_start_state))
         self.disclosure_output_dir_var.trace_add("write", lambda *_args: self.after_idle(self._refresh_start_state))
+        self.polish_input_var.trace_add("write", lambda *_args: self.after_idle(self._refresh_start_state))
         self.elephant_horse_report_var.trace_add("write", lambda *_args: self.after_idle(self._refresh_elephant_horse_readiness))
         self.elephant_horse_output_var.trace_add("write", lambda *_args: self.after_idle(self._refresh_start_state))
 
@@ -581,7 +585,7 @@ class PatentSummarizerApp(ctk.CTk):
             button = ctk.CTkButton(
                 self.mode_group,
                 text=label,
-                width=104,
+                width=92,
                 height=38,
                 corner_radius=10,
                 border_width=1,
@@ -689,6 +693,8 @@ class PatentSummarizerApp(ctk.CTk):
             self._render_portfolio_config()
         elif self._selected_mode() == MODE_DISCLOSURE:
             self._render_disclosure_config()
+        elif self._selected_mode() == MODE_POLISH:
+            self._render_polish_config()
         elif self._selected_mode() == MODE_ELEPHANT_HORSE:
             self._render_elephant_horse_config()
         else:
@@ -696,6 +702,7 @@ class PatentSummarizerApp(ctk.CTk):
         self.start_button.configure(
             text=(
                 "生成候选方案" if self._selected_mode() == MODE_DISCLOSURE
+                else "开始润色" if self._selected_mode() == MODE_POLISH
                 else "生成象马组合报告" if self._selected_mode() == MODE_ELEPHANT_HORSE
                 else "开始运行"
             )
@@ -881,6 +888,27 @@ class PatentSummarizerApp(ctk.CTk):
             width=104,
             secondary=True,
         ).grid(row=1, column=1)
+
+    def _render_polish_config(self) -> None:
+        section = ctk.CTkFrame(self.config_frame, fg_color="transparent")
+        section.grid(row=0, column=0, sticky="ew")
+        section.grid_columnconfigure(0, weight=1)
+        self._section_label(section, "技术交底书 DOCX").grid(
+            row=0, column=0, columnspan=2, sticky="w", pady=(0, 7)
+        )
+        self.polish_entry = self._entry(section, self.polish_input_var)
+        self.polish_entry.grid(row=1, column=0, sticky="ew", padx=(0, 10))
+        self.polish_browse_button = self._button(
+            section, "选择文件", self._choose_polish_input, width=104, secondary=True
+        )
+        self.polish_browse_button.grid(row=1, column=1)
+
+    def _choose_polish_input(self) -> None:
+        selected = filedialog.askopenfilename(
+            title="选择要润色的技术交底书", filetypes=[("Word 文档", "*.docx")], parent=self
+        )
+        if selected:
+            self.polish_input_var.set(selected)
 
     def _render_elephant_horse_config(self) -> None:
         report_section = ctk.CTkFrame(self.config_frame, fg_color="transparent")
@@ -1281,6 +1309,9 @@ class PatentSummarizerApp(ctk.CTk):
         if self._selected_mode() == MODE_DISCLOSURE:
             self._start_disclosure_task()
             return
+        if self._selected_mode() == MODE_POLISH:
+            self._start_polish_task()
+            return
         if self._selected_mode() == MODE_ELEPHANT_HORSE:
             self._start_elephant_horse_task()
             return
@@ -1363,6 +1394,27 @@ class PatentSummarizerApp(ctk.CTk):
             return "象马组合报告必须使用 .docx 扩展名。"
         if output.resolve() == Path(report_value).resolve():
             return "象马组合输出不能覆盖输入分析报告。"
+        return None
+
+    def _start_polish_task(self) -> None:
+        error = self._polish_validation_error()
+        if error:
+            messagebox.showerror("无法运行", error, parent=self)
+            return
+        env_file = get_app_dir() / ".env"
+        if not env_file.is_file():
+            messagebox.showerror("缺少配置", f"未找到配置文件：{env_file}", parent=self)
+            return
+        argv = ["polish", "--input", self.polish_input_var.get().strip(), "--env-file", str(env_file)]
+        self._set_running(True)
+        self._clear_log()
+        self.worker = threading.Thread(target=self._run_cli, args=(argv,), daemon=True)
+        self.worker.start()
+
+    def _polish_validation_error(self) -> str | None:
+        value = self.polish_input_var.get().strip()
+        if not value or Path(value).suffix.lower() != ".docx" or not Path(value).is_file():
+            return "请选择一份存在的技术交底书 DOCX。"
         return None
 
     def _start_disclosure_task(self) -> None:
@@ -2167,8 +2219,12 @@ class PatentSummarizerApp(ctk.CTk):
 
     def _set_running(self, running: bool) -> None:
         self.running = running
+        state = "disabled" if running else "normal"
         for button in self.mode_buttons.values():
-            button.configure(state="disabled" if running else "normal")
+            button.configure(state=state)
+        if self._selected_mode() == MODE_POLISH:
+            self.polish_entry.configure(state=state)
+            self.polish_browse_button.configure(state=state)
         if running:
             self.start_button.configure(state="disabled")
             self.status_var.set("正在运行，请等待...")
@@ -2184,6 +2240,10 @@ class PatentSummarizerApp(ctk.CTk):
             error = self._disclosure_validation_error()
             self.start_button.configure(state="disabled" if error else "normal")
             self.status_var.set(error or "技术来源已就绪，可以生成候选方案")
+        elif self._selected_mode() == MODE_POLISH:
+            error = self._polish_validation_error()
+            self.start_button.configure(state="disabled" if error else "normal")
+            self.status_var.set(error or "已选择交底书，润色版将保存到原目录")
         elif self._selected_mode() == MODE_ELEPHANT_HORSE:
             error = self._elephant_horse_validation_error()
             self.start_button.configure(state="disabled" if error else "normal")
@@ -2262,6 +2322,9 @@ class PatentSummarizerApp(ctk.CTk):
                     self._select_mode(MODE_DISCLOSURE)
         else:
             previous = self.last_progress_update
+            if finished_mode == MODE_POLISH and previous and previous.state == "error":
+                self.status_var.set(previous.stage)
+                return
             self._apply_progress(
                 ProgressUpdate(
                     mode=self._selected_mode(),

@@ -262,7 +262,7 @@ conda run -n temp python -m pip install pypandoc-binary pyinstaller customtkinte
 conda run -n temp python build_portable.py
 ```
 
-构建脚本在完成后运行打包 EXE 自检，实际启动随包 Chromium，并检查 Mermaid、Pillow、`latex2mathml`、DOCX 和中文路径写入。自检失败时不会把该目录报告为可交付版本。构建结果位于 `dist\PatentSummarizer\`，包含：
+构建完成后，EXE 会自检 Tcl、随包 Chromium、Mermaid、Pillow、`latex2mathml`、中文路径写入及 DOCX 润色读写。润色自检使用模拟响应。默认构建目录为 `dist\PatentSummarizer\`，包含：
 
 - `PatentSummarizer.exe`：主程序。
 - `.env`：API 配置。若项目根目录没有 `.env`，构建脚本会复制 `.env.example` 作为模板。
@@ -272,7 +272,7 @@ conda run -n temp python build_portable.py
 - `使用说明.md`：面向普通使用人员的完整操作指南。
 - `_internal\`：EXE 运行依赖，包含 CustomTkinter、Python 运行库、Pandoc、Chromium、本地 Mermaid 运行时及第三方许可证等文件。
 
-使用时把整个 `dist\PatentSummarizer\` 文件夹复制给使用者，不要只复制 EXE。GUI 提供五项任务；独立组合对比仅保留为前文所述的 CLI `compare` 命令：
+使用时复制整个 `dist\PatentSummarizer\` 文件夹。独立组合对比可使用前文所述的 CLI `compare` 命令。GUI 任务包括：
 
 - “批量总结”“分类”“趋势分析”继续使用单个专利目录。
 - “报告”使用一个目标组合及一个或多个竞争对手组合。名称默认取文件夹名，也可以改成报告中使用的正式名称；所有名称必须非空且不能重复。报告会在内部完成所需的组合对比分析，无需先生成独立的对比 Excel。
@@ -281,10 +281,13 @@ conda run -n temp python build_portable.py
 - “报告”默认输出 `<目标名称>_专利布局分析报告.docx`，保存到目标目录并可通过“另存为”修改。
 - “报告”固定使用便携包内置的 `汽车底盘领域专利布局分析报告模板.docx`。
 - “技术交底书”支持导入分析报告、直接输入发明构想或扫描项目材料，前两种来源可附加项目目录。查新默认关闭；候选方向和完整技术方案分别经过一次确认。
+- “润色”支持手动导入本工具生成的技术交底书 DOCX，使用已配置的模型润色摘要和正文，并在原目录另存 `<原文件名>_润色版.docx`。源码环境下也可运行 `python -m patent_summarizer polish --input <docx> [--env-file <path>]`。
+
+“润色”会从随包文件 `patent_summarizer/disclosure/prompts/humanizer-zh/SKILL.md` 读取 Humanizer-zh 的完整规则和示例，与 `polish.md` 中的交底书约束一并发送给模型。离线部署时，将 `.env` 的 `OPENAI_BASE_URL` 指向可访问的本地 OpenAI 兼容接口，并配置该服务的模型名称和认证参数。模型上下文需要容纳完整规则、当前批次正文和改写输出。
 
 完整的逐步说明、前置条件和常见问题请查看根目录的 [使用说明.md](使用说明.md)。
 
-如果 `dist\PatentSummarizer\` 已存在，`build_portable.py` 会停止，避免覆盖已有便携包。需要重新打包时，先手动备份、改名或清理旧的构建输出，再重新运行打包命令。
+如果 `dist\PatentSummarizer\` 已存在，可用 `python build_portable.py --distpath dist\new --workpath build\new` 在独立目录构建新版。
 
 ### 可清理文件
 

@@ -30,5 +30,5 @@ patent-summarizer-gui = "patent_summarizer.gui:launch"
 include = ["patent_summarizer*"]
 
 [tool.setuptools.package-data]
-"patent_summarizer.disclosure" = ["prompts/*.md", "THIRD_PARTY_NOTICES.md", "MERMAID_LICENSE.txt"]
+"patent_summarizer.disclosure" = ["prompts/*.md", "prompts/humanizer-zh/SKILL.md", "THIRD_PARTY_NOTICES.md", "MERMAID_LICENSE.txt", "HUMANIZER_ZH_LICENSE.txt"]
 "patent_summarizer.disclosure.cnipa_upstream" = ["LICENSE.txt"]

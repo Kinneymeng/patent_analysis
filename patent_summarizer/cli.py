@@ -10,6 +10,7 @@ from .comparison import ComparisonAnalyzer, load_or_build_portfolio
 from .comparison_excel_export import write_comparison_workbook
 from .config import ConfigError, load_config
 from .discovery import discover_documents, inspect_summary_coverage
+from .disclosure_polish import PolishError, polish_disclosure_docx
 from .disclosure import (
     CnipaPriorArtSearcher,
     ConflictPolicy,
@@ -50,7 +51,7 @@ from .elephant_horse import (
 )
 from .elephant_horse_docx import write_elephant_horse_report
 from .excel_export import write_classification_workbook
-from .llm import RateLimitedOpenAIClient
+from .llm import HttpResponseError, RateLimitedOpenAIClient
 from .logging_utils import RunLogger
 from .processor import PatentProcessor, ProcessingResult
 from .progress import ProgressCallback, ProgressTracker
@@ -109,6 +110,8 @@ def main(
             preview_review=disclosure_preview_review,
             prior_art_failure=disclosure_prior_art_failure,
         )
+    if args.command == "polish":
+        return polish(args, progress=progress)
     parser.print_help()
     return 2
 
@@ -251,7 +254,48 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_false",
         help="Ignore semantic workflow checkpoints and regenerate model stages",
     )
+
+    polish_parser = subparsers.add_parser("polish", help="Polish a generated engineering disclosure DOCX")
+    polish_parser.add_argument("--input", required=True, type=Path, help="Existing technical disclosure DOCX")
+    polish_parser.add_argument("--env-file", type=Path, default=Path(".env"), help="Path to .env config file")
     return parser
+
+
+def polish(args: argparse.Namespace, progress: ProgressCallback | None = None) -> int:
+    tracker = ProgressTracker("polish", progress)
+    tracker.preparing("正在准备润色", "正在读取技术交底书 DOCX")
+    try:
+        config = load_config(env_path=args.env_file)
+        client = RateLimitedOpenAIClient(
+            base_url=config.base_url,
+            api_key=config.api_key,
+            model=config.model,
+            rpm=config.api_rpm,
+            max_retries=config.max_retries,
+            timeout=config.api_timeout_seconds,
+        )
+        result = polish_disclosure_docx(args.input, client, tracker)
+    except (ConfigError, PolishError) as exc:
+        print(f"FAIL\t{type(exc).__name__}\t{exc}")
+        tracker.fail("润色失败", str(exc))
+        return 2 if isinstance(exc, ConfigError) else 1
+    except Exception as exc:
+        # API response bodies can contain source text. Report the error type/status only.
+        detail = type(exc).__name__
+        if isinstance(exc, HttpResponseError):
+            detail += f" (HTTP {exc.status_code})"
+        print(f"FAIL\t{detail}")
+        tracker.fail("润色失败", detail)
+        return 1
+
+    print(f"OK\t{result.output}")
+    if result.rejected:
+        print(f"WARNING\t{result.rejected} 段未通过校验，已保留原文。")
+    if not result.changed:
+        print("INFO\t没有可采用的改写，副本保留原文。" if result.eligible else "INFO\t未发现可润色的普通正文段落，已保存原文副本。")
+    stage = "润色完成（有警告）" if result.rejected else "润色完成"
+    tracker.succeed(stage, str(result.output))
+    return 0
 
 
 def elephant_horse(

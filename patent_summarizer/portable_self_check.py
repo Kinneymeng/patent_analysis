@@ -4,9 +4,11 @@ import os
 import json
 import sys
 import tempfile
+import tkinter
 import traceback
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 
 
 def _write_report(path: Path | None, payload: dict[str, object]) -> None:
@@ -48,6 +50,18 @@ def run_portable_self_check(report_path: Path | None = None) -> int:
         from .disclosure.cnipa_upstream.browser import probe_launch
         from .disclosure.diagrams import _render_with_pillow, render_mermaid_flowchart
         from .disclosure.math_to_omml import latex_to_omml_with_fallback
+        from .disclosure.models import TechnicalDisclosure
+        from .disclosure.prompt_loader import load_prompt
+        from .disclosure_docx import build_technical_disclosure_document
+        from .disclosure_polish import polish_disclosure_docx
+        from .progress import ProgressTracker
+
+        begin("load_polishing_rules")
+        upstream_rules = load_prompt("humanizer-zh/SKILL.md").split("\n---\n", 1)[1].lstrip()
+        disclosure_constraints = load_prompt("polish.md").rstrip()
+
+        begin("initialize_tcl")
+        tkinter.Tcl()
 
         begin("launch_bundled_browser")
         previous_channel = os.environ.get("PATENT_BROWSER_CHANNEL")
@@ -117,6 +131,24 @@ def run_portable_self_check(report_path: Path | None = None) -> int:
             )
             if "技术交底书自检" not in markdown_path.read_text(encoding="utf-8"):
                 raise RuntimeError("Markdown round-trip failed")
+
+            begin("polish_disclosure_docx")
+            disclosure = TechnicalDisclosure("控制器自检", "控制器进行状态校验。", ())
+            build_technical_disclosure_document(disclosure).save(docx_path)
+
+            def fake_chat(system_prompt: str, user_prompt: str) -> str:
+                if system_prompt != f"{disclosure_constraints}\n\n{upstream_rules}":
+                    raise RuntimeError("polishing request did not include the complete Humanizer-zh rules")
+                paragraphs = json.loads(user_prompt)["paragraphs"]
+                paragraphs[0]["text"] = "控制器校验状态。"
+                return json.dumps({"paragraphs": paragraphs})
+
+            result = polish_disclosure_docx(docx_path, SimpleNamespace(chat=fake_chat), ProgressTracker("polish"))
+            try:
+                if result.changed != 1 or Document(result.output).paragraphs[2].text != "控制器校验状态。":
+                    raise RuntimeError("polishing round-trip failed")
+            finally:
+                result.output.unlink()
         finally:
             stage_before_cleanup = stage
             for path in (mermaid_png, pillow_png, docx_path, markdown_path):

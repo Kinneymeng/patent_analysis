@@ -17,3 +17,4 @@ dist_palette/
 tests/*
 !tests/test_disclosure.py
 !tests/test_elephant_horse.py
+!tests/test_disclosure_polish.py
