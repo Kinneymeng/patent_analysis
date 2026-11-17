@@ -84,8 +84,13 @@ def _add_legacy_disclosure(document: DocumentType, disclosure: TechnicalDisclosu
 
 
 def _add_structured_disclosure(document: DocumentType, disclosure: TechnicalDisclosure) -> None:
-    _add_paragraph(document, "研发技术交底书", alignment=WD_ALIGN_PARAGRAPH.CENTER, bold=True, outline_level=BODY_OUTLINE_LEVEL, font_size=Pt(18))
+    heading = "研发技术交底书（审阅稿）" if disclosure.review_items else "研发技术交底书"
+    _add_paragraph(document, heading, alignment=WD_ALIGN_PARAGRAPH.CENTER, bold=True, outline_level=BODY_OUTLINE_LEVEL, font_size=Pt(18))
     _add_paragraph(document, disclosure.title, alignment=WD_ALIGN_PARAGRAPH.CENTER, bold=True, font_size=Pt(16))
+    if disclosure.review_items:
+        _add_paragraph(document, "待确认事项", alignment=WD_ALIGN_PARAGRAPH.LEFT, bold=True)
+        for item in disclosure.review_items:
+            _add_paragraph(document, f"{item.message}。{item.action}", alignment=WD_ALIGN_PARAGRAPH.LEFT)
     _add_paragraph(document, "摘要", alignment=WD_ALIGN_PARAGRAPH.LEFT, bold=True, outline_level=SECTION_OUTLINE_LEVEL)
     _add_paragraph(document, disclosure.abstract, alignment=WD_ALIGN_PARAGRAPH.JUSTIFY, first_line_chars=FIRST_LINE_CHARS)
     for section in disclosure.sections:
@@ -97,6 +102,9 @@ def _add_structured_disclosure(document: DocumentType, disclosure: TechnicalDisc
             for text in subsection.paragraphs:
                 _add_paragraph(document, text, alignment=WD_ALIGN_PARAGRAPH.JUSTIFY, first_line_chars=FIRST_LINE_CHARS)
         for diagram in (item for item in disclosure.diagrams if item.section_number == section.number):
+            if diagram.image_path is None and disclosure.review_items:
+                _add_paragraph(document, f"{diagram.title}【待补】图示未能渲染。", alignment=WD_ALIGN_PARAGRAPH.CENTER)
+                continue
             if diagram.image_path is None or not diagram.image_path.is_file():
                 raise ValueError(f"图示尚未成功生成：{diagram.title}")
             paragraph = document.add_paragraph()
@@ -192,7 +200,12 @@ def validate_technical_disclosure_docx(path: Path, expected: TechnicalDisclosure
     if not expected.is_structured:
         _validate_legacy_document(document, expected)
         return
-    expected_texts = ["研发技术交底书", expected.title, "摘要", expected.abstract]
+    heading = "研发技术交底书（审阅稿）" if expected.review_items else "研发技术交底书"
+    expected_texts = [heading, expected.title]
+    if expected.review_items:
+        expected_texts.append("待确认事项")
+        expected_texts.extend(f"{item.message}。{item.action}" for item in expected.review_items)
+    expected_texts.extend(("摘要", expected.abstract))
     for section in expected.sections:
         expected_texts.append(f"{section.number}、{section.title}")
         expected_texts.extend(section.paragraphs)
@@ -200,7 +213,8 @@ def validate_technical_disclosure_docx(path: Path, expected: TechnicalDisclosure
             expected_texts.append(f"{subsection.number} {subsection.title}")
             expected_texts.extend(subsection.paragraphs)
         expected_texts.extend(
-            item.title for item in expected.diagrams if item.section_number == section.number
+            f"{item.title}【待补】图示未能渲染。" if item.image_path is None and expected.review_items else item.title
+            for item in expected.diagrams if item.section_number == section.number
         )
         for formula in (item for item in expected.formulas if item.section_number == section.number):
             expected_texts.append(formula.description)
@@ -216,7 +230,7 @@ def validate_technical_disclosure_docx(path: Path, expected: TechnicalDisclosure
     actual_texts = [paragraph.text for paragraph in document.paragraphs if paragraph.text]
     if actual_texts != expected_texts:
         raise ValueError("技术交底书 DOCX 的标题、正文、图题、公式或表题内容不一致")
-    if len(document.inline_shapes) != len(expected.diagrams):
+    if len(document.inline_shapes) != sum(item.image_path is not None for item in expected.diagrams):
         raise ValueError("技术交底书 DOCX 的图示数量不匹配")
     if len(document.tables) != len(expected.tables):
         raise ValueError("技术交底书 DOCX 的参数表数量不匹配")

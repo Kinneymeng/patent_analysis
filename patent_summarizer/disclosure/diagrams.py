@@ -21,6 +21,7 @@ def render_disclosure_diagrams(
     assets_dir: Path,
     *,
     diagnostics: list[DisclosureDiagnostic] | None = None,
+    allow_unrendered: bool = False,
 ) -> TechnicalDisclosure:
     if not disclosure.diagrams:
         return disclosure
@@ -33,6 +34,7 @@ def render_disclosure_diagrams(
                 assets_dir,
                 runtime,
                 diagnostics,
+                allow_unrendered=allow_unrendered,
             )
         except RuntimeError as exc:
             browser_error = str(exc)
@@ -44,6 +46,10 @@ def render_disclosure_diagrams(
         try:
             _render_with_pillow(_normalize_mermaid(diagram.mermaid), output, diagram.title)
         except Exception as exc:
+            if allow_unrendered:
+                _record_unrendered(diagnostics, diagram.title, str(exc))
+                rendered.append(diagram)
+                continue
             raise RuntimeError(
                 f"Mermaid 与备用图示转换均失败：{browser_error}；Pillow: {exc}"
             ) from exc
@@ -57,6 +63,8 @@ def _render_diagrams_with_shared_browser(
     assets_dir: Path,
     runtime: Path,
     diagnostics: list[DisclosureDiagnostic] | None,
+    *,
+    allow_unrendered: bool,
 ) -> TechnicalDisclosure:
     try:
         from playwright.sync_api import sync_playwright
@@ -91,6 +99,10 @@ def _render_diagrams_with_shared_browser(
                                 diagram.title,
                             )
                         except Exception as exc:
+                            if allow_unrendered:
+                                _record_unrendered(diagnostics, diagram.title, str(exc))
+                                rendered.append(diagram)
+                                continue
                             raise RuntimeError(
                                 f"{diagram.title} 的 Mermaid 与 Pillow 转换均失败："
                                 + "；".join(errors)
@@ -110,6 +122,16 @@ def _render_diagrams_with_shared_browser(
     except Exception as exc:
         raise RuntimeError(f"Mermaid 共享浏览器启动或渲染失败：{exc}") from exc
     return replace(disclosure, diagrams=tuple(rendered))
+
+
+def _record_unrendered(
+    diagnostics: list[DisclosureDiagnostic] | None, title: str, error: str
+) -> None:
+    if diagnostics is not None:
+        diagnostics.append(DisclosureDiagnostic(
+            "diagram-export", "diagram-unrendered", f"{title} 无法生成图片：{error}",
+            "已在对应位置保留图题及待补提示，Markdown 附原图源", requires_review=True,
+        ))
 
 
 def render_mermaid_flowchart(

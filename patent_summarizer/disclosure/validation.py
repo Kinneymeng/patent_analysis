@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
 from dataclasses import asdict, replace
 from typing import Any, Mapping
 
@@ -223,6 +224,8 @@ def validate_engineering_language(disclosure: TechnicalDisclosure) -> None:
 def validate_disclosure_against_preview(
     disclosure: TechnicalDisclosure,
     preview: DisclosurePreview,
+    *,
+    allow_missing_diagrams: bool = False,
 ) -> None:
     corpus = "\n".join(
         [
@@ -264,7 +267,7 @@ def validate_disclosure_against_preview(
     missing_modules = [
         module.name for module in preview.modules if module.name not in architecture_sources
     ]
-    if missing_modules:
+    if missing_modules and (architecture_sources or not allow_missing_diagrams):
         raise ValueError("系统架构图遗漏用户确认的模块：" + "、".join(missing_modules))
 
     flow_sources = "\n".join(
@@ -276,7 +279,7 @@ def validate_disclosure_against_preview(
         if (match := re.match(r"\s*S\d+\b", step, flags=re.IGNORECASE))
     ]
     missing_steps = [step_id for step_id in step_ids if step_id not in flow_sources.upper()]
-    if missing_steps:
+    if missing_steps and (flow_sources or not allow_missing_diagrams):
         raise ValueError("流程图遗漏用户确认的步骤编号：" + "、".join(missing_steps))
 
     for parameter in preview.suggested_parameters:
@@ -287,12 +290,10 @@ def validate_disclosure_against_preview(
 
     prior_art = preview.prior_art
     if prior_art.status in {PriorArtStatus.DISABLED, PriorArtStatus.FAILED}:
-        false_claims = ("已经查新", "经查新", "未发现相似专利", "没有相似专利")
-        if any(value in corpus for value in false_claims):
+        if any(unsupported_prior_art_claim(clause, prior_art.status) for clause in split_claims(corpus)):
             raise ValueError("查新未启用或未完成时不得声称已经查新或没有相似专利")
     elif prior_art.status == PriorArtStatus.EMPTY:
-        overbroad_claims = ("未发现相似专利", "没有相似专利", "不存在相似专利")
-        if any(value in corpus for value in overbroad_claims):
+        if any(unsupported_prior_art_claim(clause, prior_art.status) for clause in split_claims(corpus)):
             raise ValueError("查新无结果只代表本次检索范围内未筛选出记录，不得断言没有相似专利")
         required_search_details = [prior_art.searched_at, *prior_art.keywords]
         missing_details = [value for value in required_search_details if value and value not in corpus]
@@ -546,9 +547,9 @@ def _mermaid_label(value: str) -> str:
 
 def _dedupe_diagnostics(values: list[DisclosureDiagnostic]) -> list[DisclosureDiagnostic]:
     result: list[DisclosureDiagnostic] = []
-    seen: set[tuple[str, str]] = set()
+    seen: set[tuple[str, str, str]] = set()
     for item in values:
-        key = (item.stage, item.code)
+        key = (item.stage, item.code, item.message if item.requires_review else "")
         if key not in seen:
             seen.add(key)
             result.append(item)
@@ -561,30 +562,81 @@ def validate_effect_claims(disclosure: TechnicalDisclosure, source_context: str)
     effect = next((item for item in disclosure.sections if item.number == "四"), None)
     if effect is None:
         return
-    text = "\n".join(
-        [
-            *effect.paragraphs,
-            *[paragraph for subsection in effect.subsections for paragraph in subsection.paragraphs],
-        ]
-    )
-    verified_markers = ("实测", "试验表明", "测试结果", "验证结果", "已经验证", "已验证")
-    if any(marker in text for marker in verified_markers) and not any(
-        marker in source_context for marker in verified_markers
+    for paragraph in (*effect.paragraphs, *(p for sub in effect.subsections for p in sub.paragraphs)):
+        for clause in split_claims(paragraph):
+            if problem := effect_claim_problem(clause, source_context):
+                raise ValueError(problem)
+
+
+def split_claims(text: str) -> list[str]:
+    # Keep punctuation so callers can replace an individual clause without
+    # rewriting adjacent prose or splitting decimals and numeric ranges.
+    return re.split(r"([。；;！？\n]|[，,](?=\s*(?:但|而|然而|不过|实测|台架|试验|测试|验证)))", text)
+
+
+_MEASURED_RESULT = re.compile(
+    r"(?:实测|试验|测试|验证)(?:结果)?\s*(?:表明|显示|证实|证明)|"
+    r"(?:已经|已)(?:过|完成)?(?:实测|验证)|"
+    r"经(?:台架|实车)?(?:实测|试验|测试|验证)(?:得出|确认|[，,]|$)|"
+    r"(?:实测|试验|测试|验证)结果[：:]"
+)
+_MEASURED_CHANGE = re.compile(r"实测[^，、。；]{0,18}(?:降低|下降|提高|提升|改善|减少|缩短|优于)")
+_UNVERIFIED = re.compile(
+    r"(?:未|没有|尚无|缺少|不构成|不代表|不等于|不能|不得|不应)[^，。；]{0,24}"
+    r"(?:实测|试验|测试|验证)|(?:尚需|需要|需|待|计划|拟|建议)[^，。；]{0,16}"
+    r"(?:实测|试验|测试|验证)|需(?:进一步)?(?:测试|验证)|尚待"
+)
+_RESULT_AMOUNT = re.compile(
+    r"(?:降低|下降|提高|提升|改善|减少|缩短|达到|增至|降至|优于|控制在)"
+    r"[^，、。；\d]{0,8}(\d+(?:\.\d+)?\s*(?:%|％|ms|毫秒|倍|℃|°C))",
+    re.IGNORECASE,
+)
+_EXPECTED_RESULT = re.compile(r"预期|预计|期望|待验证|建议|示例|目标")
+
+
+def effect_claim_problem(clause: str, source_context: str) -> str | None:
+    measured = _MEASURED_RESULT.search(clause)
+    amount = _RESULT_AMOUNT.search(clause)
+    conditional = re.search(r"(?:如果|当|若).+|[，,]\s*则|阈值|限幅", clause)
+    if not measured and not conditional:
+        measured = _MEASURED_CHANGE.search(clause)
+    if not measured and not amount:
+        return None
+    # An earlier negative/prospective qualifier must govern the result itself.
+    if any(match.start() <= (measured or amount).start() for match in _UNVERIFIED.finditer(clause)):
+        return None
+    if not measured and (
+        _EXPECTED_RESULT.search(clause) or _UNVERIFIED.search(clause)
+        or conditional
     ):
-        raise ValueError("来源材料没有验证记录，不得把预期技术效果写成已经实测或验证的结果")
-    expected_markers = ("预期", "预计", "待验证", "建议", "示例", "目标")
-    for sentence in re.split(r"[。；;\n]", text):
-        values = re.findall(
-            r"\d+(?:\.\d+)?\s*(?:%|％|ms|毫秒|倍|℃|°C)",
-            sentence,
-            flags=re.IGNORECASE,
-        )
-        unsupported = [value for value in values if value not in source_context]
-        if unsupported and not any(marker in sentence for marker in expected_markers):
-            raise ValueError(
-                "来源材料不支持量化技术效果，必须标为预期或待验证："
-                + "、".join(unsupported)
-            )
+        return None
+    normalized = _effect_evidence_text(clause)
+    # Use the source assertion itself as evidence rather than accepting an
+    # unrelated occurrence of the word 实测 or of the same number.
+    if len(normalized) >= 6:
+        for evidence in split_claims(source_context):
+            if _UNVERIFIED.search(evidence) or _EXPECTED_RESULT.search(evidence):
+                continue
+            if normalized in _effect_evidence_text(evidence):
+                return None
+    if measured:
+        return "来源材料没有验证记录，不得把预期技术效果写成已经实测或验证的结果"
+    return f"来源材料不支持量化技术效果，必须标为预期或待验证：{amount.group(1)}"
+
+
+def _effect_evidence_text(value: str) -> str:
+    return re.sub(r"\s+", "", unicodedata.normalize("NFKC", value)).casefold()
+
+
+def unsupported_prior_art_claim(clause: str, status: PriorArtStatus) -> bool:
+    if re.search(r"(?:尚未|未启用|未完成|未进行|待|无法|不能|不得|不表示|不代表)"
+                 r"[^，。；]{0,10}(?:查新|相似专利)", clause):
+        return False
+    if re.search(r"(?:未发现|没有|不存在)(?:任何)?相似专利", clause):
+        return True
+    return status in {PriorArtStatus.DISABLED, PriorArtStatus.FAILED} and bool(
+        re.search(r"(?:已经|已完成|完成|经|通过|已)查新|查新(?:表明|结果表明)", clause)
+    )
 
 
 def disclosure_to_payload(disclosure: TechnicalDisclosure) -> dict[str, Any]:
@@ -744,7 +796,7 @@ def _parse_sections(raw: Any) -> tuple[DisclosureSection, ...]:
     return tuple(sections)
 
 
-def _parse_diagrams(raw: Any) -> tuple[DisclosureDiagram, ...]:
+def _parse_diagrams(raw: Any, *, require_kinds: bool = True) -> tuple[DisclosureDiagram, ...]:
     if not isinstance(raw, list):
         raise ValueError("图示必须是数组")
     diagrams: list[DisclosureDiagram] = []
@@ -760,7 +812,7 @@ def _parse_diagrams(raw: Any) -> tuple[DisclosureDiagram, ...]:
             mermaid=mermaid,
         ))
     kinds = {item.kind for item in diagrams}
-    if "系统架构图" not in kinds or "流程图" not in kinds:
+    if require_kinds and not {"系统架构图", "流程图"} <= kinds:
         raise ValueError("完整交底书必须同时包含系统架构图和流程图")
     return tuple(diagrams)
 
@@ -847,9 +899,24 @@ def _validate_cross_references(disclosure: TechnicalDisclosure) -> None:
     labels = [item.label for item in disclosure.formulas]
     if len(labels) != len(set(labels)):
         raise ValueError("公式编号不得重复")
+    for formula, missing_symbols in undefined_formula_symbols(disclosure):
+        raise ValueError(
+            f"{formula.label}存在未定义符号：" + "、".join(missing_symbols)
+        )
+
+
+_INDEXED_SYMBOL_RANGE = re.compile(
+    r"(?<![A-Za-z0-9_])([A-Za-z][A-Za-z0-9]*)_(\d+)\s*(?:至|到|[~～–—-])\s*"
+    r"\1_(\d+)(?![A-Za-z0-9_])"
+)
+
+
+def undefined_formula_symbols(
+    disclosure: TechnicalDisclosure,
+) -> list[tuple[DisclosureFormula, list[str]]]:
     definition_text = "\n".join(
         [
-            text,
+            *disclosure.all_paragraphs(),
             *[
                 cell
                 for table in disclosure.tables
@@ -859,21 +926,37 @@ def _validate_cross_references(disclosure: TechnicalDisclosure) -> None:
             *[item.description for item in disclosure.formulas],
         ]
     ).replace("{", "").replace("}", "")
+    ranges = [
+        (match[1], int(match[2]), int(match[3]))
+        for match in _INDEXED_SYMBOL_RANGE.finditer(definition_text)
+        if len(match[2]) <= 8 and len(match[3]) <= 8
+    ]
+    missing = []
     for formula in disclosure.formulas:
         missing_symbols = [
             symbol
             for symbol in _latex_symbols(formula.latex)
-            if symbol not in definition_text
+            if not re.search(
+                rf"(?<![A-Za-z0-9_]){re.escape(symbol)}(?![A-Za-z0-9])", definition_text
+            )
+            and not _symbol_in_range(symbol, ranges)
         ]
         if missing_symbols:
-            raise ValueError(
-                f"{formula.label}存在未定义符号：" + "、".join(missing_symbols)
-            )
+            missing.append((formula, missing_symbols))
+    return missing
+
+
+def _symbol_in_range(symbol: str, ranges: list[tuple[str, int, int]]) -> bool:
+    match = re.fullmatch(r"([A-Za-z][A-Za-z0-9]*)_(\d{1,8})", symbol)
+    return match is not None and any(
+        base == match[1] and start <= int(match[2]) <= end
+        for base, start, end in ranges
+    )
 
 
 def _latex_symbols(latex: str) -> list[str]:
     without_commands = re.sub(r"\\[A-Za-z]+", " ", latex)
-    values = re.findall(r"(?<![A-Za-z0-9])([A-Za-z](?:_\{?[A-Za-z0-9]+\}?)?)(?![A-Za-z0-9])", without_commands)
+    values = re.findall(r"(?<![A-Za-z0-9_])([A-Za-z](?:_\{?[A-Za-z0-9]+\}?)?)(?![A-Za-z0-9])", without_commands)
     result: list[str] = []
     for value in values:
         normalized = value.replace("{", "").replace("}", "")

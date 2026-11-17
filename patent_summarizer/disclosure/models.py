@@ -37,6 +37,7 @@ class DisclosureDiagnostic:
     message: str
     action: str = ""
     severity: ValidationSeverity = ValidationSeverity.WARNING
+    requires_review: bool = False
 
 
 @dataclass(frozen=True)
@@ -248,6 +249,10 @@ class TechnicalDisclosure:
     diagnostics: tuple[DisclosureDiagnostic, ...] = ()
 
     @property
+    def review_items(self) -> tuple[DisclosureDiagnostic, ...]:
+        return tuple(item for item in self.diagnostics if item.requires_review)
+
+    @property
     def is_structured(self) -> bool:
         return bool(self.sections)
 
@@ -283,6 +288,7 @@ class DisclosureOutputPaths:
     markdown: Path
     assets_dir: Path
     diagnostics: tuple[DisclosureDiagnostic, ...] = ()
+    is_review_draft: bool = False
 
 
 @dataclass(frozen=True)

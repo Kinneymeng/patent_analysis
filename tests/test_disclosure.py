@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+import re
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -47,6 +48,7 @@ from patent_summarizer.disclosure_docx import (
     validate_technical_disclosure_docx,
     write_technical_disclosure,
 )
+from patent_summarizer.disclosure.validation import effect_claim_problem
 
 
 def _valid_payload(title: str = "一种冗余制动控制方法") -> dict:
@@ -652,6 +654,157 @@ class DisclosureCliTests(unittest.TestCase):
 
 
 class DisclosureReliabilityTests(unittest.TestCase):
+    def test_claim_checks_distinguish_evidence_from_future_work_and_runtime_measurement(self):
+        statement = "台架试验表明阻尼波动降低 30%"
+        for clause in (
+            "材料未给出实测对比数据",
+            "不构成已经验证的性能结论",
+            "上述范围均为建议值，不能视为已验证的限值",
+            "降幅仍需实测确认",
+            "若实测阻尼达到阈值，则启动窗口计时",
+            "预期缩短 20 ms",
+        ):
+            with self.subTest(clause=clause):
+                self.assertIsNone(effect_claim_problem(clause, "设计方案"))
+        self.assertIsNone(effect_claim_problem(statement, f"初次演示记录。{statement}。"))
+        for source in (
+            "材料只有采集通道的实测设计。",
+            "30% 是指目标阈值。",
+            f"本项目没有证据证明{statement}。",
+            "台架试验表明阻尼波动降低 30‰。",
+        ):
+            with self.subTest(source=source):
+                self.assertIsNotNone(effect_claim_problem(statement, source))
+
+    def test_both_sources_publish_and_resume_marked_review_drafts(self):
+        payload = _structured_reliability_payload()
+        title = payload["标题"]
+        sections = {item["编号"]: {"章节": item} for item in payload["章节"]}
+        artifacts = {key: payload[key] for key in ("摘要", "图示", "参数表", "公式")}
+        artifacts["公式"] = [{
+            "章节": "三", "编号": "式（1）", "LaTeX": "w_2+w_3+q",
+            "说明": "w_1至w_4为权重。", "来源": "agent", "材料依据": "",
+        }]
+        bad_effect = {"章节": {**sections["四"]["章节"], "段落": [
+            "多信号判断属于待验证的预期效果。台架实测表明阻尼波动降低 30%。"
+            "经查新未发现相似专利。"
+        ]}}
+
+        class Model:
+            broken = True
+
+            def __init__(self):
+                self.calls = []
+
+            def chat(self, _system, prompt):
+                if "只修复一个公式项目" in prompt:
+                    self.calls.append("formula")
+                    return {"公式": [dict(artifacts["公式"][0], 说明="w_1至w_4为权重，q为新参数。")]}
+                if "图文与摘要生成" in prompt:
+                    self.calls.append("artifacts")
+                    return artifacts
+                write = re.search(r"当前只撰写：([一二三四五六])", prompt)
+                if write:
+                    number = write[1]
+                    self.calls.append(f"write-{number}")
+                    if self.broken and number == "三":
+                        return "无效 JSON"
+                    if self.broken and number == "四":
+                        return bad_effect
+                    if number == "三":
+                        return {"章节": {**sections[number]["章节"], "段落": [
+                            *sections[number]["章节"]["段落"], "q 为输入修正量。"
+                        ]}}
+                    return sections[number]
+                if "当前待审校章节：" in prompt:
+                    current = prompt.split("当前待审校章节：\n", 1)[1]
+                    item, _ = json.JSONDecoder().raw_decode(current)
+                    self.calls.append(f"review-{item['章节']['编号']}")
+                    if self.broken and item["章节"]["编号"] == "六":
+                        raise ConnectionError("审校连接中断")
+                    return item
+                raise AssertionError("unexpected request")
+
+        from patent_summarizer.disclosure.diagrams import _render_with_pillow
+
+        for flag, source_id in (("--idea", "manual"), ("--project-dir", "project")):
+            with self.subTest(source=source_id), tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                project = root / "source"
+                project.mkdir()
+                (project / "design.txt").write_text("已有姿态输入及阻尼控制流程。", encoding="utf-8")
+                title_file = root / "titles.json"
+                title_file.write_text(json.dumps([{"source_id": source_id, "titles": [title]}]), encoding="utf-8")
+                preview = DisclosurePreview(
+                    source_id=source_id, title=title, technical_problems=("保持有效输出",),
+                    modules=(
+                        ModuleDefinition("姿态融合模块", "判断状态", ("车速",), ("路面状态",)),
+                        ModuleDefinition("阻尼计算模块", "计算阻尼", ("路面状态",), ("目标阻尼",)),
+                    ),
+                    process_steps=("S1 采集信号", "S2 检查有效性", "S3 计算目标阻尼"),
+                    key_points=("信号可信度融合",), evidence_refs=(), suggested_parameters=(),
+                    assumptions=(), open_questions=(),
+                )
+                model = Model()
+                output = root / "out"
+                source_value = str(project) if source_id == "project" else "已有姿态输入及阻尼控制流程。"
+                argv = ["disclosure", flag, source_value, "--output-dir", str(output),
+                        "--titles-file", str(title_file)]
+
+                def render(code, path, diagram_title):
+                    if model.broken and "控制流程" in diagram_title:
+                        raise RuntimeError("模拟图示渲染失败")
+                    return _render_with_pillow(code, path, diagram_title)
+
+                with patch("patent_summarizer.cli.load_config", return_value=AppConfig(
+                    "https://example.test", "key", "model"
+                )), patch("patent_summarizer.cli.RateLimitedOpenAIClient", return_value=model), patch(
+                    "patent_summarizer.cli.DisclosureAnalyzer.build_preview", return_value=preview
+                ) as build_preview, patch(
+                    "patent_summarizer.disclosure.diagrams._mermaid_runtime_path", return_value=None
+                ), patch("patent_summarizer.disclosure.diagrams._render_with_pillow", side_effect=render):
+                    log = StringIO()
+                    with redirect_stdout(log):
+                        self.assertEqual(main(argv), 0)
+                    self.assertIn(f"REVIEW_DRAFT\t{source_id}", log.getvalue())
+                    first = output / f"{title}_技术交底书_审阅稿"
+                    docx = first.with_suffix(".docx")
+                    markdown = first.with_suffix(".md")
+                    original = docx.read_bytes()
+                    for content in (markdown.read_text(encoding="utf-8"),
+                                    "\n".join(p.text for p in Document(docx).paragraphs)):
+                        for marker in ("待确认事项", "第六章独立审校未完成", "图示未能渲染",
+                                       "式（1）存在未定义符号：q", "姿态融合模块", "【待核验】"):
+                            self.assertIn(marker, content)
+                        self.assertNotIn("降低 30%", content)
+                        self.assertNotIn("未发现相似专利", content)
+                    self.assertEqual(model.calls.count("write-三"), 2)
+                    self.assertEqual(model.calls.count("formula"), 1)
+
+                    with redirect_stdout(StringIO()):
+                        self.assertEqual(main(argv), 0)
+                    self.assertTrue(first.with_name(f"{first.name}_2").with_suffix(".docx").is_file())
+                    self.assertEqual(docx.read_bytes(), original)
+
+                    model.broken = False
+                    model.calls.clear()
+                    with patch("patent_summarizer.disclosure.exporter._publish_bundle",
+                               side_effect=PermissionError("模拟输出目录不可写")), redirect_stdout(log):
+                        self.assertEqual(main(argv), 1)
+                    self.assertIn("图文导出与文件核验：模拟输出目录不可写", log.getvalue())
+                    self.assertFalse((output / f"{title}_技术交底书.docx").exists())
+                    self.assertNotIn("artifacts", model.calls)
+                    self.assertEqual([call for call in model.calls if call.startswith("write-")],
+                                     ["write-三", "write-四"])
+                    model.calls.clear()
+                    with redirect_stdout(log):
+                        self.assertEqual(main(argv), 0)
+                    self.assertEqual(model.calls, [])
+                    self.assertIn("confirmed-preview", log.getvalue())
+                    self.assertTrue((output / f"{title}_技术交底书.docx").is_file())
+                    self.assertTrue((output / f"{title}_技术交底书.md").is_file())
+                    build_preview.assert_called_once()
+
     def test_multiple_recommendations_are_normalized_without_model_repair(self):
         payload = {
             "候选方案": [

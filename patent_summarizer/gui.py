@@ -2299,11 +2299,17 @@ class PatentSummarizerApp(ctk.CTk):
                 self.last_progress_update
                 and "有警告" in self.last_progress_update.stage
             )
+            has_review_draft = bool(
+                finished_mode == MODE_DISCLOSURE and self.last_progress_update
+                and "审阅稿" in self.last_progress_update.stage
+            )
             self.status_var.set(
-                "运行完成（有警告）" if completed_with_warnings else "运行完成"
+                "已交付审阅稿（待复核）" if has_review_draft else
+                ("运行完成（有警告）" if completed_with_warnings else "运行完成")
             )
             self._append_log(
-                "\n完成，但存在需要复核的警告。\n"
+                "\n审阅稿已保存。请查看文首的待确认事项及上方输出路径。\n"
+                if has_review_draft else "\n完成，但存在需要复核的警告。\n"
                 if completed_with_warnings
                 else "\n完成。\n"
             )
@@ -2325,17 +2331,20 @@ class PatentSummarizerApp(ctk.CTk):
             if finished_mode == MODE_POLISH and previous and previous.state == "error":
                 self.status_var.set(previous.stage)
                 return
+            detail = f"退出码 {exit_code}"
+            if finished_mode == MODE_DISCLOSURE and previous and previous.state == "error":
+                detail = f"{detail} · {previous.detail}"
             self._apply_progress(
                 ProgressUpdate(
                     mode=self._selected_mode(),
                     state="error",
                     stage="运行异常结束",
-                    detail=f"退出码 {exit_code}",
+                    detail=detail,
                     completed=previous.completed if previous else None,
                     total=previous.total if previous else None,
                 )
             )
-            self.status_var.set(f"运行结束，退出码 {exit_code}")
+            self.status_var.set(f"运行结束，{detail}")
             self._append_log(f"\n运行结束，退出码 {exit_code}。\n")
             if finished_mode == MODE_DISCLOSURE:
                 self.start_button.configure(text="只重试失败项")

@@ -61,6 +61,21 @@ def existing_disclosure_bundle_complete(paths: DisclosureOutputPaths) -> bool:
         return False
 
 
+def _review_draft_paths(normal: DisclosureOutputPaths) -> DisclosureOutputPaths:
+    parent = normal.docx.parent
+    prefix = f"{normal.docx.stem}_审阅稿"
+    number = 1
+    while True:
+        stem = prefix if number == 1 else f"{prefix}_{number}"
+        candidate = DisclosureOutputPaths(
+            parent / f"{stem}.docx", parent / f"{stem}.md",
+            parent / f"{stem}_assets", is_review_draft=True,
+        )
+        if not any(path.exists() for path in (candidate.docx, candidate.markdown, candidate.assets_dir)):
+            return candidate
+        number += 1
+
+
 def write_disclosure_bundle(
     disclosure: TechnicalDisclosure,
     output_dir: Path,
@@ -71,7 +86,8 @@ def write_disclosure_bundle(
     conflicts = [path for path in (paths.docx, paths.markdown) if path.exists()]
     if conflicts and not overwrite:
         raise FileExistsError("技术交底书已经存在：" + "；".join(str(path) for path in conflicts))
-    validate_engineering_language(disclosure)
+    if not disclosure.review_items:
+        validate_engineering_language(disclosure)
     paths.docx.parent.mkdir(parents=True, exist_ok=True)
     token = uuid.uuid4().hex
     staged_assets = paths.assets_dir.with_name(f".{paths.assets_dir.name}.{token}.tmp")
@@ -91,14 +107,20 @@ def write_disclosure_bundle(
                         if formula_result.mode == "linear"
                         else "已写入原始 LaTeX 文本并标记需人工复核"
                     ),
+                    requires_review=formula_result.mode == "raw",
                 )
             )
     try:
         rendered = (
-            render_disclosure_diagrams(disclosure, staged_assets, diagnostics=diagnostics)
+            render_disclosure_diagrams(
+                disclosure, staged_assets, diagnostics=diagnostics, allow_unrendered=True,
+            )
             if disclosure.is_structured
             else disclosure
         )
+        rendered = replace(rendered, diagnostics=tuple(diagnostics))
+        if rendered.review_items:
+            paths = _review_draft_paths(paths)
         published = _with_published_image_paths(rendered, paths.assets_dir)
         markdown = disclosure_to_markdown(published, paths.markdown)
         validate_disclosure_markdown(
@@ -113,7 +135,7 @@ def write_disclosure_bundle(
         document = build_technical_disclosure_document(rendered)
         document.save(temporary_docx)
         validate_technical_disclosure_docx(temporary_docx, rendered)
-        if not overwrite and (paths.docx.exists() or paths.markdown.exists()):
+        if (not overwrite or paths.is_review_draft) and (paths.docx.exists() or paths.markdown.exists()):
             raise FileExistsError(f"技术交底书已经存在：{paths.docx} 或 {paths.markdown}")
         _publish_bundle(
             rendered,
@@ -133,7 +155,8 @@ def write_disclosure_bundle(
             staged_assets.rmdir()
     final_paths = replace(paths, diagnostics=tuple(diagnostics))
     try:
-        _write_diagnostics(output_dir, disclosure.title, final_paths.diagnostics)
+        diagnostic_title = paths.docx.stem if paths.is_review_draft else disclosure.title
+        _write_diagnostics(output_dir, diagnostic_title, final_paths.diagnostics)
     except OSError as exc:
         final_paths = replace(
             final_paths,
@@ -156,7 +179,13 @@ def disclosure_to_markdown(disclosure: TechnicalDisclosure, markdown_path: Path)
         for paragraph in disclosure.content_paragraphs:
             lines.extend([paragraph, ""])
         return "\n".join(lines).rstrip() + "\n"
-    lines = ["# 研发技术交底书", "", f"## {disclosure.title}", "", "### 摘要", "", disclosure.abstract, ""]
+    heading = "研发技术交底书（审阅稿）" if disclosure.review_items else "研发技术交底书"
+    lines = [f"# {heading}", "", f"## {disclosure.title}", ""]
+    if disclosure.review_items:
+        lines.extend(["### 待确认事项", ""])
+        lines.extend(f"- {item.message}。{item.action}" for item in disclosure.review_items)
+        lines.append("")
+    lines.extend(["### 摘要", "", disclosure.abstract, ""])
     for section in disclosure.sections:
         lines.extend([f"## {section.number}、{section.title}", ""])
         for paragraph in section.paragraphs:
@@ -166,9 +195,15 @@ def disclosure_to_markdown(disclosure: TechnicalDisclosure, markdown_path: Path)
             for paragraph in subsection.paragraphs:
                 lines.extend([paragraph, ""])
         for diagram in (item for item in disclosure.diagrams if item.section_number == section.number):
-            lines.extend([f"#### {diagram.title}", "", "<details>", "<summary>Mermaid 图源</summary>", "", "```mermaid", diagram.mermaid, "```", "", "</details>", ""])
+            lines.extend([f"#### {diagram.title}", ""])
             if diagram.image_path is None:
-                raise ValueError(f"图示尚未成功生成：{diagram.title}")
+                if not disclosure.review_items:
+                    raise ValueError(f"图示尚未成功生成：{diagram.title}")
+                lines.extend(["【待补】图示未能渲染，以下为原始图源。", "", "````text",
+                              diagram.mermaid, "````", ""])
+                continue
+            lines.extend(["<details>", "<summary>Mermaid 图源</summary>", "", "```mermaid",
+                          diagram.mermaid, "```", "", "</details>", ""])
             relative = _relative_link(diagram.image_path, markdown_path.parent)
             lines.extend([f"![{diagram.title}]({relative})", ""])
         for formula in (item for item in disclosure.formulas if item.section_number == section.number):
@@ -194,12 +229,15 @@ def validate_disclosure_markdown(
         positions = [markdown.find(f"## {section.number}、{section.title}") for section in disclosure.sections]
         if any(value < 0 for value in positions) or positions != sorted(positions):
             raise ValueError("技术交底书 Markdown 六章目录缺失或错序")
-        if markdown.count("```mermaid") != len(disclosure.diagrams):
+        if markdown.count("```mermaid") != sum(item.image_path is not None for item in disclosure.diagrams):
             raise ValueError("技术交底书 Markdown 的 Mermaid 图源数量不匹配")
         for diagram in disclosure.diagrams:
+            if diagram.image_path is None and disclosure.review_items:
+                continue
             if diagram.image_path is None or (check_images and not diagram.image_path.exists()):
                 raise ValueError(f"技术交底书 Markdown 引用的图片不存在：{diagram.title}")
-    validate_engineering_language(disclosure)
+    if not disclosure.review_items:
+        validate_engineering_language(disclosure)
 
 
 def _relative_link(path: Path, root: Path) -> str:
@@ -235,7 +273,7 @@ def _publish_bundle(
     token: str,
 ) -> None:
     assets_existed = paths.assets_dir.exists()
-    paths.assets_dir.mkdir(parents=True, exist_ok=True)
+    paths.assets_dir.mkdir(parents=True, exist_ok=not paths.is_review_draft)
     sources_and_destinations = [
         *[
             (item.image_path, paths.assets_dir / item.image_path.name)
@@ -252,6 +290,8 @@ def _publish_bundle(
             if source is None or not source.exists():
                 raise FileNotFoundError(f"待发布文件不存在：{source}")
             if destination.exists():
+                if paths.is_review_draft:
+                    raise FileExistsError(f"审阅稿输出已经存在：{destination}")
                 backup = destination.with_name(f".{destination.name}.{token}.backup")
                 os.replace(destination, backup)
                 backups[destination] = backup
@@ -292,6 +332,7 @@ def _write_diagnostics(
             "severity": item.severity.value,
             "message": item.message,
             "action": item.action,
+            "requires_review": item.requires_review,
         }
         for item in diagnostics
     ]

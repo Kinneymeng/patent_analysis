@@ -923,26 +923,34 @@ def disclosure(
         written: list[Path] = []
         failures: list[DisclosureFailure] = []
         warnings = []
+        review_count = 0
         for source, title, paths, preview in confirmed_items:
             completed_units = 0
+            stage = "分章撰写与图文校验"
             try:
                 tracker.set_stage("正在撰写研发技术交底书", title)
                 draft = analyzer.draft(source, title, preview)
                 tracker.advance("正在撰写研发技术交底书", f"{title} 初稿完成")
                 completed_units += 1
 
+                stage = "独立技术审校"
                 tracker.set_stage("正在独立技术审校", title)
                 reviewed_disclosure = analyzer.review(source, draft, preview)
-                tracker.advance("正在独立审校", f"{title} 审校完成")
+                tracker.advance("正在独立审校", f"{title} 审校阶段已处理")
                 completed_units += 1
 
+                stage = "图文导出与文件核验"
                 tracker.set_stage("正在生成图示并核验双格式文件", title)
                 bundle = write_disclosure_bundle(
                     reviewed_disclosure,
                     output_dir,
                     overwrite=conflict_policy == ConflictPolicy.OVERWRITE,
                 )
-                written.append(bundle.docx)
+                is_review_draft = getattr(bundle, "is_review_draft", False)
+                if is_review_draft:
+                    review_count += 1
+                else:
+                    written.append(bundle.docx)
                 for diagnostic in getattr(bundle, "diagnostics", ()):
                     warnings.append(diagnostic)
                     print(
@@ -952,15 +960,16 @@ def disclosure(
                 warning_count = len(getattr(bundle, "diagnostics", ()))
                 tracker.advance(
                     "正在核验并写入双格式文件",
-                    f"{title} 已保存" + (f"（警告 {warning_count} 项）" if warning_count else ""),
+                    f"{title} 已保存{'审阅稿' if is_review_draft else '技术交底书'}：{bundle.docx}",
                 )
                 completed_units += 1
-                status = "OK_WITH_WARNINGS" if warning_count else "OK"
+                status = "REVIEW_DRAFT" if is_review_draft else ("OK_WITH_WARNINGS" if warning_count else "OK")
                 print(f"{status}\t{source.source_id}\t{bundle.docx}")
                 print(f"MARKDOWN\t{source.source_id}\t{bundle.markdown}")
             except Exception as exc:
-                failures.append(DisclosureFailure(source.source_id, title, str(exc)))
-                print(f"FAIL\t{source.source_id}\t{title}\t{exc}")
+                detail = f"{stage}：{exc}"
+                failures.append(DisclosureFailure(source.source_id, title, detail))
+                print(f"FAIL\t{source.source_id}\t{title}\t{detail}")
             finally:
                 remaining = 3 - completed_units
                 if remaining:
@@ -975,20 +984,25 @@ def disclosure(
         if result.failures:
             tracker.fail(
                 "部分研发技术交底书生成失败",
-                f"成功 {len(result.written)}，跳过 {len(result.skipped)}，失败 {len(result.failures)}",
+                f"正常交付 {len(result.written)}，审阅稿 {review_count}，"
+                f"跳过 {len(result.skipped)}，失败 {len(result.failures)}",
             )
             print(
                 f"Done. written={len(result.written)}, skipped={len(result.skipped)}, "
-                f"failed={len(result.failures)}, output_dir={output_dir}"
+                f"failed={len(result.failures)}, review_drafts={review_count}, output_dir={output_dir}"
             )
             return 1
+        completion = "已交付技术交底书审阅稿" if review_count else "研发技术交底书生成完成"
+        if result.warnings:
+            completion += "（有警告）"
         tracker.succeed(
-            "研发技术交底书生成完成" if not result.warnings else "研发技术交底书生成完成（有警告）",
-            f"已保存 {len(result.written)} 份，跳过 {len(result.skipped)} 份，警告 {len(result.warnings)} 项",
+            completion,
+            f"正常交付 {len(result.written)} 份，审阅稿 {review_count} 份，"
+            f"跳过 {len(result.skipped)} 份，警告 {len(result.warnings)} 项",
         )
         print(
             f"Done. written={len(result.written)}, skipped={len(result.skipped)}, "
-            f"failed=0, warnings={len(result.warnings)}, output_dir={output_dir}"
+            f"failed=0, warnings={len(result.warnings)}, review_drafts={review_count}, output_dir={output_dir}"
         )
         return 0
     except (FileNotFoundError, NotADirectoryError, OSError, RuntimeError, ValueError) as exc:
