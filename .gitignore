@@ -3,6 +3,11 @@ CN202411182168_llm_debug/
 .patent_summary_logs/
 __pycache__/
 CN*
+!patent_summarizer/disclosure/cnipa_upstream/
+!patent_summarizer/disclosure/cnipa_upstream/*.py
+patent_summarizer/disclosure/cnipa_upstream/_last_result_*.html
+!patent_summarizer/disclosure/cnipa_upstream/
+patent_summarizer/disclosure/cnipa_upstream/_last_result_*.html
 00_patents/
 build/
 dist/

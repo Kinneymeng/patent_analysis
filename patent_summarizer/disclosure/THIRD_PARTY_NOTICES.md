@@ -19,3 +19,8 @@ integrity-checked at package build time. It is never downloaded at runtime.
 2026-09-23 revision. The application reads its complete Markdown body locally
 and adds the technical disclosure constraints from `prompts/polish.md`.
 The MIT copyright and license text are included in `HUMANIZER_ZH_LICENSE.txt`.
+
+Portable builds include the static Draw.io editor distributed in
+`@next-ai-drawio/mcp-server` 0.4.15. Draw.io is copyrighted by JGraph Ltd.
+The editor and the notices for the bundled shape, stencil and image libraries
+are in the `drawio` directory in the portable runtime.

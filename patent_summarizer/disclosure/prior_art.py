@@ -24,80 +24,102 @@ class CnipaPriorArtSearcher:
         terms = normalize_search_terms(keywords)
         if not terms:
             raise ValueError("查新至少需要一个具体技术检索词")
-        try:
-            search, helpers = self._dependencies()
-            first_batches = search(list(terms), patent_type="invention")
-            first_hits = _dedupe(hit for _html, hits in first_batches for hit in hits)
-            _kind, class_codes = helpers[0](first_hits, patent_type="invention")
-            class_codes = class_codes[:3]
-
-            second_hits = []
-            if class_codes:
-                second_batches = search(list(terms[:3]), patent_type="invention", class_codes=list(class_codes))
-                second_pool = _dedupe(hit for _html, hits in second_batches for hit in hits)
-                second_hits = helpers[1](
-                    second_pool,
-                    class_prefixes=list(class_codes),
-                    core_terms=list(terms[:3]),
-                    limit=6,
-                )
-            selected, reason = helpers[2](
-                list(second_hits),
-                list(first_hits),
-                class_prefixes=list(class_codes),
-                core_terms=list(terms),
-                min_keep=4,
-                limit=6,
-            )
-        except PriorArtSearchError:
-            raise
-        except Exception as exc:
-            raise PriorArtSearchError(f"国知局查新失败：{exc}") from exc
-
-        records = tuple(_record_from_hit(hit) for hit in selected if _usable_hit(hit))
-        now = datetime.now().astimezone().isoformat(timespec="seconds")
-        if not records:
-            return PriorArtResult(
-                status=PriorArtStatus.EMPTY,
-                searched_at=now,
-                keywords=terms,
-                ipc_codes=tuple(class_codes),
-                records=(),
-                message="检索范围内未筛选出可核验的相关中国发明专利记录",
-            )
-        status = PriorArtStatus.SUCCESS if len(records) >= 4 else PriorArtStatus.PARTIAL
-        message = "查新完成" if status == PriorArtStatus.SUCCESS else "检索范围内可核验近邻少于 4 条，已如实保留现有结果"
-        if reason == "still_short":
-            status = PriorArtStatus.PARTIAL
-        return PriorArtResult(
-            status=status,
-            searched_at=now,
-            keywords=terms,
-            ipc_codes=tuple(class_codes),
-            records=records,
-            message=message,
-        )
-
-    def _dependencies(self):
         if self._transport is not None:
-            from .cnipa_upstream.cnipa_epub_parse import (
-                backfill_hits_for_disclosure,
-                select_hits_for_disclosure,
-                suggest_class_codes,
-            )
-            return self._transport, (suggest_class_codes, select_hits_for_disclosure, backfill_hits_for_disclosure)
+            return self._search_rounds(terms, self._transport)
         try:
-            from .cnipa_upstream.cnipa_epub_crawler import search_epub_keywords
-            from .cnipa_upstream.cnipa_epub_parse import (
-                backfill_hits_for_disclosure,
-                select_hits_for_disclosure,
-                suggest_class_codes,
-            )
+            from .cnipa_upstream.cnipa_epub_crawler import epub_search_session
         except ImportError as exc:
             if "playwright" in str(exc).casefold():
                 raise PriorArtSearchError("便携包缺少 Playwright 查新组件") from exc
             raise
-        return search_epub_keywords, (suggest_class_codes, select_hits_for_disclosure, backfill_hits_for_disclosure)
+
+        try:
+            with epub_search_session() as search:
+                return self._search_rounds(terms, search)
+        except PriorArtSearchError:
+            raise
+        except Exception as exc:
+            raise PriorArtSearchError(f"国知局查新浏览器会话失败：{_error_detail(exc)}") from exc
+
+    def _search_rounds(self, terms: tuple[str, ...], search: Callable) -> PriorArtResult:
+        from .cnipa_upstream.cnipa_epub_parse import (
+            backfill_hits_for_disclosure,
+            select_hits_for_disclosure,
+            suggest_class_codes,
+        )
+
+        now = datetime.now().astimezone().isoformat(timespec="seconds")
+        try:
+            first_hits = _batch_hits(search(list(terms), patent_type="invention"))
+            _kind, class_codes = suggest_class_codes(first_hits, patent_type="invention")
+            class_codes = class_codes[:3]
+        except Exception as exc:
+            return _partial_result("国知局关键词检索失败", exc, terms, now)
+
+        second_pool = []
+        second_hits = []
+        if class_codes:
+            try:
+                second_pool = _batch_hits(
+                    search(list(terms[:3]), patent_type="invention", class_codes=list(class_codes)),
+                )
+                second_hits = select_hits_for_disclosure(
+                    second_pool, class_prefixes=list(class_codes), core_terms=list(terms[:3]), limit=6,
+                )
+            except Exception as exc:
+                return _partial_result("IPC 高级检索未完成", exc, terms, now, class_codes, first_hits)
+
+        selected, reason = backfill_hits_for_disclosure(
+            second_hits, first_hits,
+            class_prefixes=list(class_codes), core_terms=list(terms), min_keep=4, limit=6,
+        )
+        records = _verified_records(selected)
+        if not records and (first_hits or second_pool):
+            records = _verified_records(_dedupe([*first_hits, *second_pool]))
+            if not records:
+                raise PriorArtSearchError("国知局结果页展示了记录，但未能核验公开号及来源链接")
+            reason = "still_short"
+        if not records:
+            status = PriorArtStatus.EMPTY
+            message = "国知局结果页显示本次检索范围内无结果"
+        elif len(records) >= 4 and reason != "still_short":
+            status = PriorArtStatus.SUCCESS
+            message = "查新完成"
+        else:
+            status = PriorArtStatus.PARTIAL
+            message = "已保留本次检索范围内的可核验记录"
+        return PriorArtResult(
+            status=status, searched_at=now, keywords=terms, ipc_codes=tuple(class_codes),
+            records=records, message=message,
+        )
+
+
+def _error_detail(error: Exception) -> str:
+    return str(error).partition("\n")[0].strip(": ") or type(error).__name__
+
+
+def _batch_hits(batches):
+    return _dedupe(hit for _html, hits in batches for hit in hits)
+
+
+def _verified_records(hits) -> tuple[PriorArtRecord, ...]:
+    return tuple(_record_from_hit(hit) for hit in hits if _usable_hit(hit))[:6]
+
+
+def _partial_result(stage, error, terms, now, class_codes=(), first_hits=()) -> PriorArtResult:
+    completed = _batch_hits(getattr(error, "completed_batches", ()))
+    records = _verified_records(_dedupe([*first_hits, *completed]))
+    message = f"{stage}：{_error_detail(error)}"
+    if not records:
+        raise PriorArtSearchError(message) from error
+    return PriorArtResult(
+        status=PriorArtStatus.PARTIAL,
+        searched_at=now,
+        keywords=terms,
+        ipc_codes=tuple(class_codes),
+        records=records,
+        message=f"{message}。已保留已完成检索得到的可核验记录。",
+    )
 
 
 def normalize_search_terms(values: Sequence[str]) -> tuple[str, ...]:

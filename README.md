@@ -240,17 +240,17 @@ Project Scan 递归读取 DOCX、PPTX、文字型 PDF、Markdown、文本和常�
 ]
 ```
 
-候选确认后先形成完整技术方案预览，集中展示技术问题、具体模块及输入输出、流程、材料依据、示例参数、假设和未决问题。GUI 第二次确认可直接编辑这些结构化内容。成文固定使用六章：技术背景与现有方案、需要解决的技术问题、技术方案详细说明、技术效果与适用边界、技术关键点、实施例与验证方法。全文采用工程设计文档表达，检查权利要求式措辞、术语、图文、公式、参数、异常路径和验证方法的一致性，不设置固定字数上限。
+候选确认后形成完整技术方案预览，GUI 第二次确认可编辑模块、输入输出、流程和参数。成文依次为发明名称、摘要、技术领域、背景技术、发明内容和具体实施方式。正文逐章生成，每章承接已经完成的前文。发明内容分为发明目的、技术方案和有益效果。
 
-每项输出 `<标题>_技术交底书.docx`、同名 `.md` 和 `_assets` 图片目录。Markdown 保留 Mermaid 图源，Word 嵌入本地生成的 PNG；参数使用 Word 表格，必要公式转换为可编辑 Word 公式。结构化公式失败时自动使用可编辑线性公式，仍失败则保留原始 LaTeX 并标记需人工复核。Mermaid 失败时使用 Pillow 备用渲染。确认模块、参数或技术关键点被模型遗漏时由程序从第二次确认结果补回，交付状态显示为“成功但有警告”。
+每项输出 `<标题>_技术交底书.docx`、同名 `.md` 和 `_assets` 图片目录。图文请求同时给出技术连线和可选的排版建议，本地 Draw.io 使用紧凑判断框、正交箭头和子系统分组。Word 和 Markdown 使用同一份 PNG，Markdown 还链接可编辑的 `.drawio` 文件并保留 Mermaid 图源。单张图出错时依次尝试 Mermaid 和 Pillow，转换问题写入诊断文件。参数使用 Word 表格，必要公式转换为可编辑的 Word 公式或线性公式。
 
-六章正文、图文附件、确认方案和审校结果保存到输出侧 `.patent_disclosure_work`。`--resume` 默认开启，再次运行会跳过已经完整交付的篇目并从失败章节继续；`--no-resume` 忽略这些工作流检查点并重新生成。默认遇到无法验证为完整交付的同名 DOCX 或 Markdown 仍会停止；可使用 `--skip-existing` 或 `--overwrite`。
+四章正文、图文附件、确认方案和审校结果保存到输出侧 `.patent_disclosure_work`，审阅提示写入该目录下的 `diagnostics` 和运行日志。`--resume` 默认开启，续跑会跳过已完成的交付并从失败章节继续。`--no-resume` 忽略检查点。`--skip-existing` 和 `--overwrite` 分别用于跳过或覆盖已有交付文件。
 
-查新通过 `--prior-art` 显式开启，默认关闭。开启时只访问国知局专利公布公告系统，先按技术关键词召回，再按 IPC 收敛，保留约 4 至 6 条可核验中国发明记录。CLI 查新失败默认停止，只有同时传入 `--prior-art-failure skip` 才明确跳过并继续。关闭时不发起查新公网请求。`--dry-run` 只检查来源与材料清单，不调用模型、查新或写入交付文件。
+查新通过 `--prior-art` 显式开启，默认关闭。开启后优先使用随包 Chromium，在同一会话完成关键词与 IPC 检索。IPC 高级检索失败时，预览会标明失败阶段，并保留已核验的部分结果。没有可用记录的访问故障会使 CLI 停止，可通过 `--prior-art-failure skip` 明确跳过。`--dry-run` 只检查来源与材料清单。
 
 ## 便携 GUI EXE
 
-Windows 便携版的专利总结流程仍只处理 DOCX；研发技术交底书的 Project Scan 还支持 PPTX、文字型 PDF、Markdown、文本和常见源码，不提供 OCR。GUI 使用 CustomTkinter，便携包包含 Python 运行库、Pandoc、Office/PDF 解析库、Playwright、Chromium 和本地 Mermaid 运行时，终端用户不需要安装 Python、Node 或 Office，也不需要在首次运行时下载绘图资源。
+Windows 便携版的专利总结流程处理 DOCX，研发技术交底书的 Project Scan 还支持 PPTX、文字型 PDF、Markdown、文本和常见源码。便携包包含 Python 运行库、Pandoc、Office/PDF 解析库、Playwright、Chromium、Draw.io 和 Mermaid 静态资源。离线生成交底书时，将 `.env` 中的 `OPENAI_BASE_URL` 指向内网 OpenAI 兼容接口并保持查新关闭。便携包也可用 `PatentSummarizer.exe --cli` 运行源版 CLI 命令。
 
 ### 自行打包
 
@@ -262,15 +262,15 @@ conda run -n temp python -m pip install pypandoc-binary pyinstaller customtkinte
 conda run -n temp python build_portable.py
 ```
 
-构建完成后，EXE 会自检 Tcl、随包 Chromium、Mermaid、Pillow、`latex2mathml`、中文路径写入及 DOCX 润色读写。润色自检使用模拟响应。默认构建目录为 `dist\PatentSummarizer\`，包含：
+构建完成后，EXE 会自检 Tcl、随包 Chromium、Draw.io 离线出图和可编辑源文件、Mermaid、Pillow、公式、中文路径写入及 DOCX 润色。润色自检使用模拟响应。默认构建目录为 `dist\PatentSummarizer\`，包含：
 
 - `PatentSummarizer.exe`：主程序。
-- `.env`：API 配置。若项目根目录没有 `.env`，构建脚本会复制 `.env.example` 作为模板。
+- `.env.example` 是随包配置模板。首次使用时将其复制为 EXE 同目录的 `.env`，再填写接口配置。
 - `class.xlsx`：分类表。
 - `汽车底盘领域专利布局分析报告模板.docx`：报告功能使用的内置模板。
 - `patent-summarizer.ico`：程序窗口和便携包使用的自定义图标。
 - `使用说明.md`：面向普通使用人员的完整操作指南。
-- `_internal\`：EXE 运行依赖，包含 CustomTkinter、Python 运行库、Pandoc、Chromium、本地 Mermaid 运行时及第三方许可证等文件。
+- `_internal\`：EXE 运行依赖，包含 CustomTkinter、Python 运行库、Pandoc、Chromium、Draw.io 和 Mermaid 静态资源及第三方许可证。
 
 使用时复制整个 `dist\PatentSummarizer\` 文件夹。独立组合对比可使用前文所述的 CLI `compare` 命令。GUI 任务包括：
 
@@ -309,7 +309,7 @@ conda run -n temp python build_portable.py
 
 - `dist\PatentSummarizer\`：最终便携版程序目录。
 - `dist\PatentSummarizer\_internal\`：EXE 运行依赖。
-- `dist\PatentSummarizer\.env`：EXE 运行配置。
+- `dist\PatentSummarizer\.env.example` 是 EXE 的运行配置模板。
 - `dist\PatentSummarizer\class.xlsx`：EXE 分类功能需要的分类表。
 - `dist\PatentSummarizer\汽车底盘领域专利布局分析报告模板.docx`：EXE 报告功能需要的内置模板。
 - `dist\PatentSummarizer\patent-summarizer.ico`：EXE 的自定义图标文件。
@@ -325,6 +325,6 @@ conda run -n temp python build_portable.py
 - `.github/workflows/ci.yml`：推送到 `master` 或创建 Pull Request 时，在 Ubuntu/Windows 和 Python 3.10/3.13 上运行完整测试。
 - `.github/workflows/release.yml`：支持手动构建 Windows 便携 ZIP；推送 `v*` 标签时还会自动创建 GitHub Release。
 
-工作流不会调用专利分析接口，也不需要上传 API Key。CI 构建使用 `.env.example` 生成便携包中的待填写 `.env`。
+CI 构建使用模拟响应做自检，并将 `.env.example` 原名打入便携包。
 
 第一次上传 GitHub、查看 CI、下载 Artifact 和发布 `v0.1.0` 的完整步骤见 [CI-CD实验指南.md](CI-CD实验指南.md)。

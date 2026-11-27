@@ -6,6 +6,10 @@ from pathlib import Path
 
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
+    if args[:1] == ["--cli"]:
+        from patent_summarizer.cli import main as cli_main
+
+        return cli_main(args[1:])
     if "--self-check" in args:
         from patent_summarizer.portable_self_check import run_portable_self_check
 

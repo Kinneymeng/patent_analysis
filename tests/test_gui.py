@@ -416,6 +416,7 @@ class PortableRuntimeFilesTests(unittest.TestCase):
             dist.mkdir()
             (root / "class.xlsx").write_bytes(b"classes")
             (root / ".env.example").write_text("OPENAI_API_KEY=", encoding="utf-8")
+            (root / ".env").write_text("OPENAI_API_KEY=build-test-only", encoding="utf-8")
             template = template_dir / build_portable.REPORT_TEMPLATE_NAME
             template.write_bytes(b"template")
             assets = root / "assets"
@@ -429,8 +430,8 @@ class PortableRuntimeFilesTests(unittest.TestCase):
             self.assertEqual((dist / build_portable.REPORT_TEMPLATE_NAME).read_bytes(), b"template")
             self.assertEqual((dist / build_portable.APP_ICON_NAME).read_bytes(), b"icon")
             self.assertEqual((dist / build_portable.USER_GUIDE_NAME).read_text(encoding="utf-8"), "guide")
-            self.assertEqual((dist / ".env").read_text(encoding="utf-8"), "OPENAI_API_KEY=")
-            self.assertFalse((dist / ".env.example").exists())
+            self.assertEqual((dist / ".env.example").read_text(encoding="utf-8"), "OPENAI_API_KEY=")
+            self.assertFalse((dist / ".env").exists())
 
     def test_missing_report_template_stops_portable_build(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -470,6 +471,7 @@ class PortableRuntimeFilesTests(unittest.TestCase):
             ):
                 directory.mkdir(parents=True)
             (dist / "PatentSummarizer.exe").write_bytes(b"exe")
+            (dist / ".env.example").write_bytes((build_portable.ROOT / ".env.example").read_bytes())
             (prompt_dir / "common.md").write_text("rules", encoding="utf-8")
             (prompt_dir / "polish.md").write_text("polishing rules", encoding="utf-8")
             skill_path = prompt_dir / "humanizer-zh" / "SKILL.md"
@@ -480,6 +482,10 @@ class PortableRuntimeFilesTests(unittest.TestCase):
             (browser_dir / "chrome.exe").write_bytes(b"browser")
             (playwright_driver_dir / "node.exe").write_bytes(b"node")
             (mermaid_dir / "mermaid.min.js").write_bytes(b"mermaid")
+            for name in build_portable.DRAWIO_REQUIRED:
+                path = internal / "drawio" / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("Draw.io resource", encoding="utf-8")
             (latex2mathml_dir / "unimathsymbols.txt").write_text(
                 "symbols",
                 encoding="utf-8",
@@ -493,6 +499,11 @@ class PortableRuntimeFilesTests(unittest.TestCase):
                 build_portable.verify_portable_application(dist)
             humanizer_license.write_text("MIT", encoding="utf-8")
             build_portable.verify_portable_application(dist)
+            stray_config = internal / ".env"
+            stray_config.write_bytes(b"TEST=only")
+            with self.assertRaisesRegex(ValueError, r"must not contain a \.env"):
+                build_portable.verify_portable_application(dist)
+            stray_config.unlink()
 
             with patch(
                 "build_portable.subprocess.run",

@@ -17,7 +17,7 @@ from docx.oxml.ns import qn
 from lxml import etree
 
 from .disclosure.prompt_loader import polish_system_prompt
-from .disclosure.validation import SECTION_TITLES, mapping_payload
+from .disclosure.validation import LEGACY_SECTION_TITLES, SECTION_TITLES, chapter_heading, mapping_payload
 from .progress import ProgressTracker
 
 
@@ -109,14 +109,20 @@ def polish_disclosure_docx(
 
 def _document_batches(paragraphs: list) -> Iterator[tuple[str, list[EditableParagraph]]]:
     labels = [paragraph.text.strip() for paragraph in paragraphs]
-    if labels[:1] == ["研发技术交底书"]:
-        chapters = [f"{number}、{title}" for number, title in SECTION_TITLES.items()]
+    if labels[:1] in (["研发技术交底书"], ["研发技术交底书（审阅稿）"]):
+        chapters = [f"{number}、{title}" for number, title in LEGACY_SECTION_TITLES.items()]
         headings = [(index, label) for index, label in enumerate(labels) if label in chapters]
-        if labels[2:3] != ["摘要"] or [label for _, label in headings] != chapters:
-            raise PolishError("交底书章节不完整，请选择本工具生成的六章版 DOCX。")
-        headings.insert(0, (2, "摘要"))
+        if [label for _, label in headings] != chapters or "摘要" not in labels[2:headings[0][0]]:
+            raise PolishError("交底书章节不完整，请选择本工具生成的 Word 交底书。")
+        headings.insert(0, (labels.index("摘要", 2), "摘要"))
     elif len(labels) >= 4 and labels[0] and labels[1] == "摘要" and labels[3] == "发明内容":
         headings = [(1, "摘要"), (3, "发明内容")]
+    elif len(labels) >= 4 and labels[0] and labels[1] == "摘要":
+        chapters = [chapter_heading(number, title) for number, title in SECTION_TITLES.items()]
+        headings = [(index, label) for index, label in enumerate(labels) if index >= 3 and label in chapters]
+        if [label for _, label in headings] != chapters:
+            raise PolishError("交底书章节不完整，请选择本工具生成的 Word 交底书。")
+        headings.insert(0, (1, "摘要"))
     else:
         raise PolishError("无法识别交底书结构，请选择本工具生成的技术交底书 DOCX。")
 
@@ -159,7 +165,7 @@ def _editable_text(paragraph: etree._Element) -> etree._Element | None:
     following = paragraph.getnext()
     if following is not None and following.tag == qn("w:p"):
         if following.xpath("./m:oMath | ./m:oMathPara") or following.text.startswith(
-            "原始公式表达（需人工复核）："
+            ("原始公式表达：", "原始公式表达（需人工复核）：")
         ):
             return None
     return nodes[0]

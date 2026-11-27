@@ -49,10 +49,12 @@ def run_portable_self_check(report_path: Path | None = None) -> int:
 
         from .disclosure.cnipa_upstream.browser import probe_launch
         from .disclosure.diagrams import _render_with_pillow, render_mermaid_flowchart
+        from .disclosure.drawio import drawio_renderer, drawio_runtime_path
         from .disclosure.math_to_omml import latex_to_omml_with_fallback
-        from .disclosure.models import TechnicalDisclosure
+        from .disclosure.models import DisclosureDiagram, DisclosureSection, TechnicalDisclosure
         from .disclosure.prompt_loader import load_prompt
-        from .disclosure_docx import build_technical_disclosure_document
+        from .disclosure.validation import SECTION_TITLES
+        from .disclosure_docx import build_technical_disclosure_document, validate_technical_disclosure_docx
         from .disclosure_polish import polish_disclosure_docx
         from .progress import ProgressTracker
 
@@ -85,9 +87,25 @@ def run_portable_self_check(report_path: Path | None = None) -> int:
         root.mkdir(parents=True, exist_ok=False)
         mermaid_png = root / "mermaid.png"
         pillow_png = root / "pillow.png"
+        drawio_png = root / "drawio.png"
+        drawio_source = root / "drawio.drawio"
         docx_path = root / "公式自检.docx"
         markdown_path = root / "交底书自检.md"
         try:
+            begin("render_drawio")
+            drawio_runtime = drawio_runtime_path()
+            if drawio_runtime is None:
+                raise FileNotFoundError("bundled Draw.io static editor is missing")
+            diagram = DisclosureDiagram(
+                "四", "流程图", "Draw.io 离线自检",
+                "flowchart TD\nS1[采集信号] --> S2{校验通过}\nS2 -->|是| S3[更新状态]\n"
+                "S2 -->|否| S4[保持上一周期输出]\nS4 --> S1",
+            )
+            with drawio_renderer(drawio_runtime) as render:
+                render(diagram, drawio_png, drawio_source)
+            if "保持上一周期输出" not in drawio_source.read_text(encoding="utf-8"):
+                raise RuntimeError("editable Draw.io diagram lost its Chinese label")
+
             begin("render_mermaid")
             source = "flowchart TD\nA[输入] --> B[控制模块]"
             render_mermaid_flowchart(source, mermaid_png, "Mermaid 自检")
@@ -96,7 +114,7 @@ def run_portable_self_check(report_path: Path | None = None) -> int:
             _render_with_pillow(source, pillow_png, "Pillow 自检")
 
             begin("verify_images")
-            for image_path in (mermaid_png, pillow_png):
+            for image_path in (drawio_png, mermaid_png, pillow_png):
                 with Image.open(image_path) as image:
                     image.verify()
 
@@ -133,14 +151,18 @@ def run_portable_self_check(report_path: Path | None = None) -> int:
                 raise RuntimeError("Markdown round-trip failed")
 
             begin("polish_disclosure_docx")
-            disclosure = TechnicalDisclosure("控制器自检", "控制器进行状态校验。", ())
+            sections = tuple(DisclosureSection(number, title, ("控制器检查信号。",))
+                             for number, title in SECTION_TITLES.items())
+            disclosure = TechnicalDisclosure("控制器自检", "控制器进行状态校验。", sections=sections)
             build_technical_disclosure_document(disclosure).save(docx_path)
+            validate_technical_disclosure_docx(docx_path, disclosure)
 
             def fake_chat(system_prompt: str, user_prompt: str) -> str:
                 if system_prompt != f"{disclosure_constraints}\n\n{upstream_rules}":
                     raise RuntimeError("polishing request did not include the complete Humanizer-zh rules")
                 paragraphs = json.loads(user_prompt)["paragraphs"]
-                paragraphs[0]["text"] = "控制器校验状态。"
+                if paragraphs[0]["text"] == disclosure.abstract:
+                    paragraphs[0]["text"] = "控制器校验状态。"
                 return json.dumps({"paragraphs": paragraphs})
 
             result = polish_disclosure_docx(docx_path, SimpleNamespace(chat=fake_chat), ProgressTracker("polish"))
@@ -151,7 +173,7 @@ def run_portable_self_check(report_path: Path | None = None) -> int:
                 result.output.unlink()
         finally:
             stage_before_cleanup = stage
-            for path in (mermaid_png, pillow_png, docx_path, markdown_path):
+            for path in (drawio_source, drawio_png, mermaid_png, pillow_png, docx_path, markdown_path):
                 if path.exists():
                     path.unlink()
             if root.exists():

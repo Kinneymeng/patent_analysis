@@ -1,4 +1,5 @@
 import json
+from contextlib import contextmanager
 from contextlib import redirect_stdout
 from io import StringIO
 import tempfile
@@ -7,11 +8,13 @@ from dataclasses import replace
 from pathlib import Path
 import re
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
+from xml.etree import ElementTree
 
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml.ns import qn
+from PIL import Image
 
 from patent_summarizer.cli import build_parser, main
 from patent_summarizer.config import AppConfig
@@ -48,7 +51,13 @@ from patent_summarizer.disclosure_docx import (
     validate_technical_disclosure_docx,
     write_technical_disclosure,
 )
-from patent_summarizer.disclosure.validation import effect_claim_problem
+from patent_summarizer.disclosure.cnipa_upstream.browser import launch_chromium
+from patent_summarizer.disclosure.cnipa_upstream.cnipa_epub_crawler import (
+    EpubBatchError, _launch_browser, _search_epub_batches, submit_advanced_search,
+)
+from patent_summarizer.disclosure.drawio import _style_diagram
+from patent_summarizer.disclosure.prior_art import CnipaPriorArtSearcher, PriorArtSearchError
+from patent_summarizer.disclosure.validation import SECTION_TITLES, chapter_heading, effect_claim_problem
 
 
 def _valid_payload(title: str = "一种冗余制动控制方法") -> dict:
@@ -84,23 +93,31 @@ def _valid_preview(title: str = "一种冗余制动控制方法") -> DisclosureP
 
 def _structured_reliability_payload(title: str = "车辆姿态融合阻尼控制方法") -> dict:
     section_titles = (
-        ("一", "技术背景与现有方案", "现有控制方案依赖单一信号，扰动条件下容易产生误判。"),
-        ("二", "需要解决的技术问题", "方案需要在传感器短时失效时继续稳定计算目标阻尼。"),
-        ("三", "技术方案详细说明", "姿态融合模块的输入为车速，输出为路面状态；阻尼计算模块输出目标阻尼。信号异常或超过边界时进入保持流程。"),
-        ("四", "技术效果与适用边界", "多信号判断可降低阻尼跳变，属于待验证的预期效果。"),
-        ("五", "技术关键点", "姿态融合模块先计算信号可信度，再选择阻尼标定区间。"),
-        ("六", "实施例与验证方法", "正常用例输入有效车速并检查目标阻尼；异常用例断开传感器并检查保持输出。"),
+        ("一", "技术领域", "本发明涉及车辆悬架控制，具体涉及按车辆姿态计算悬架阻尼的方法。"),
+        ("二", "背景技术", "现有控制方案依赖单一信号，扰动条件下容易产生误判。"),
+        ("四", "具体实施方式", "正常用例输入有效车速并检查目标阻尼；异常用例断开传感器并检查保持输出。"),
     )
+    sections = [
+        {"编号": number, "标题": heading, "段落": [paragraph], "小节": []}
+        for number, heading, paragraph in section_titles
+    ]
+    sections.insert(2, {
+        "编号": "三", "标题": "发明内容", "段落": [],
+        "小节": [
+            {"编号": "3.1", "标题": "发明目的", "段落": ["在传感器短时失效时保持稳定阻尼。"]},
+            {"编号": "3.2", "标题": "技术方案", "段落": [
+                "姿态融合模块的输入为车速，输出为路面状态，阻尼计算模块输出目标阻尼。",
+            ]},
+            {"编号": "3.3", "标题": "有益效果", "段落": ["多信号判断可降低阻尼跳变。"]},
+        ],
+    })
     return {
         "标题": title,
         "摘要": "本方案采集车辆速度和车身垂向加速度，计算信号可信度与路面状态，再根据路面状态计算目标悬架阻尼。系统在信号缺失、超时或越界时进入保持或降级流程，并记录触发原因。工程人员可以按照模块输入输出、计算顺序、参数设置和验证用例完成控制器实现与台架复现。",
-        "章节": [
-            {"编号": number, "标题": section_title, "段落": [paragraph], "小节": []}
-            for number, section_title, paragraph in section_titles
-        ],
+        "章节": sections,
         "图示": [
-            {"章节": "三", "类型": "系统架构图", "标题": "图1 系统架构", "mermaid": "flowchart TD\nA[车辆信号] --> B[姿态融合模块]\nB --> C[阻尼计算模块]"},
-            {"章节": "三", "类型": "流程图", "标题": "图2 控制流程", "mermaid": "flowchart TD\nS1[S1 采集信号] --> S2[S2 检查有效性]\nS2 --> S3[S3 计算目标阻尼]"},
+            {"章节": "四", "类型": "系统架构图", "标题": "图1 系统架构", "mermaid": "flowchart TD\nA[车辆信号] --> B[姿态融合模块]\nB --> C[阻尼计算模块]"},
+            {"章节": "四", "类型": "流程图", "标题": "图2 控制流程", "mermaid": "flowchart TD\nS1[S1 采集信号] --> S2[S2 检查有效性]\nS2 --> S3[S3 计算目标阻尼]"},
         ],
         "参数表": [],
         "公式": [],
@@ -507,8 +524,9 @@ class DisclosureCliTests(unittest.TestCase):
             ), patch(
                 "patent_summarizer.cli.DisclosureAnalyzer.review",
                 return_value=disclosure,
-            ):
+            ), patch("patent_summarizer.cli.CnipaPriorArtSearcher.search") as searched:
                 self.assertEqual(0, main(argv))
+                searched.assert_not_called()
             generated = output / f"{title}_技术交底书.docx"
             self.assertTrue(generated.exists())
 
@@ -676,7 +694,7 @@ class DisclosureReliabilityTests(unittest.TestCase):
             with self.subTest(source=source):
                 self.assertIsNotNone(effect_claim_problem(statement, source))
 
-    def test_both_sources_publish_and_resume_marked_review_drafts(self):
+    def test_both_sources_publish_clean_review_drafts_and_resume(self):
         payload = _structured_reliability_payload()
         title = payload["标题"]
         sections = {item["编号"]: {"章节": item} for item in payload["章节"]}
@@ -687,7 +705,7 @@ class DisclosureReliabilityTests(unittest.TestCase):
         }]
         bad_effect = {"章节": {**sections["四"]["章节"], "段落": [
             "多信号判断属于待验证的预期效果。台架实测表明阻尼波动降低 30%。"
-            "经查新未发现相似专利。"
+            "经查新未发现相似专利。", *sections["四"]["章节"]["段落"],
         ]}}
 
         class Model:
@@ -707,20 +725,14 @@ class DisclosureReliabilityTests(unittest.TestCase):
                 if write:
                     number = write[1]
                     self.calls.append(f"write-{number}")
-                    if self.broken and number == "三":
-                        return "无效 JSON"
                     if self.broken and number == "四":
                         return bad_effect
-                    if number == "三":
-                        return {"章节": {**sections[number]["章节"], "段落": [
-                            *sections[number]["章节"]["段落"], "q 为输入修正量。"
-                        ]}}
                     return sections[number]
                 if "当前待审校章节：" in prompt:
                     current = prompt.split("当前待审校章节：\n", 1)[1]
                     item, _ = json.JSONDecoder().raw_decode(current)
                     self.calls.append(f"review-{item['章节']['编号']}")
-                    if self.broken and item["章节"]["编号"] == "六":
+                    if self.broken and item["章节"]["编号"] == "二":
                         raise ConnectionError("审校连接中断")
                     return item
                 raise AssertionError("unexpected request")
@@ -762,6 +774,8 @@ class DisclosureReliabilityTests(unittest.TestCase):
                     "patent_summarizer.cli.DisclosureAnalyzer.build_preview", return_value=preview
                 ) as build_preview, patch(
                     "patent_summarizer.disclosure.diagrams._mermaid_runtime_path", return_value=None
+                ), patch(
+                    "patent_summarizer.disclosure.diagrams.drawio_runtime_path", return_value=None
                 ), patch("patent_summarizer.disclosure.diagrams._render_with_pillow", side_effect=render):
                     log = StringIO()
                     with redirect_stdout(log):
@@ -771,15 +785,30 @@ class DisclosureReliabilityTests(unittest.TestCase):
                     docx = first.with_suffix(".docx")
                     markdown = first.with_suffix(".md")
                     original = docx.read_bytes()
+                    document = Document(docx)
+                    self.assertEqual([paragraph.text for paragraph in document.paragraphs[:2]], [title, "摘要"])
+                    self.assertEqual(
+                        [p.text for p in document.paragraphs if p.style.name == "Heading 1"],
+                        [chapter_heading(number, name) for number, name in SECTION_TITLES.items()],
+                    )
+                    self.assertEqual(len(document.inline_shapes), 1)
+                    self.assertEqual(len(document.element.body.xpath(".//m:oMath")), 1)
                     for content in (markdown.read_text(encoding="utf-8"),
-                                    "\n".join(p.text for p in Document(docx).paragraphs)):
-                        for marker in ("待确认事项", "第六章独立审校未完成", "图示未能渲染",
-                                       "式（1）存在未定义符号：q", "姿态融合模块", "【待核验】"):
-                            self.assertIn(marker, content)
-                        self.assertNotIn("降低 30%", content)
+                                    "\n".join(p.text for p in document.paragraphs)):
+                        for marker in ("待确认事项", "独立审校未完成", "【待补】", "【待复核】",
+                                       "式（1）存在未定义符号", "【待核验】"):
+                            self.assertNotIn(marker, content)
+                        self.assertIn("姿态融合模块", content)
+                        self.assertIn("降低 30%", content)
                         self.assertNotIn("未发现相似专利", content)
-                    self.assertEqual(model.calls.count("write-三"), 2)
-                    self.assertEqual(model.calls.count("formula"), 1)
+                    self.assertEqual(model.calls.count("write-三"), 1)
+                    self.assertNotIn("formula", model.calls)
+                    self.assertNotIn("公式局部纠错", log.getvalue())
+                    self.assertNotIn("来源材料没有验证记录", log.getvalue())
+                    diagnostic = output / ".patent_disclosure_work" / "diagnostics" / f"{first.name}.json"
+                    codes = {item["code"] for item in json.loads(diagnostic.read_text(encoding="utf-8"))}
+                    self.assertIn("chapter-review-pending", codes)
+                    self.assertIn("prior-art-claim-pending", codes)
 
                     with redirect_stdout(StringIO()):
                         self.assertEqual(main(argv), 0)
@@ -793,9 +822,9 @@ class DisclosureReliabilityTests(unittest.TestCase):
                         self.assertEqual(main(argv), 1)
                     self.assertIn("图文导出与文件核验：模拟输出目录不可写", log.getvalue())
                     self.assertFalse((output / f"{title}_技术交底书.docx").exists())
-                    self.assertNotIn("artifacts", model.calls)
+                    self.assertIn("artifacts", model.calls)
                     self.assertEqual([call for call in model.calls if call.startswith("write-")],
-                                     ["write-三", "write-四"])
+                                     ["write-四"])
                     model.calls.clear()
                     with redirect_stdout(log):
                         self.assertEqual(main(argv), 0)
@@ -829,10 +858,10 @@ class DisclosureReliabilityTests(unittest.TestCase):
 
     def test_missing_confirmed_content_is_restored_as_diagnostics(self):
         payload = _structured_reliability_payload()
-        payload["章节"][2]["段落"] = [
+        payload["章节"][2]["小节"][1]["段落"] = [
             "控制器接收输入并产生输出，信号异常或超过边界时保持上一周期结果。"
         ]
-        payload["章节"][4]["段落"] = ["控制器执行状态判断和阻尼计算。"]
+        payload["章节"][3]["段落"] = ["控制器执行状态判断和阻尼计算。"]
         payload["图示"][0]["mermaid"] = "flowchart TD\nA[输入] --> B[计算]\nB --> C[输出]"
         disclosure = parse_technical_disclosure(payload, payload["标题"])
         preview = DisclosurePreview(
@@ -860,6 +889,8 @@ class DisclosureReliabilityTests(unittest.TestCase):
         self.assertIn("confirmed-modules-restored", codes)
         self.assertIn("confirmed-key-points-restored", codes)
         self.assertIn("confirmed-parameters-restored", codes)
+        self.assertIn("confirmed-steps-restored", codes)
+        self.assertEqual(restored, reconcile_disclosure_with_preview(restored, preview))
 
     def test_formula_failure_delivers_editable_linear_formula_with_warning(self):
         payload = _structured_reliability_payload()
@@ -895,7 +926,7 @@ class DisclosureReliabilityTests(unittest.TestCase):
 
             def chat(self, _system, prompt):
                 self.calls.append(prompt)
-                for number in ("一", "二", "三", "四", "五", "六"):
+                for number in SECTION_TITLES:
                     if f"当前只撰写：{number}、" in prompt:
                         if self.fail_on == number:
                             raise ConnectionError("simulated interruption")
@@ -932,10 +963,244 @@ class DisclosureReliabilityTests(unittest.TestCase):
                 source, payload["标题"], preview
             )
 
-        self.assertEqual(6, len(result.sections))
+        self.assertEqual(4, len(result.sections))
         self.assertFalse(any("当前只撰写：一、" in prompt for prompt in second.calls))
         self.assertFalse(any("当前只撰写：二、" in prompt for prompt in second.calls))
         self.assertTrue(any("当前只撰写：三、" in prompt for prompt in second.calls))
+        third = next(prompt for prompt in second.calls if "当前只撰写：三、" in prompt)
+        previous = json.loads(third.split("已完成的前文章节：\n", 1)[1].split("\n\n当前只撰写", 1)[0])
+        self.assertEqual(previous, payload["章节"][:2])
+
+
+class CnipaSearchTests(unittest.TestCase):
+    def test_advanced_click_only_dispatches_and_allows_a_response_after_thirty_seconds(self):
+        fake_time_ms = 0
+        page = Mock()
+        button = page.locator.return_value.get_by_role.return_value
+
+        @contextmanager
+        def response_wait(*, wait_until, timeout):
+            nonlocal fake_time_ms
+            self.assertEqual(wait_until, "commit")
+            navigation = SimpleNamespace()
+            yield navigation
+            fake_time_ms += 35_000
+            self.assertGreater(timeout, fake_time_ms)
+            navigation.value = SimpleNamespace(status=200)
+
+        page.expect_navigation.side_effect = response_wait
+        page.wait_for_function.return_value.json_value.return_value = "results"
+        with patch("patent_summarizer.disclosure.cnipa_upstream.cnipa_epub_crawler.apply_epub_advanced_type_filter"):
+            self.assertEqual("results", submit_advanced_search(page, "转向控制", class_code="B62D5"))
+        button.click.assert_called_once_with(timeout=10_000, no_wait_after=True)
+        self.assertEqual(fake_time_ms, 35_000)
+
+    def test_advanced_http_error_stops_before_dom_wait(self):
+        page = Mock()
+
+        @contextmanager
+        def rejected_navigation(**_):
+            yield SimpleNamespace(value=SimpleNamespace(status=400))
+
+        page.expect_navigation.side_effect = rejected_navigation
+        with patch("patent_summarizer.disclosure.cnipa_upstream.cnipa_epub_crawler.apply_epub_advanced_type_filter"):
+            with self.assertRaisesRegex(RuntimeError, "高级查询提交收到 HTTP 400"):
+                submit_advanced_search(page, "转向控制", class_code="B62D5")
+        page.wait_for_function.assert_not_called()
+
+    def test_browser_returns_empty_only_for_an_explicit_zero_result(self):
+        module = "patent_summarizer.disclosure.cnipa_upstream.cnipa_epub_crawler"
+        with patch(module + ".wait_for_epub_home_ready"), patch(
+            module + "._safe_page_content", return_value="<html/>",
+        ), patch(module + ".parse_search_result_html", return_value=[]), patch(
+            module + ".submit_index_search", side_effect=["empty", "results"],
+        ):
+            self.assertEqual([("<html/>", [])], _search_epub_batches(Mock(), ["转向控制"], patent_type="invention"))
+            with self.assertRaisesRegex(EpubBatchError, "无法解析专利记录"):
+                _search_epub_batches(Mock(), ["转向控制"], patent_type="invention")
+
+    def test_default_search_reuses_session_and_retains_completed_ipc_batches(self):
+        def hit(index):
+            return SimpleNamespace(pub_number=f"CN12345678{index}A", title=f"转向控制{index}",
+                                   abstract="转向控制公开摘要", ipc_codes=["B62D5/04"],
+                                   link=f"http://epub.cnipa.gov.cn/patent/CN12345678{index}A")
+
+        advanced_error = EpubBatchError(RuntimeError("高级查询提交收到 HTTP 400"), [("<html>", [hit(2)])])
+        search = Mock(side_effect=[[("<html>", [hit(1)])], advanced_error])
+
+        @contextmanager
+        def session():
+            yield search
+
+        with patch("patent_summarizer.disclosure.cnipa_upstream.cnipa_epub_crawler.epub_search_session",
+                   side_effect=session) as start:
+            result = CnipaPriorArtSearcher().search(["转向控制"])
+        start.assert_called_once_with()
+        self.assertEqual(2, search.call_count)
+        self.assertEqual(PriorArtStatus.PARTIAL, result.status)
+        self.assertIn("HTTP 400", result.message)
+        self.assertEqual([hit(1).pub_number, hit(2).pub_number], [r.publication_number for r in result.records])
+
+    def test_bundled_browser_preference_is_local_to_cnipa(self):
+        playwright = Mock()
+        with patch.dict("os.environ", {}, clear=True):
+            _launch_browser(playwright)
+            self.assertNotIn("channel", playwright.chromium.launch.call_args.kwargs)
+            launch_chromium(playwright)
+            self.assertEqual("chrome", playwright.chromium.launch.call_args.kwargs["channel"])
+            playwright.chromium.launch.side_effect = [RuntimeError("missing"), Mock()]
+            _launch_browser(playwright)
+            self.assertEqual("chrome", playwright.chromium.launch.call_args.kwargs["channel"])
+        with patch.dict("os.environ", {"PATENT_BROWSER_CHANNEL": "msedge"}):
+            playwright.chromium.launch.side_effect = None
+            _launch_browser(playwright)
+            self.assertEqual("msedge", playwright.chromium.launch.call_args.kwargs["channel"])
+
+    def test_ipc_timeout_preserves_real_first_pass_records_even_above_threshold(self):
+        hits = [
+            SimpleNamespace(pub_number=f"CN12345678{index}A", title=f"转向控制{index}",
+                            abstract="转向控制公开摘要", ipc_codes=["B62D5/04"],
+                            link=f"http://epub.cnipa.gov.cn/patent/CN12345678{index}A")
+            for index in range(4)
+        ]
+        transport = Mock(side_effect=[[("<html>", hits)], TimeoutError("模拟 IPC 超时")])
+        search = CnipaPriorArtSearcher(transport)
+        result = search.search(["电动助力转向"])
+        self.assertEqual(result.status, PriorArtStatus.PARTIAL)
+        self.assertEqual([record.publication_number for record in result.records], [hit.pub_number for hit in hits])
+        self.assertIn("IPC 高级检索未完成", result.message)
+        self.assertEqual(transport.call_args_list[1].kwargs["class_codes"], ["B62D5"])
+
+        unverified = SimpleNamespace(**{**vars(hits[0]), "link": "https://example.test/patent"})
+        transport.side_effect = [[("<html>", [unverified])], TimeoutError("模拟 IPC 超时")]
+        with self.assertRaisesRegex(PriorArtSearchError, "IPC 高级检索未完成"):
+            search.search(["电动助力转向"])
+
+    def test_empty_and_blocked_search_are_distinct(self):
+        transport = Mock(return_value=[("<html>", [])])
+        search = CnipaPriorArtSearcher(transport)
+        self.assertEqual(search.search(["电动助力转向"]).status, PriorArtStatus.EMPTY)
+        transport.assert_called_once()
+        transport.side_effect = RuntimeError("net::ERR_BLOCKED_BY_CLIENT")
+        with self.assertRaisesRegex(PriorArtSearchError, "关键词检索失败.*ERR_BLOCKED_BY_CLIENT"):
+            search.search(["电动助力转向"])
+
+
+class DrawioDeliveryTests(unittest.TestCase):
+    def test_styling_preserves_drawio_decision_shape_and_branch_label(self):
+        xml = (
+            '<mxGraphModel><root><mxCell id="a" vertex="1" style="rhombus;whiteSpace=wrap;"/>'
+            '<mxCell id="b" edge="1" source="a" value="否"/></root></mxGraphModel>'
+        )
+        model = ElementTree.fromstring(_style_diagram(xml, "流程图"))
+        decision, branch = model.findall(".//mxCell")
+        self.assertIn("rhombus;", decision.get("style"))
+        self.assertIn("fillColor=#fff2cf;", decision.get("style"))
+        self.assertEqual("a", branch.get("source"))
+        self.assertEqual("否", branch.get("value"))
+
+    def test_normalizes_a_large_decision_and_routes_feedback_orthogonally(self):
+        xml = (
+            '<mxGraphModel><root><mxCell id="0"/><mxCell id="1" parent="0"/>'
+            '<UserObject id="2" mermaidId="n:S1" label="S1 采集信号">'
+            '<mxCell vertex="1" parent="1"><mxGeometry x="190" y="0" width="140" height="54"/></mxCell>'
+            '</UserObject><UserObject id="3" mermaidId="n:S2" label="S2 判断多通道传感器输入信号是否可用">'
+            '<mxCell vertex="1" parent="1" style="rhombus;">'
+            '<mxGeometry x="0" y="115" width="459" height="459"/></mxCell></UserObject>'
+            '<mxCell id="4" edge="1" parent="1" source="2" target="3" style="curved=1;"/>'
+            '<mxCell id="5" edge="1" parent="1" source="3" target="2" value="否" style="curved=1;"/>'
+            '</root></mxGraphModel>'
+        )
+        result = ElementTree.fromstring(_style_diagram(xml, "流程图"))
+        decision = result.find(".//UserObject[@id='3']")
+        self.assertLess(float(decision.find("mxCell/mxGeometry").get("height")), 125)
+        self.assertIn("<br>", decision.get("label"))
+        feedback = result.find(".//mxCell[@id='5']")
+        self.assertIn("orthogonalEdgeStyle", feedback.get("style"))
+        self.assertIn("curved=0", feedback.get("style"))
+        self.assertIn("dashed=1", feedback.get("style"))
+        self.assertEqual(2, len(feedback.findall("mxGeometry/Array/mxPoint")))
+        self.assertEqual("否", feedback.get("value"))
+
+    def test_model_can_place_and_group_existing_nodes_without_changing_edges(self):
+        xml = (
+            '<mxGraphModel><root><mxCell id="0"/><mxCell id="1" parent="0"/>'
+            '<UserObject id="2" mermaidId="n:A" label="输入"><mxCell vertex="1" parent="1"/></UserObject>'
+            '<UserObject id="3" mermaidId="n:B" label="计算"><mxCell vertex="1" parent="1"/></UserObject>'
+            '<mxCell id="4" edge="1" parent="1" source="2" target="3"/>'
+            '</root></mxGraphModel>'
+        )
+        layout = {"节点": {"A": [180, 90, "input"], "B": [420, 90, "output"]},
+                  "分组": [{"名称": "控制模块", "节点": ["A", "B"]}]}
+        result = ElementTree.fromstring(_style_diagram(xml, "架构", layout, horizontal=True))
+        self.assertEqual("96.0", result.find(".//UserObject[@id='2']/mxCell/mxGeometry").get("x"))
+        self.assertIsNotNone(result.find(".//mxCell[@value='控制模块']"))
+        self.assertEqual("3", result.find(".//mxCell[@id='4']").get("target"))
+
+    def test_missing_diagram_does_not_trigger_another_model_call(self):
+        from patent_summarizer.disclosure.recovery import prepare_artifacts
+
+        payload = _structured_reliability_payload()
+        preview = _valid_preview(payload["标题"])
+        repair = Mock(side_effect=AssertionError("unexpected diagram regeneration"))
+        raw = {key: payload[key] for key in ("摘要", "图示", "参数表", "公式")}
+        raw["图示"] = [payload["图示"][0], {"mermaid": "invalid chart"}]
+        result, _ = prepare_artifacts(TechnicalDisclosure(payload["标题"], ""), raw, preview, repair)
+        self.assertEqual(1, len(result.diagrams))
+        self.assertIn("diagram-missing", [item.code for item in result.diagnostics])
+        repair.assert_not_called()
+
+    def test_a_drawio_failure_only_rerenders_the_failed_figure(self):
+        payload = _structured_reliability_payload("一种姿态融合 (验证) 方法")
+        disclosure = parse_technical_disclosure(payload, payload["标题"])
+
+        @contextmanager
+        def drawio(_runtime):
+            def render(diagram, image, editable):
+                editable.write_text("<mxfile/>", encoding="utf-8")
+                if diagram.kind == "流程图":
+                    raise RuntimeError("模拟 PNG 导出失败")
+                Image.new("RGB", (100, 64), "white").save(image)
+            yield render
+
+        def mermaid(_source, image, _title, *, diagnostics):
+            Image.new("RGB", (64, 100), "white").save(image)
+            return image
+
+        module = "patent_summarizer.disclosure.diagrams"
+        with tempfile.TemporaryDirectory() as directory, patch(module + ".drawio_runtime_path", return_value=Path(".")), patch(
+            module + ".drawio_renderer", side_effect=drawio,
+        ), patch(module + ".render_mermaid_flowchart", side_effect=mermaid) as fallback:
+            paths = write_disclosure_bundle(disclosure, Path(directory))
+            fallback.assert_called_once()
+            self.assertEqual(disclosure.diagrams[1].mermaid, fallback.call_args.args[0])
+            self.assertEqual(["diagram_01.drawio"], [path.name for path in paths.assets_dir.glob("*.drawio")])
+            markdown = paths.markdown.read_text(encoding="utf-8")
+            self.assertIn("diagram_01.drawio", markdown)
+            self.assertNotIn("diagram_02.drawio", markdown)
+            self.assertIn("%28", markdown)
+            self.assertEqual(2, len(Document(paths.docx).inline_shapes))
+            self.assertIn("drawio-fallback", [item.code for item in paths.diagnostics])
+            from patent_summarizer.disclosure import existing_disclosure_bundle_complete
+            self.assertTrue(existing_disclosure_bundle_complete(paths))
+            (paths.assets_dir / "diagram_01.drawio").unlink()
+            self.assertFalse(existing_disclosure_bundle_complete(paths))
+
+    def test_mermaid_failure_uses_pillow_after_drawio_failure(self):
+        payload = _structured_reliability_payload()
+        disclosure = parse_technical_disclosure(payload, payload["标题"])
+        module = "patent_summarizer.disclosure.diagrams"
+        with tempfile.TemporaryDirectory() as directory, patch(module + ".drawio_runtime_path", return_value=Path(".")), patch(
+            module + ".drawio_renderer", side_effect=RuntimeError("模拟 Draw.io 启动失败"),
+        ), patch(module + "._mermaid_runtime_path", return_value=Path("mermaid.js")), patch(
+            module + "._render_with_mermaid", side_effect=RuntimeError("模拟 Mermaid 导出失败"),
+        ) as mermaid:
+            paths = write_disclosure_bundle(disclosure, Path(directory))
+            self.assertGreaterEqual(mermaid.call_count, 2)
+            self.assertEqual(2, len(Document(paths.docx).inline_shapes))
+            codes = [item.code for item in paths.diagnostics]
+            self.assertEqual(2, codes.count("drawio-fallback"))
+            self.assertEqual(2, codes.count("pillow-fallback"))
 
 
 if __name__ == "__main__":

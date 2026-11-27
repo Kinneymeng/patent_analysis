@@ -4,7 +4,7 @@ from functools import lru_cache
 from importlib.resources import files
 
 
-PROMPT_VERSION = "engineering-disclosure-v2"
+PROMPT_VERSION = "engineering-disclosure-v4"
 
 
 @lru_cache(maxsize=None)

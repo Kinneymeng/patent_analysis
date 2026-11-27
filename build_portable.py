@@ -3,13 +3,17 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
+import io
 import json
 import os
 import shutil
 import subprocess
 import sys
+import tarfile
 import urllib.request
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+
+from patent_summarizer.disclosure.drawio import DRAWIO_VERSION
 
 
 ROOT = Path(__file__).resolve().parent
@@ -22,6 +26,10 @@ PLAYWRIGHT_BROWSERS = ROOT / "build" / "playwright-browsers"
 MERMAID_RUNTIME = ROOT / "build" / "vendor" / "mermaid.min.js"
 MERMAID_URL = "https://cdnjs.cloudflare.com/ajax/libs/mermaid/11.12.0/mermaid.min.js"
 MERMAID_SHA512 = "5TKaYvhenABhlGIKSxAWLFJBZCSQw7HTV7aL1dJcBokM/+3PNtfgJFlv8E6Us/B1VMlQ4u8sPzjudL9TEQ06ww=="
+DRAWIO_RUNTIME = ROOT / "build" / "vendor" / f"drawio-{DRAWIO_VERSION}"
+DRAWIO_URL = f"https://registry.npmjs.org/@next-ai-drawio/mcp-server/-/mcp-server-{DRAWIO_VERSION}.tgz"
+DRAWIO_SHA512 = "t0X5MNyNe0598dlh17CQb1vpP4ENGhMmLfzdxJtK9S93dxze7gKw+SZ/tMXgZKGVE6tItavRZDj0f1CuQ6+YMQ=="
+DRAWIO_REQUIRED = ("index.html", "LICENSE", "img/LICENSE", "shapes/LICENSE", "stencils/LICENSE", "templates/LICENSE")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -42,6 +50,7 @@ def main(argv: list[str] | None = None) -> int:
         # Keep Tcl/Tk DLLs and scripts from the same environment when PyInstaller resolves imports.
         build_env["PATH"] = os.pathsep.join((str(conda_bin), build_env.get("PATH", "")))
     ensure_mermaid_runtime()
+    build_env["PATENT_DRAWIO_RUNTIME"] = str(ensure_drawio_runtime())
     subprocess.run(
         [sys.executable, "-m", "playwright", "install", "chromium"],
         cwd=ROOT,
@@ -84,14 +93,10 @@ def copy_runtime_files(dist_app: Path) -> None:
         raise FileNotFoundError(f"Missing required user guide: {user_guide}")
     shutil.copy2(user_guide, dist_app / USER_GUIDE_NAME)
 
-    env_file = ROOT / ".env"
-    if env_file.exists():
-        shutil.copy2(env_file, dist_app / ".env")
-        return
-
     env_example = ROOT / ".env.example"
-    if env_example.exists():
-        shutil.copy2(env_example, dist_app / ".env")
+    if not env_example.is_file():
+        raise FileNotFoundError(f"Missing required configuration template: {env_example}")
+    shutil.copy2(env_example, dist_app / env_example.name)
 
 
 def ensure_mermaid_runtime() -> Path:
@@ -119,6 +124,44 @@ def _verify_mermaid_runtime(data: bytes) -> None:
         raise ValueError("Downloaded Mermaid runtime failed its pinned SHA-512 integrity check")
 
 
+def ensure_drawio_runtime() -> Path:
+    marker = DRAWIO_RUNTIME / ".integrity"
+    if (marker.is_file() and marker.read_text(encoding="ascii") == DRAWIO_SHA512
+            and all((DRAWIO_RUNTIME / name).is_file() for name in DRAWIO_REQUIRED)):
+        return DRAWIO_RUNTIME
+
+    archive_path = DRAWIO_RUNTIME.with_name(f"{DRAWIO_RUNTIME.name}.tgz")
+    if archive_path.is_file():
+        data = archive_path.read_bytes()
+    else:
+        with urllib.request.urlopen(DRAWIO_URL, timeout=120) as response:
+            data = response.read()
+    if base64.b64encode(hashlib.sha512(data).digest()).decode("ascii") != DRAWIO_SHA512:
+        raise ValueError("Draw.io archive failed its pinned SHA-512 integrity check")
+    DRAWIO_RUNTIME.mkdir(parents=True, exist_ok=True)
+    if not archive_path.is_file():
+        temporary = archive_path.with_suffix(".tgz.tmp")
+        temporary.write_bytes(data)
+        temporary.replace(archive_path)
+    prefix = "package/dist/drawio/"
+    root = DRAWIO_RUNTIME.resolve()
+    with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as archive:
+        for member in archive:
+            if not member.isfile() or not member.name.startswith(prefix):
+                continue
+            relative = PurePosixPath(member.name.removeprefix(prefix))
+            target = (root / relative).resolve()
+            if not target.is_relative_to(root) or "\\" in member.name or ".." in relative.parts:
+                raise ValueError(f"Unsafe Draw.io resource path: {member.name}")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with archive.extractfile(member) as source, target.open("wb") as output:
+                shutil.copyfileobj(source, output)
+    if not all((root / name).is_file() for name in DRAWIO_REQUIRED):
+        raise FileNotFoundError("Draw.io archive lacks static editor files or license notices")
+    marker.write_text(DRAWIO_SHA512, encoding="ascii")
+    return root
+
+
 def verify_portable_application(
     dist_app: Path,
     *,
@@ -127,9 +170,11 @@ def verify_portable_application(
     internal = dist_app / "_internal"
     required = (
         dist_app / "PatentSummarizer.exe",
+        dist_app / ".env.example",
         internal / "playwright-browsers",
         internal / "playwright" / "driver" / "node.exe",
         internal / "mermaid" / "mermaid.min.js",
+        *(internal / "drawio" / name for name in DRAWIO_REQUIRED),
         internal / "latex2mathml" / "unimathsymbols.txt",
         internal / "patent_summarizer" / "disclosure" / "prompts" / "common.md",
         internal / "patent_summarizer" / "disclosure" / "prompts" / "polish.md",
@@ -145,6 +190,10 @@ def verify_portable_application(
             "Portable build is missing required disclosure resources: "
             + "; ".join(str(path) for path in missing)
         )
+    if any(path.is_file() for path in dist_app.rglob(".env")):
+        raise ValueError("Portable build must not contain a .env file")
+    if (dist_app / ".env.example").read_bytes() != (ROOT / ".env.example").read_bytes():
+        raise ValueError("Packaged .env.example differs from the source template")
     browser_root = internal / "playwright-browsers"
     executables = list(browser_root.rglob("chrome.exe")) + list(
         browser_root.rglob("headless_shell.exe")

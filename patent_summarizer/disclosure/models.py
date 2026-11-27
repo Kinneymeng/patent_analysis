@@ -216,6 +216,8 @@ class DisclosureDiagram:
     title: str
     mermaid: str
     image_path: Path | None = None
+    drawio_path: Path | None = None
+    layout: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True)

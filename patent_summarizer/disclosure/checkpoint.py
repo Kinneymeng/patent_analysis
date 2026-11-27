@@ -11,7 +11,7 @@ from .models import TechnicalDisclosure
 from .validation import disclosure_to_payload, parse_technical_disclosure
 
 
-DISCLOSURE_PROMPT_VERSION = "engineering-disclosure-v3"
+DISCLOSURE_PROMPT_VERSION = "engineering-disclosure-v4"
 
 
 class DisclosureCheckpointStore:

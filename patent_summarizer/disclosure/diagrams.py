@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import re
 import uuid
+from contextlib import ExitStack
 from dataclasses import replace
 from pathlib import Path
 import sys
 
+from .drawio import drawio_renderer, drawio_runtime_path
 from .models import DisclosureDiagnostic, DisclosureDiagram, TechnicalDisclosure
 
 
@@ -26,101 +28,46 @@ def render_disclosure_diagrams(
     if not disclosure.diagrams:
         return disclosure
     assets_dir.mkdir(parents=True, exist_ok=True)
-    runtime = _mermaid_runtime_path()
-    if runtime is not None:
-        try:
-            return _render_diagrams_with_shared_browser(
-                disclosure,
-                assets_dir,
-                runtime,
-                diagnostics,
-                allow_unrendered=allow_unrendered,
-            )
-        except RuntimeError as exc:
-            browser_error = str(exc)
-    else:
-        browser_error = "本地 Mermaid 运行时不可用"
     rendered: list[DisclosureDiagram] = []
-    for index, diagram in enumerate(disclosure.diagrams, start=1):
-        output = assets_dir / f"diagram_{index:02d}.png"
-        try:
-            _render_with_pillow(_normalize_mermaid(diagram.mermaid), output, diagram.title)
-        except Exception as exc:
-            if allow_unrendered:
+    runtime = drawio_runtime_path()
+    with ExitStack() as stack:
+        render = None
+        startup_error = "本地 Draw.io 运行时不可用"
+        if runtime is not None:
+            try:
+                render = stack.enter_context(drawio_renderer(runtime))
+            except Exception as exc:
+                startup_error = str(exc)
+        for index, diagram in enumerate(disclosure.diagrams, start=1):
+            image = assets_dir / f"diagram_{index:02d}.png"
+            editable = image.with_suffix(".drawio")
+            drawio_error = startup_error
+            if render is not None:
+                try:
+                    render(diagram, image, editable)
+                except Exception as exc:
+                    drawio_error = str(exc)
+                    editable.unlink(missing_ok=True)
+                    image.unlink(missing_ok=True)
+                else:
+                    rendered.append(replace(diagram, image_path=image, drawio_path=editable))
+                    continue
+
+            if diagnostics is not None:
+                diagnostics.append(DisclosureDiagnostic(
+                    "diagram-export", "drawio-fallback",
+                    f"{diagram.title} 的 Draw.io 出图失败：{drawio_error}",
+                    "已切换到 Mermaid 备用出图",
+                ))
+            try:
+                render_mermaid_flowchart(diagram.mermaid, image, diagram.title, diagnostics=diagnostics)
+            except Exception as exc:
+                if not allow_unrendered:
+                    raise
                 _record_unrendered(diagnostics, diagram.title, str(exc))
                 rendered.append(diagram)
-                continue
-            raise RuntimeError(
-                f"Mermaid 与备用图示转换均失败：{browser_error}；Pillow: {exc}"
-            ) from exc
-        _record_pillow_fallback(diagnostics, diagram.title, browser_error)
-        rendered.append(replace(diagram, image_path=output))
-    return replace(disclosure, diagrams=tuple(rendered))
-
-
-def _render_diagrams_with_shared_browser(
-    disclosure: TechnicalDisclosure,
-    assets_dir: Path,
-    runtime: Path,
-    diagnostics: list[DisclosureDiagnostic] | None,
-    *,
-    allow_unrendered: bool,
-) -> TechnicalDisclosure:
-    try:
-        from playwright.sync_api import sync_playwright
-        from .cnipa_upstream.browser import launch_chromium
-    except ImportError as exc:
-        raise RuntimeError("Mermaid 图示生成缺少便携包内的 Playwright 组件") from exc
-    rendered: list[DisclosureDiagram] = []
-    try:
-        with sync_playwright() as playwright:
-            browser, _label = launch_chromium(playwright, headless=True)
-            context = browser.new_context(
-                viewport={"width": 1600, "height": 1200},
-                device_scale_factor=2,
-            )
-            try:
-                page = context.new_page()
-                for index, diagram in enumerate(disclosure.diagrams, start=1):
-                    output = assets_dir / f"diagram_{index:02d}.png"
-                    errors = []
-                    for candidate in (diagram.mermaid, _normalize_mermaid(diagram.mermaid)):
-                        if candidate != diagram.mermaid or not errors:
-                            try:
-                                _render_mermaid_page(page, candidate, output, diagram.title, runtime)
-                                break
-                            except Exception as exc:
-                                errors.append(f"{type(exc).__name__}: {exc}")
-                    else:
-                        try:
-                            _render_with_pillow(
-                                _normalize_mermaid(diagram.mermaid),
-                                output,
-                                diagram.title,
-                            )
-                        except Exception as exc:
-                            if allow_unrendered:
-                                _record_unrendered(diagnostics, diagram.title, str(exc))
-                                rendered.append(diagram)
-                                continue
-                            raise RuntimeError(
-                                f"{diagram.title} 的 Mermaid 与 Pillow 转换均失败："
-                                + "；".join(errors)
-                                + f"；Pillow: {exc}"
-                            ) from exc
-                        _record_pillow_fallback(
-                            diagnostics,
-                            diagram.title,
-                            "；".join(errors),
-                        )
-                    rendered.append(replace(diagram, image_path=output))
-            finally:
-                context.close()
-                browser.close()
-    except RuntimeError:
-        raise
-    except Exception as exc:
-        raise RuntimeError(f"Mermaid 共享浏览器启动或渲染失败：{exc}") from exc
+            else:
+                rendered.append(replace(diagram, image_path=image, drawio_path=None))
     return replace(disclosure, diagrams=tuple(rendered))
 
 
@@ -130,7 +77,7 @@ def _record_unrendered(
     if diagnostics is not None:
         diagnostics.append(DisclosureDiagnostic(
             "diagram-export", "diagram-unrendered", f"{title} 无法生成图片：{error}",
-            "已在对应位置保留图题及待补提示，Markdown 附原图源", requires_review=True,
+            "Markdown 已保留图题及原图源", requires_review=True,
         ))
 
 
@@ -268,8 +215,10 @@ def _render_with_mermaid(source: str, output: Path, title: str, runtime: Path) -
             context = browser.new_context(
                 viewport={"width": 1600, "height": 1200},
                 device_scale_factor=2,
+                service_workers="block",
             )
             try:
+                context.route("**/*", lambda route: route.abort())
                 page = context.new_page()
                 _render_mermaid_page(page, source, temporary, title, runtime)
             finally:
@@ -288,20 +237,28 @@ def _render_mermaid_page(page, source: str, output: Path, title: str, runtime: P
     from PIL import Image
 
     page.set_content(
-        "<html><body style='margin:0;padding:32px;background:white'>"
-        "<h2 id='title'></h2><div id='graph'></div></body></html>"
+        "<html><body style='margin:0;background:white'>"
+        "<main id='figure' style='display:inline-block;padding:24px;text-align:center;background:white'>"
+        "<h2 id='title' style='margin:0 0 12px'></h2><div id='graph'></div></main></body></html>"
     )
     page.add_script_tag(path=str(runtime))
     page.evaluate(
         """async ({code, title, graphId}) => {
-            document.getElementById('title').textContent = title;
-            mermaid.initialize({startOnLoad: false, securityLevel: 'strict', theme: 'default'});
+            const heading = document.getElementById('title');
+            heading.textContent = title;
+            heading.hidden = !title;
+            mermaid.initialize({startOnLoad: false, securityLevel: 'strict', theme: 'default',
+                                flowchart: {curve: 'step'}});
             const rendered = await mermaid.render(graphId, code);
-            document.getElementById('graph').innerHTML = rendered.svg;
+            const graph = document.getElementById('graph');
+            graph.innerHTML = rendered.svg;
+            const svg = graph.querySelector('svg');
+            svg.style.width = `${svg.viewBox.baseVal.width}px`;
+            svg.style.height = 'auto';
         }""",
         {"code": source, "title": title, "graphId": f"graph-{uuid.uuid4().hex}"},
     )
-    page.locator("body").screenshot(path=str(output), animations="disabled")
+    page.locator("#figure").screenshot(path=str(output), animations="disabled")
     with Image.open(output) as check:
         check.verify()
 

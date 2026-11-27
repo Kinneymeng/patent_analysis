@@ -7,6 +7,8 @@ import uuid
 from zipfile import BadZipFile
 from dataclasses import replace
 from pathlib import Path
+from urllib.parse import quote, unquote
+from xml.etree import ElementTree
 
 from docx import Document
 from PIL import Image
@@ -16,7 +18,13 @@ from .diagrams import render_disclosure_diagrams
 from .math_to_omml import latex_to_omml_with_fallback
 from .legacy import disclosure_output_path, validate_disclosure_title
 from .models import DisclosureDiagnostic, DisclosureOutputPaths, TechnicalDisclosure
-from .validation import validate_engineering_language
+from .validation import (
+    LEGACY_SECTION_TITLES,
+    SECTION_TITLES,
+    chapter_heading,
+    subsections_around_artifacts,
+    validate_engineering_language,
+)
 
 
 def disclosure_output_paths(output_dir: Path, title: str) -> DisclosureOutputPaths:
@@ -37,27 +45,26 @@ def existing_disclosure_bundle_complete(paths: DisclosureOutputPaths) -> bool:
         document = Document(paths.docx)
         document_text = "\n".join(paragraph.text for paragraph in document.paragraphs)
         markdown = paths.markdown.read_text(encoding="utf-8")
-        required = (
-            "一、技术背景与现有方案",
-            "二、需要解决的技术问题",
-            "三、技术方案详细说明",
-            "四、技术效果与适用边界",
-            "五、技术关键点",
-            "六、实施例与验证方法",
-        )
-        if any(value not in document_text or value not in markdown for value in required):
+        current = [chapter_heading(number, title) for number, title in SECTION_TITLES.items()]
+        legacy = [f"{number}、{title}" for number, title in LEGACY_SECTION_TITLES.items()]
+        if not any(all(heading in document_text and f"## {heading}\n" in markdown for heading in outline)
+                   for outline in (current, legacy)):
             return False
         image_links = re.findall(r"!\[[^\]]*\]\(([^)]+)\)", markdown)
         if not image_links:
             return False
         for link in image_links:
-            image_path = paths.markdown.parent / Path(link.replace("/", os.sep))
+            image_path = paths.markdown.parent / Path(unquote(link).replace("/", os.sep))
             if not image_path.is_file():
                 return False
             with Image.open(image_path) as image:
                 image.verify()
+        for link in re.findall(r"\[可编辑 Draw\.io 文件\]\(([^)]+)\)", markdown):
+            editable = paths.markdown.parent / Path(unquote(link))
+            if ElementTree.parse(editable).getroot().tag != "mxfile":
+                return False
         return True
-    except (OSError, ValueError, BadZipFile, KeyError):
+    except (OSError, ValueError, BadZipFile, KeyError, ElementTree.ParseError):
         return False
 
 
@@ -105,7 +112,7 @@ def write_disclosure_bundle(
                     action=(
                         "已写入 Word 可编辑线性公式，Markdown 保留原始 LaTeX"
                         if formula_result.mode == "linear"
-                        else "已写入原始 LaTeX 文本并标记需人工复核"
+                        else "已写入原始 LaTeX 文本，请复核公式"
                     ),
                     requires_review=formula_result.mode == "raw",
                 )
@@ -121,7 +128,7 @@ def write_disclosure_bundle(
         rendered = replace(rendered, diagnostics=tuple(diagnostics))
         if rendered.review_items:
             paths = _review_draft_paths(paths)
-        published = _with_published_image_paths(rendered, paths.assets_dir)
+        published = _with_published_asset_paths(rendered, paths.assets_dir)
         markdown = disclosure_to_markdown(published, paths.markdown)
         validate_disclosure_markdown(
             markdown,
@@ -179,33 +186,28 @@ def disclosure_to_markdown(disclosure: TechnicalDisclosure, markdown_path: Path)
         for paragraph in disclosure.content_paragraphs:
             lines.extend([paragraph, ""])
         return "\n".join(lines).rstrip() + "\n"
-    heading = "研发技术交底书（审阅稿）" if disclosure.review_items else "研发技术交底书"
-    lines = [f"# {heading}", "", f"## {disclosure.title}", ""]
-    if disclosure.review_items:
-        lines.extend(["### 待确认事项", ""])
-        lines.extend(f"- {item.message}。{item.action}" for item in disclosure.review_items)
-        lines.append("")
-    lines.extend(["### 摘要", "", disclosure.abstract, ""])
+    lines = [f"# {disclosure.title}", "", "## 摘要", "", disclosure.abstract, ""]
     for section in disclosure.sections:
-        lines.extend([f"## {section.number}、{section.title}", ""])
+        lines.extend([f"## {chapter_heading(section.number, section.title)}", ""])
         for paragraph in section.paragraphs:
             lines.extend([paragraph, ""])
-        for subsection in section.subsections:
-            lines.extend([f"### {subsection.number} {subsection.title}", ""])
-            for paragraph in subsection.paragraphs:
-                lines.extend([paragraph, ""])
+        before, after = subsections_around_artifacts(section)
+        _append_markdown_subsections(lines, before)
         for diagram in (item for item in disclosure.diagrams if item.section_number == section.number):
             lines.extend([f"#### {diagram.title}", ""])
             if diagram.image_path is None:
                 if not disclosure.review_items:
                     raise ValueError(f"图示尚未成功生成：{diagram.title}")
-                lines.extend(["【待补】图示未能渲染，以下为原始图源。", "", "````text",
-                              diagram.mermaid, "````", ""])
+                lines.extend(["<details>", "<summary>Mermaid 图源</summary>", "", "````text",
+                              diagram.mermaid, "````", "", "</details>", ""])
                 continue
             lines.extend(["<details>", "<summary>Mermaid 图源</summary>", "", "```mermaid",
                           diagram.mermaid, "```", "", "</details>", ""])
             relative = _relative_link(diagram.image_path, markdown_path.parent)
             lines.extend([f"![{diagram.title}]({relative})", ""])
+            if diagram.drawio_path is not None:
+                editable = _relative_link(diagram.drawio_path, markdown_path.parent)
+                lines.extend([f"[可编辑 Draw.io 文件]({editable})", ""])
         for formula in (item for item in disclosure.formulas if item.section_number == section.number):
             lines.extend([formula.description, "", "```math", formula.latex, "```", "", formula.label, ""])
         for table in (item for item in disclosure.tables if item.section_number == section.number):
@@ -213,7 +215,15 @@ def disclosure_to_markdown(disclosure: TechnicalDisclosure, markdown_path: Path)
             for row in table.rows:
                 lines.append("| " + " | ".join(_escape_table_cell(cell) for cell in row) + " |")
             lines.append("")
+        _append_markdown_subsections(lines, after)
     return "\n".join(lines).rstrip() + "\n"
+
+
+def _append_markdown_subsections(lines, subsections) -> None:
+    for subsection in subsections:
+        lines.extend([f"### {subsection.number} {subsection.title}", ""])
+        for paragraph in subsection.paragraphs:
+            lines.extend([paragraph, ""])
 
 
 def validate_disclosure_markdown(
@@ -226,9 +236,9 @@ def validate_disclosure_markdown(
     if not markdown.startswith("# "):
         raise ValueError("技术交底书 Markdown 缺少主标题")
     if disclosure.is_structured:
-        positions = [markdown.find(f"## {section.number}、{section.title}") for section in disclosure.sections]
-        if any(value < 0 for value in positions) or positions != sorted(positions):
-            raise ValueError("技术交底书 Markdown 六章目录缺失或错序")
+        headings = re.findall(r"^## (第[一二三四五六]章 .+)$", markdown, flags=re.MULTILINE)
+        if headings != [chapter_heading(number, title) for number, title in SECTION_TITLES.items()]:
+            raise ValueError("技术交底书 Markdown 四章目录缺失或错序")
         if markdown.count("```mermaid") != sum(item.image_path is not None for item in disclosure.diagrams):
             raise ValueError("技术交底书 Markdown 的 Mermaid 图源数量不匹配")
         for diagram in disclosure.diagrams:
@@ -236,22 +246,28 @@ def validate_disclosure_markdown(
                 continue
             if diagram.image_path is None or (check_images and not diagram.image_path.exists()):
                 raise ValueError(f"技术交底书 Markdown 引用的图片不存在：{diagram.title}")
+            if diagram.drawio_path is not None:
+                editable = _relative_link(diagram.drawio_path, markdown_path.parent)
+                if (f"[可编辑 Draw.io 文件]({editable})" not in markdown
+                        or (check_images and not diagram.drawio_path.is_file())):
+                    raise ValueError(f"技术交底书 Markdown 的 Draw.io 文件链接无效：{diagram.title}")
     if not disclosure.review_items:
         validate_engineering_language(disclosure)
 
 
 def _relative_link(path: Path, root: Path) -> str:
     try:
-        return path.relative_to(root).as_posix()
+        value = path.relative_to(root)
     except ValueError:
-        return path.as_posix()
+        value = path
+    return quote(value.as_posix(), safe="/:")
 
 
 def _escape_table_cell(value: str) -> str:
     return value.replace("|", "\\|").replace("\n", "<br>")
 
 
-def _with_published_image_paths(
+def _with_published_asset_paths(
     disclosure: TechnicalDisclosure,
     assets_dir: Path,
 ) -> TechnicalDisclosure:
@@ -259,6 +275,7 @@ def _with_published_image_paths(
         replace(
             item,
             image_path=assets_dir / item.image_path.name if item.image_path else None,
+            drawio_path=assets_dir / item.drawio_path.name if item.drawio_path else None,
         )
         for item in disclosure.diagrams
     )
@@ -276,9 +293,10 @@ def _publish_bundle(
     paths.assets_dir.mkdir(parents=True, exist_ok=not paths.is_review_draft)
     sources_and_destinations = [
         *[
-            (item.image_path, paths.assets_dir / item.image_path.name)
+            (asset, paths.assets_dir / asset.name)
             for item in rendered.diagrams
-            if item.image_path is not None
+            for asset in (item.image_path, item.drawio_path)
+            if asset is not None
         ],
         (temporary_md, paths.markdown),
         (temporary_docx, paths.docx),

@@ -118,10 +118,10 @@ class GitHubActionsWorkflowTests(unittest.TestCase):
         self.assertIn("gh release create", workflow)
         self.assertIn("contents: write", workflow)
 
-    def test_portable_build_uses_env_example_as_editable_env_when_secret_is_absent(self):
+    def test_portable_build_keeps_original_env_example_filename(self):
         build_script = Path("build_portable.py").read_text(encoding="utf-8")
 
-        self.assertIn('shutil.copy2(env_example, dist_app / ".env")', build_script)
+        self.assertIn("shutil.copy2(env_example, dist_app / env_example.name)", build_script)
 
     def test_ci_cd_guide_explains_the_first_experiment(self):
         guide = Path("CI-CD实验指南.md").read_text(encoding="utf-8")

@@ -1,6 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 
 from pathlib import Path
+import os
 
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
@@ -20,6 +21,8 @@ browser_datas = (
     else []
 )
 mermaid_datas = [(str(mermaid_runtime), "mermaid")] if mermaid_runtime.exists() else []
+drawio_runtime = os.environ.get("PATENT_DRAWIO_RUNTIME")
+drawio_datas = [(drawio_runtime, "drawio")] if drawio_runtime else []
 dynamic_packages = ("playwright", "pptx", "pdfplumber", "pypdf", "PIL", "latex2mathml")
 dynamic_hiddenimports = [
     module
@@ -38,6 +41,7 @@ a = Analysis(
         + latex2mathml_datas
         + browser_datas
         + mermaid_datas
+        + drawio_datas
     ),
     hiddenimports=(
         pypandoc_hiddenimports

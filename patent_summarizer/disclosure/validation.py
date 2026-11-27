@@ -26,7 +26,7 @@ from .models import (
 )
 
 
-SECTION_TITLES = {
+LEGACY_SECTION_TITLES = {
     "一": "技术背景与现有方案",
     "二": "需要解决的技术问题",
     "三": "技术方案详细说明",
@@ -34,6 +34,27 @@ SECTION_TITLES = {
     "五": "技术关键点",
     "六": "实施例与验证方法",
 }
+SECTION_TITLES = {
+    "一": "技术领域",
+    "二": "背景技术",
+    "三": "发明内容",
+    "四": "具体实施方式",
+}
+INVENTION_SUBSECTIONS = ("发明目的", "技术方案", "有益效果")
+
+
+def chapter_heading(number: str, title: str) -> str:
+    return f"第{number}章 {title}"
+
+
+def subsections_around_artifacts(
+    section: DisclosureSection,
+) -> tuple[tuple[DisclosureSubsection, ...], tuple[DisclosureSubsection, ...]]:
+    if section.number == "三" and section.subsections and section.subsections[-1].title == "有益效果":
+        return section.subsections[:-1], section.subsections[-1:]
+    return section.subsections, ()
+
+
 FORBIDDEN_EXPRESSIONS = (
     "其特征在于",
     "根据权利要求",
@@ -321,15 +342,11 @@ def reconcile_disclosure_with_preview(
     diagrams = list(disclosure.diagrams)
 
     missing_modules = [
-        item for item in preview.modules if not _contains_normalized(corpus, item.name)
+        (index, module) for index, module in enumerate(preview.modules, start=1)
+        if any(not _contains_normalized(corpus, value)
+               for value in (module.name, *module.inputs, *module.outputs))
     ]
-    missing_interfaces = [
-        value
-        for module in preview.modules
-        for value in (*module.inputs, *module.outputs)
-        if not _contains_normalized(corpus, value)
-    ]
-    if missing_modules or missing_interfaces:
+    if missing_modules:
         tables.append(
             DisclosureTable(
                 section_number="三",
@@ -343,7 +360,7 @@ def reconcile_disclosure_with_preview(
                         "；".join(module.inputs),
                         "；".join(module.outputs),
                     )
-                    for index, module in enumerate(preview.modules, start=1)
+                    for index, module in missing_modules
                 ),
             )
         )
@@ -357,8 +374,8 @@ def reconcile_disclosure_with_preview(
         )
 
     missing_parameters = [
-        item
-        for item in preview.suggested_parameters
+        (index, item)
+        for index, item in enumerate(preview.suggested_parameters, start=1)
         if not _contains_normalized(corpus, item.name)
         or (item.symbol and not _contains_symbols(corpus, item.symbol))
         or (item.is_example and item.value_or_range not in corpus)
@@ -378,7 +395,7 @@ def reconcile_disclosure_with_preview(
                         item.value_or_range,
                         item.basis,
                     )
-                    for index, item in enumerate(preview.suggested_parameters, start=1)
+                    for index, item in missing_parameters
                 ),
             )
         )
@@ -391,39 +408,54 @@ def reconcile_disclosure_with_preview(
             )
         )
 
-    missing_key_points = [
-        (index, value)
-        for index, value in enumerate(preview.key_points, start=1)
-        if not _contains_normalized(corpus, value)
-    ]
+    missing_key_points = tuple(value for value in preview.key_points if not _contains_normalized(corpus, value))
     if missing_key_points:
         section_index = next(
-            (index for index, section in enumerate(sections) if section.number == "五"),
+            (index for index, section in enumerate(sections) if section.number == "三"),
             None,
         )
         if section_index is not None:
             section = sections[section_index]
-            start = len(section.subsections) + 1
-            additions = tuple(
-                DisclosureSubsection(
-                    number=f"5.{start + offset}",
-                    title=f"KP{key_index} 已确认技术关键点",
-                    paragraphs=(value,),
-                )
-                for offset, (key_index, value) in enumerate(missing_key_points)
-            )
-            sections[section_index] = replace(
-                section,
-                subsections=(*section.subsections, *additions),
-            )
+            subsections = list(section.subsections)
+            for index, sub in enumerate(subsections):
+                if sub.title == "技术方案":
+                    subsections[index] = replace(sub, paragraphs=(*sub.paragraphs, *missing_key_points))
+                    sections[section_index] = replace(section, subsections=tuple(subsections))
+                    break
+            else:
+                sections[section_index] = replace(section, paragraphs=(*section.paragraphs, *missing_key_points))
             diagnostics.append(
                 DisclosureDiagnostic(
                     stage="confirmed-baseline",
                     code="confirmed-key-points-restored",
                     message="模型正文遗漏或改写了已确认技术关键点",
-                    action="已按 KP 编号补入第五章",
+                    action="已补入第三章技术方案",
                 )
             )
+
+    implementation_index = next((index for index, item in enumerate(sections) if item.number == "四"), None)
+    if implementation_index is not None:
+        implementation = sections[implementation_index]
+        body = "\n".join(disclosure.all_paragraphs())
+        missing_steps = tuple(
+            step for step in preview.process_steps
+            if (match := re.match(r"\s*(S\d+)\b", step, re.IGNORECASE))
+            and not re.search(rf"\b{match[1]}\b", body, re.IGNORECASE)
+            and not _contains_normalized(body, re.sub(r"^\s*S\d+\s*[:：.、-]?\s*", "", step, flags=re.IGNORECASE))
+        )
+        if missing_steps:
+            subsections = list(implementation.subsections)
+            for index, sub in enumerate(subsections):
+                if sub.title in {"工作流程", "系统工作流程"}:
+                    subsections[index] = replace(sub, paragraphs=(*sub.paragraphs, *missing_steps))
+                    break
+            else:
+                subsections.append(DisclosureSubsection(f"4.{len(subsections) + 1}", "工作流程", missing_steps))
+            sections[implementation_index] = replace(implementation, subsections=tuple(subsections))
+            diagnostics.append(DisclosureDiagnostic(
+                stage="confirmed-baseline", code="confirmed-steps-restored",
+                message="模型正文遗漏了已确认的流程步骤", action="已补入第四章工作流程",
+            ))
 
     diagrams = _restore_confirmed_diagram_nodes(diagrams, preview, diagnostics)
     return replace(
@@ -557,15 +589,15 @@ def _dedupe_diagnostics(values: list[DisclosureDiagnostic]) -> list[DisclosureDi
 
 
 def validate_effect_claims(disclosure: TechnicalDisclosure, source_context: str) -> None:
-    if not disclosure.is_structured:
-        return
-    effect = next((item for item in disclosure.sections if item.number == "四"), None)
-    if effect is None:
-        return
-    for paragraph in (*effect.paragraphs, *(p for sub in effect.subsections for p in sub.paragraphs)):
-        for clause in split_claims(paragraph):
-            if problem := effect_claim_problem(clause, source_context):
-                raise ValueError(problem)
+    for section in disclosure.sections:
+        if section.title == "技术效果与适用边界":
+            paragraphs = (*section.paragraphs, *(p for sub in section.subsections for p in sub.paragraphs))
+        else:
+            paragraphs = tuple(p for sub in section.subsections if sub.title == "有益效果" for p in sub.paragraphs)
+        for paragraph in paragraphs:
+            for clause in split_claims(paragraph):
+                if problem := effect_claim_problem(clause, source_context):
+                    raise ValueError(problem)
 
 
 def split_claims(text: str) -> list[str]:
@@ -658,7 +690,8 @@ def disclosure_to_payload(disclosure: TechnicalDisclosure) -> dict[str, Any]:
             for section in disclosure.sections
         ],
         "图示": [
-            {"章节": item.section_number, "类型": item.kind, "标题": item.title, "mermaid": item.mermaid}
+            {"章节": item.section_number, "类型": item.kind, "标题": item.title, "mermaid": item.mermaid,
+             **({"布局": item.layout} if item.layout else {})}
             for item in disclosure.diagrams
         ],
         "参数表": [
@@ -697,7 +730,10 @@ def parse_disclosure_section(
     payload = mapping_payload(response)
     if set(payload) != {"章节"} or not isinstance(payload["章节"], Mapping):
         raise ValueError("分章节响应必须且只能包含一个“章节”对象")
-    value = payload["章节"]
+    return _parse_section(payload["章节"], expected_number)
+
+
+def _parse_section(value: Mapping[str, Any], expected_number: str) -> DisclosureSection:
     number = required_string(value, "编号", "章节")
     title = required_string(value, "标题", "章节")
     if number != expected_number or SECTION_TITLES.get(number) != title:
@@ -714,15 +750,20 @@ def parse_disclosure_section(
     for index, sub in enumerate(raw_subsections, start=1):
         if not isinstance(sub, Mapping):
             raise ValueError(f"第 {index} 个小节必须是对象")
+        required_string(sub, "编号", "小节")
         subsections.append(
             DisclosureSubsection(
-                required_string(sub, "编号", "小节"),
+                f"{list(SECTION_TITLES).index(number) + 1}.{index}",
                 required_string(sub, "标题", "小节"),
                 tuple(string_list(sub.get("段落"), "小节段落")),
             )
         )
     if not paragraphs and not subsections:
         raise ValueError("章节没有正文内容")
+    if number == "一" and (len(paragraphs) != 1 or subsections):
+        raise ValueError("技术领域应为一个自然段")
+    if number == "三" and tuple(item.title for item in subsections) != INVENTION_SUBSECTIONS:
+        raise ValueError("发明内容应依次包含发明目的、技术方案、有益效果")
     return DisclosureSection(number, title, paragraphs, tuple(subsections))
 
 
@@ -765,35 +806,10 @@ def disclosure_section_to_payload(section: DisclosureSection) -> dict[str, Any]:
 
 
 def _parse_sections(raw: Any) -> tuple[DisclosureSection, ...]:
-    if not isinstance(raw, list) or len(raw) != 6:
-        raise ValueError("技术交底书必须包含六个正文章节")
-    sections: list[DisclosureSection] = []
-    for index, value in enumerate(raw, start=1):
-        if not isinstance(value, Mapping):
-            raise ValueError(f"第 {index} 章必须是对象")
-        number = required_string(value, "编号", f"第 {index} 章")
-        title = required_string(value, "标题", f"第 {index} 章")
-        if SECTION_TITLES.get(number) != title:
-            raise ValueError(f"章节必须按统一目录输出：{number}、{SECTION_TITLES.get(number, '未知章节')}")
-        paragraphs = tuple(string_list(value.get("段落", []), f"第 {index} 章段落", allow_empty=True))
-        raw_subsections = value.get("小节", [])
-        if not isinstance(raw_subsections, list):
-            raise ValueError(f"第 {index} 章小节必须是数组")
-        subsections: list[DisclosureSubsection] = []
-        for sub_index, sub in enumerate(raw_subsections, start=1):
-            if not isinstance(sub, Mapping):
-                raise ValueError(f"第 {index} 章第 {sub_index} 个小节必须是对象")
-            subsections.append(DisclosureSubsection(
-                required_string(sub, "编号", "小节"),
-                required_string(sub, "标题", "小节"),
-                tuple(string_list(sub.get("段落"), "小节段落")),
-            ))
-        if not paragraphs and not subsections:
-            raise ValueError(f"第 {index} 章没有正文内容")
-        sections.append(DisclosureSection(number, title, paragraphs, tuple(subsections)))
-    if [item.number for item in sections] != list(SECTION_TITLES):
-        raise ValueError("六章编号或顺序不正确")
-    return tuple(sections)
+    if not isinstance(raw, list) or len(raw) != len(SECTION_TITLES):
+        raise ValueError("技术交底书必须包含四个正文章节")
+    return tuple(parse_disclosure_section({"章节": value}, number)
+                 for number, value in zip(SECTION_TITLES, raw))
 
 
 def _parse_diagrams(raw: Any, *, require_kinds: bool = True) -> tuple[DisclosureDiagram, ...]:
@@ -805,11 +821,13 @@ def _parse_diagrams(raw: Any, *, require_kinds: bool = True) -> tuple[Disclosure
             raise ValueError(f"图示第 {index} 项必须是对象")
         mermaid = required_string(item, "mermaid", f"图示第 {index} 项")
         _validate_mermaid(mermaid)
+        layout = item.get("布局")
         diagrams.append(DisclosureDiagram(
             section_number=required_string(item, "章节", f"图示第 {index} 项"),
             kind=required_string(item, "类型", f"图示第 {index} 项"),
             title=required_string(item, "标题", f"图示第 {index} 项"),
             mermaid=mermaid,
+            layout=layout if isinstance(layout, Mapping) else None,
         ))
     kinds = {item.kind for item in diagrams}
     if require_kinds and not {"系统架构图", "流程图"} <= kinds:
@@ -899,10 +917,6 @@ def _validate_cross_references(disclosure: TechnicalDisclosure) -> None:
     labels = [item.label for item in disclosure.formulas]
     if len(labels) != len(set(labels)):
         raise ValueError("公式编号不得重复")
-    for formula, missing_symbols in undefined_formula_symbols(disclosure):
-        raise ValueError(
-            f"{formula.label}存在未定义符号：" + "、".join(missing_symbols)
-        )
 
 
 _INDEXED_SYMBOL_RANGE = re.compile(

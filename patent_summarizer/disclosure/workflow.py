@@ -35,6 +35,7 @@ from .recovery import (
 )
 from .source_loader import source_evidence_catalog
 from .validation import (
+    SECTION_TITLES,
     disclosure_to_payload,
     disclosure_section_to_payload,
     mapping_payload,
@@ -44,7 +45,6 @@ from .validation import (
     parse_technical_disclosure,
     reconcile_disclosure_with_preview,
     validate_disclosure_against_preview,
-    validate_effect_claims,
     validate_disclosure_title,
 )
 
@@ -235,32 +235,17 @@ class DisclosureAnalyzer:
             "标题": title,
             "说明": "兼容旧版非交互 CLI：请依据来源形成完整工程方案",
         }
-        checkpoint_key = None
-        if preview is not None and self.checkpoint_store is not None:
-            checkpoint_key = self.checkpoint_store.key(
-                source.context,
-                title,
-                _preview_payload(preview),
-            )
-            cached = self.checkpoint_store.load_disclosure(
-                checkpoint_key,
-                "draft",
-                title,
-            )
-            if cached is not None:
-                try:
-                    result = complete_staged_document(cached, preview, source.context)
+        if preview is not None:
+            checkpoint_key = None
+            if self.checkpoint_store is not None:
+                checkpoint_key = self.checkpoint_store.key(source.context, title, confirmed)
+                cached = self.checkpoint_store.load_disclosure(checkpoint_key, "draft", title)
+                if cached is not None:
+                    result = complete_staged_document(cached, preview)
                     if not result.review_items:
                         return result
-                except ValueError:
-                    pass
-            result = self._draft_by_sections(
-                source,
-                title,
-                preview,
-                checkpoint_key,
-            )
-            if not result.review_items:
+            result = self._draft_by_sections(source, title, preview, checkpoint_key)
+            if checkpoint_key is not None and not result.review_items:
                 self.checkpoint_store.save_disclosure(checkpoint_key, "draft", result)
             return result
         prompt = (
@@ -272,10 +257,8 @@ class DisclosureAnalyzer:
             f"{title} 结构化初稿",
             system_prompt(),
             prompt,
-            lambda response: _parse_confirmed_disclosure(response, title, preview, source.context),
+            lambda response: _parse_confirmed_disclosure(response, title, preview),
         )
-        if checkpoint_key is not None:
-            self.checkpoint_store.save_disclosure(checkpoint_key, "draft", result)
         return result
 
     def review(
@@ -284,32 +267,19 @@ class DisclosureAnalyzer:
         draft: TechnicalDisclosure,
         preview: DisclosurePreview | None = None,
     ) -> TechnicalDisclosure:
-        checkpoint_key = None
-        if preview is not None and self.checkpoint_store is not None:
-            checkpoint_key = self.checkpoint_store.key(
-                source.context,
-                draft.title,
-                {**_preview_payload(preview), "draft": disclosure_to_payload(draft)},
-            )
-            cached = self.checkpoint_store.load_disclosure(
-                checkpoint_key,
-                "review",
-                draft.title,
-            )
-            if cached is not None and not draft.review_items:
-                try:
-                    result = complete_staged_document(cached, preview, source.context)
+        if preview is not None and draft.is_structured:
+            checkpoint_key = None
+            if self.checkpoint_store is not None:
+                checkpoint_key = self.checkpoint_store.key(
+                    source.context, draft.title, {**_preview_payload(preview), "draft": disclosure_to_payload(draft)},
+                )
+                cached = self.checkpoint_store.load_disclosure(checkpoint_key, "review", draft.title)
+                if cached is not None and not draft.review_items:
+                    result = complete_staged_document(cached, preview)
                     if not result.review_items:
                         return result
-                except ValueError:
-                    pass
-            result = self._review_by_sections(
-                source,
-                draft,
-                preview,
-                checkpoint_key,
-            )
-            if not result.review_items:
+            result = self._review_by_sections(source, draft, preview, checkpoint_key)
+            if checkpoint_key is not None and not result.review_items:
                 self.checkpoint_store.save_disclosure(checkpoint_key, "review", result)
             return result
         prompt = (
@@ -323,10 +293,8 @@ class DisclosureAnalyzer:
             f"{draft.title} 独立审校",
             system_prompt(),
             prompt,
-            lambda response: _parse_confirmed_disclosure(response, draft.title, preview, source.context),
+            lambda response: _parse_confirmed_disclosure(response, draft.title, preview),
         )
-        if checkpoint_key is not None:
-            self.checkpoint_store.save_disclosure(checkpoint_key, "review", result)
         return result
 
     def _draft_by_sections(
@@ -334,34 +302,34 @@ class DisclosureAnalyzer:
         source: DisclosureSourceItem,
         title: str,
         preview: DisclosurePreview,
-        checkpoint_key: str,
+        checkpoint_key: str | None,
     ) -> TechnicalDisclosure:
         confirmed = json.dumps(_preview_payload(preview), ensure_ascii=False, indent=2)
         sections = []
         issues = []
-        for number, section_title in _section_titles().items():
+        for number, section_title in SECTION_TITLES.items():
             stage = f"section-{number}"
             prompt = (
                 _source_prompt(source)
                 + f"\n\n用户确认的完整方案：\n{confirmed}"
+                + "\n\n已完成的前文章节：\n" + _sections_context(sections)
                 + f"\n\n当前只撰写：{number}、{section_title}\n\n"
                 + load_prompt("section.md")
             )
             section, pending = self._staged_section(
-                checkpoint_key, stage, number, prompt, source, preview,
+                checkpoint_key, stage, number, prompt, preview,
             )
             sections.append(section)
             issues.extend(pending)
 
         artifact_stage = "artifacts"
-        cached = self.checkpoint_store.load_payload(checkpoint_key, artifact_stage)
         artifact_context = (
             _source_prompt(source)
             + f"\n\n用户确认的完整方案：\n{confirmed}"
-            + "\n\n已经完成的六章正文：\n"
-            + json.dumps([disclosure_section_to_payload(section)["章节"] for section in sections],
-                         ensure_ascii=False, indent=2)
+            + "\n\n已经完成的四章正文：\n" + _sections_context(sections)
         )
+        artifact_key = self._context_key(checkpoint_key, artifact_context)
+        cached = self.checkpoint_store.load_payload(artifact_key, artifact_stage) if artifact_key else None
         artifact_response_failed = False
 
         def parse_artifact_payload(response):
@@ -413,17 +381,17 @@ class DisclosureAnalyzer:
             content_paragraphs=[paragraph for section in sections for paragraph in section.paragraphs],
             prior_art_status=preview.prior_art.status, diagnostics=tuple(issues),
         )
-        document, updated = prepare_artifacts(document, raw, source.context, preview, repair)
-        if not artifact_response_failed and (cached is None or updated != cached):
-            self.checkpoint_store.save_payload(checkpoint_key, artifact_stage, updated)
-        return complete_staged_document(document, preview, source.context)
+        document, updated = prepare_artifacts(document, raw, preview, repair)
+        if artifact_key and not artifact_response_failed and updated != cached:
+            self.checkpoint_store.save_payload(artifact_key, artifact_stage, updated)
+        return complete_staged_document(document, preview)
 
     def _review_by_sections(
         self,
         source: DisclosureSourceItem,
         draft: TechnicalDisclosure,
         preview: DisclosurePreview,
-        checkpoint_key: str,
+        checkpoint_key: str | None,
     ) -> TechnicalDisclosure:
         confirmed = json.dumps(_preview_payload(preview), ensure_ascii=False, indent=2)
         reviewed_sections = []
@@ -441,32 +409,38 @@ class DisclosureAnalyzer:
                 _source_prompt(source)
                 + f"\n\n用户确认的完整方案：\n{confirmed}"
                 + "\n\n全文上下文：\n" + draft_context
+                + "\n\n已审校的前文章节：\n" + _sections_context(reviewed_sections)
                 + "\n\n当前待审校章节：\n"
                 + json.dumps(disclosure_section_to_payload(section), ensure_ascii=False, indent=2)
                 + "\n\n" + load_prompt("section_review.md")
             )
             reviewed, pending = self._staged_section(
-                checkpoint_key, stage, section.number, prompt, source, preview, original=section,
+                checkpoint_key, stage, section.number, prompt, preview, original=section,
             )
             reviewed_sections.append(reviewed)
             issues.extend(pending)
         reviewed_disclosure = replace(
             draft, sections=tuple(reviewed_sections), diagnostics=tuple(issues)
         )
-        return complete_staged_document(reviewed_disclosure, preview, source.context)
+        return complete_staged_document(reviewed_disclosure, preview)
+
+    def _context_key(self, checkpoint_key: str | None, context: str) -> str | None:
+        if checkpoint_key is None:
+            return None
+        return self.checkpoint_store.key(context, checkpoint_key, {})
 
     def _staged_section(
         self,
-        checkpoint_key: str,
+        checkpoint_key: str | None,
         stage: str,
         number: str,
         prompt: str,
-        source: DisclosureSourceItem,
         preview: DisclosurePreview,
         *,
         original: DisclosureSection | None = None,
     ) -> tuple[DisclosureSection, list[DisclosureDiagnostic]]:
-        cached = self.checkpoint_store.load_payload(checkpoint_key, stage)
+        section_key = self._context_key(checkpoint_key, prompt)
+        cached = self.checkpoint_store.load_payload(section_key, stage) if section_key else None
         usable = None
         partial = None
 
@@ -482,7 +456,7 @@ class DisclosureAnalyzer:
 
         def parse(response):
             section = parse_structure(response)
-            check_section(section, source.context, preview)
+            check_section(section, preview)
             return section
 
         error = None
@@ -514,27 +488,27 @@ class DisclosureAnalyzer:
                     stage, "chapter-review-pending", f"第{number}章独立审校未完成",
                     "已保留可用初稿，请复核本章",
                 )]
-            if usable is not None:
-                # Keep the recoverable text so resuming can attempt only the
-                # targeted correction. The published copy omits unverified claims.
+            if section_key and usable is not None:
                 payload = disclosure_section_to_payload(usable)
                 if payload != cached:
-                    self.checkpoint_store.save_payload(checkpoint_key, stage, payload)
-                return reviewable_section(usable, source.context, preview, stage)
-            if partial is not None:
-                section, issues = reviewable_section(partial, source.context, preview, stage)
-                return replace(section, paragraphs=(
-                    *section.paragraphs, "【待补】已保留本章可读取的段落，请补齐其余内容。",
-                )), [*issues, review_item(
-                    stage, "chapter-writing-pending", f"第{number}章仍缺少可读段落或小节", "请补写本章",
-                )]
-            return fallback_section(number, preview), [review_item(
-                stage, "chapter-writing-pending", f"第{number}章撰写和纠错均未完成",
-                "已保留目录和可核对的信息，请补写本章",
+                    self.checkpoint_store.save_payload(section_key, stage, payload)
+            recovered = usable or partial or fallback_section(number, preview)
+            if recovered is None:
+                raise
+            recovered, issues = reviewable_section(recovered, preview, stage)
+            try:
+                recovered = parse_disclosure_section(disclosure_section_to_payload(recovered), number)
+            except ValueError:
+                fallback = fallback_section(number, preview)
+                if fallback is None:
+                    raise exc
+                recovered = fallback
+            return recovered, [*issues, review_item(
+                stage, "chapter-writing-pending", f"第{number}章撰写未完成",
+                "已保留可核对的内容，请复核本章",
             )]
-        self.checkpoint_store.save_payload(
-            checkpoint_key, stage, disclosure_section_to_payload(section)
-        )
+        if section_key:
+            self.checkpoint_store.save_payload(section_key, stage, disclosure_section_to_payload(section))
         return section, []
 
     def repair_delivery(
@@ -566,7 +540,6 @@ class DisclosureAnalyzer:
                 response,
                 disclosure.title,
                 preview,
-                source.context,
             ),
         )
 
@@ -639,15 +612,11 @@ def _parse_search_terms(response: str | Mapping[str, Any]) -> tuple[str, ...]:
     return tuple(terms)
 
 
-def _section_titles() -> dict[str, str]:
-    return {
-        "一": "技术背景与现有方案",
-        "二": "需要解决的技术问题",
-        "三": "技术方案详细说明",
-        "四": "技术效果与适用边界",
-        "五": "技术关键点",
-        "六": "实施例与验证方法",
-    }
+def _sections_context(sections: list[DisclosureSection]) -> str:
+    return json.dumps(
+        [disclosure_section_to_payload(section)["章节"] for section in sections],
+        ensure_ascii=False, indent=2,
+    )
 
 
 def _prior_art_payload(value: PriorArtResult) -> dict[str, Any]:
@@ -744,17 +713,15 @@ def _parse_confirmed_disclosure(
     response: str | Mapping[str, Any],
     title: str,
     preview: DisclosurePreview | None,
-    source_context: str,
 ) -> TechnicalDisclosure:
     disclosure = parse_technical_disclosure(response, title)
     if preview is None:
         return disclosure
     if not disclosure.is_structured:
-        raise ValueError("升级后的研发技术交底书必须返回统一六章结构")
+        raise ValueError("研发技术交底书必须返回统一四章结构")
     disclosure = replace(disclosure, prior_art_status=preview.prior_art.status)
     disclosure = reconcile_disclosure_with_preview(disclosure, preview)
     validate_disclosure_against_preview(disclosure, preview)
-    validate_effect_claims(disclosure, source_context)
     return disclosure
 
 

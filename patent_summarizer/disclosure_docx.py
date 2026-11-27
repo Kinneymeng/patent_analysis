@@ -10,10 +10,12 @@ from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
-from docx.shared import Mm, Pt
+from docx.shared import Mm, Pt, RGBColor
+from PIL import Image
 
 from .disclosure.math_to_omml import latex_to_omml_with_fallback
 from .disclosure.models import TechnicalDisclosure
+from .disclosure.validation import SECTION_TITLES, chapter_heading, subsections_around_artifacts
 
 
 DISCLOSURE_FONT = "宋体"
@@ -22,7 +24,6 @@ TABLE_FONT_SIZE = Pt(10.5)
 LINE_SPACING_VALUE = "360"
 BODY_OUTLINE_LEVEL = "9"
 SECTION_OUTLINE_LEVEL = "2"
-SUBSECTION_OUTLINE_LEVEL = "3"
 FIRST_LINE_CHARS = "200"
 
 
@@ -84,51 +85,47 @@ def _add_legacy_disclosure(document: DocumentType, disclosure: TechnicalDisclosu
 
 
 def _add_structured_disclosure(document: DocumentType, disclosure: TechnicalDisclosure) -> None:
-    heading = "研发技术交底书（审阅稿）" if disclosure.review_items else "研发技术交底书"
-    _add_paragraph(document, heading, alignment=WD_ALIGN_PARAGRAPH.CENTER, bold=True, outline_level=BODY_OUTLINE_LEVEL, font_size=Pt(18))
-    _add_paragraph(document, disclosure.title, alignment=WD_ALIGN_PARAGRAPH.CENTER, bold=True, font_size=Pt(16))
-    if disclosure.review_items:
-        _add_paragraph(document, "待确认事项", alignment=WD_ALIGN_PARAGRAPH.LEFT, bold=True)
-        for item in disclosure.review_items:
-            _add_paragraph(document, f"{item.message}。{item.action}", alignment=WD_ALIGN_PARAGRAPH.LEFT)
-    _add_paragraph(document, "摘要", alignment=WD_ALIGN_PARAGRAPH.LEFT, bold=True, outline_level=SECTION_OUTLINE_LEVEL)
-    _add_paragraph(document, disclosure.abstract, alignment=WD_ALIGN_PARAGRAPH.JUSTIFY, first_line_chars=FIRST_LINE_CHARS)
+    title_properties = document.styles["Title"].element.get_or_add_pPr()
+    border = title_properties.find(qn("w:pBdr"))
+    if border is not None:
+        title_properties.remove(border)
+    _add_manuscript_paragraph(document, disclosure.title, style="Title", center=True)
+    _add_manuscript_paragraph(document, "摘要", style="Subtitle")
+    _add_manuscript_paragraph(document, disclosure.abstract)
     for section in disclosure.sections:
-        _add_paragraph(document, f"{section.number}、{section.title}", alignment=WD_ALIGN_PARAGRAPH.LEFT, bold=True, outline_level=SECTION_OUTLINE_LEVEL, font_size=Pt(16))
+        _add_manuscript_paragraph(document, chapter_heading(section.number, section.title), style="Heading 1")
         for text in section.paragraphs:
-            _add_paragraph(document, text, alignment=WD_ALIGN_PARAGRAPH.JUSTIFY, first_line_chars=FIRST_LINE_CHARS)
-        for subsection in section.subsections:
-            _add_paragraph(document, f"{subsection.number} {subsection.title}", alignment=WD_ALIGN_PARAGRAPH.LEFT, bold=True, outline_level=SUBSECTION_OUTLINE_LEVEL)
-            for text in subsection.paragraphs:
-                _add_paragraph(document, text, alignment=WD_ALIGN_PARAGRAPH.JUSTIFY, first_line_chars=FIRST_LINE_CHARS)
+            _add_manuscript_paragraph(document, text)
+        before, after = subsections_around_artifacts(section)
+        _add_manuscript_subsections(document, before)
         for diagram in (item for item in disclosure.diagrams if item.section_number == section.number):
             if diagram.image_path is None and disclosure.review_items:
-                _add_paragraph(document, f"{diagram.title}【待补】图示未能渲染。", alignment=WD_ALIGN_PARAGRAPH.CENTER)
                 continue
             if diagram.image_path is None or not diagram.image_path.is_file():
                 raise ValueError(f"图示尚未成功生成：{diagram.title}")
             paragraph = document.add_paragraph()
             paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            paragraph.add_run().add_picture(str(diagram.image_path), width=Mm(150))
+            with Image.open(diagram.image_path) as picture:
+                width, height = picture.size
+            paragraph.add_run().add_picture(str(diagram.image_path), width=Mm(min(150, 120 * width / height)))
             _set_paragraph_spacing(paragraph)
-            _add_paragraph(document, diagram.title, alignment=WD_ALIGN_PARAGRAPH.CENTER)
+            paragraph.paragraph_format.keep_with_next = True
+            _add_manuscript_paragraph(document, diagram.title, center=True)
         for formula in (item for item in disclosure.formulas if item.section_number == section.number):
-            _add_paragraph(document, formula.description, alignment=WD_ALIGN_PARAGRAPH.JUSTIFY, first_line_chars=FIRST_LINE_CHARS)
+            _add_manuscript_paragraph(document, formula.description)
             rendered_formula = latex_to_omml_with_fallback(formula.latex, display=True)
             if rendered_formula.element is not None:
                 paragraph = document.add_paragraph()
                 paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
                 paragraph._element.append(rendered_formula.element)
                 _set_paragraph_spacing(paragraph)
+                paragraph.paragraph_format.keep_with_next = True
             else:
-                _add_paragraph(
-                    document,
-                    f"原始公式表达（需人工复核）：{rendered_formula.text}",
-                    alignment=WD_ALIGN_PARAGRAPH.CENTER,
-                )
-            _add_paragraph(document, formula.label, alignment=WD_ALIGN_PARAGRAPH.CENTER)
+                _add_manuscript_paragraph(document, f"原始公式表达：{rendered_formula.text}", center=True)
+            _add_manuscript_paragraph(document, formula.label, center=True)
         for table in (item for item in disclosure.tables if item.section_number == section.number):
-            _add_paragraph(document, table.title, alignment=WD_ALIGN_PARAGRAPH.CENTER, bold=True)
+            caption = _add_manuscript_paragraph(document, table.title, center=True)
+            caption.paragraph_format.keep_with_next = True
             word_table = document.add_table(rows=1, cols=len(table.headers))
             word_table.style = "Table Grid"
             for index, value in enumerate(table.headers):
@@ -137,6 +134,44 @@ def _add_structured_disclosure(document: DocumentType, disclosure: TechnicalDisc
                 cells = word_table.add_row().cells
                 for index, value in enumerate(values):
                     _set_cell_text(cells[index], value)
+        _add_manuscript_subsections(document, after)
+
+
+def _add_manuscript_subsections(document, subsections) -> None:
+    for subsection in subsections:
+        _add_manuscript_paragraph(document, f"{subsection.number} {subsection.title}", style="Heading 2")
+        for text in subsection.paragraphs:
+            _add_manuscript_paragraph(document, text)
+
+
+def _subsection_texts(subsections):
+    for subsection in subsections:
+        yield f"{subsection.number} {subsection.title}"
+        yield from subsection.paragraphs
+
+
+def _add_manuscript_paragraph(document: DocumentType, text: str, *, style: str | None = None, center: bool = False):
+    paragraph = document.add_paragraph(style=style)
+    formatting = paragraph.paragraph_format
+    formatting.line_spacing = 1.15
+    formatting.space_before = Pt({"Title": 30, "Heading 1": 18, "Heading 2": 12}.get(style, 0))
+    formatting.space_after = Pt({"Title": 24, "Heading 1": 12, "Heading 2": 9}.get(style, 6))
+    formatting.keep_with_next = style is not None
+    if center:
+        paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    elif style:
+        paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    else:
+        paragraph.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+        formatting.first_line_indent = Pt(21)
+    run = paragraph.add_run(text)
+    run.bold = style is not None
+    run.italic = False
+    run.font.color.rgb = RGBColor(0, 0, 0)
+    run.font.name = "SimHei" if style else "SimSun"
+    run.font.size = Pt({"Title": 18, "Heading 1": 16, "Heading 2": 14, "Subtitle": 14}.get(style, 10.5))
+    _set_rfonts(run._element.get_or_add_rPr(), run.font.name)
+    return paragraph
 
 
 def _add_paragraph(
@@ -200,33 +235,33 @@ def validate_technical_disclosure_docx(path: Path, expected: TechnicalDisclosure
     if not expected.is_structured:
         _validate_legacy_document(document, expected)
         return
-    heading = "研发技术交底书（审阅稿）" if expected.review_items else "研发技术交底书"
-    expected_texts = [heading, expected.title]
-    if expected.review_items:
-        expected_texts.append("待确认事项")
-        expected_texts.extend(f"{item.message}。{item.action}" for item in expected.review_items)
-    expected_texts.extend(("摘要", expected.abstract))
+    expected_headings = [chapter_heading(number, title) for number, title in SECTION_TITLES.items()]
+    actual_headings = [p.text for p in document.paragraphs if p.style.name == "Heading 1"]
+    if actual_headings != expected_headings or document.paragraphs[0].style.name != "Title":
+        raise ValueError("技术交底书 DOCX 缺少四章标题样式")
+    expected_texts = [expected.title, "摘要", expected.abstract]
+    tables = []
     for section in expected.sections:
-        expected_texts.append(f"{section.number}、{section.title}")
+        expected_texts.append(chapter_heading(section.number, section.title))
         expected_texts.extend(section.paragraphs)
-        for subsection in section.subsections:
-            expected_texts.append(f"{subsection.number} {subsection.title}")
-            expected_texts.extend(subsection.paragraphs)
+        before, after = subsections_around_artifacts(section)
+        expected_texts.extend(_subsection_texts(before))
         expected_texts.extend(
-            f"{item.title}【待补】图示未能渲染。" if item.image_path is None and expected.review_items else item.title
-            for item in expected.diagrams if item.section_number == section.number
+            item.title for item in expected.diagrams
+            if item.section_number == section.number and item.image_path is not None
         )
         for formula in (item for item in expected.formulas if item.section_number == section.number):
             expected_texts.append(formula.description)
             rendered_formula = latex_to_omml_with_fallback(formula.latex, display=True)
             if rendered_formula.element is None:
                 expected_texts.append(
-                    f"原始公式表达（需人工复核）：{rendered_formula.text}"
+                    f"原始公式表达：{rendered_formula.text}"
                 )
             expected_texts.append(formula.label)
-        expected_texts.extend(
-            item.title for item in expected.tables if item.section_number == section.number
-        )
+        section_tables = [item for item in expected.tables if item.section_number == section.number]
+        tables.extend(section_tables)
+        expected_texts.extend(item.title for item in section_tables)
+        expected_texts.extend(_subsection_texts(after))
     actual_texts = [paragraph.text for paragraph in document.paragraphs if paragraph.text]
     if actual_texts != expected_texts:
         raise ValueError("技术交底书 DOCX 的标题、正文、图题、公式或表题内容不一致")
@@ -234,14 +269,14 @@ def validate_technical_disclosure_docx(path: Path, expected: TechnicalDisclosure
         raise ValueError("技术交底书 DOCX 的图示数量不匹配")
     if len(document.tables) != len(expected.tables):
         raise ValueError("技术交底书 DOCX 的参数表数量不匹配")
-    for actual, table in zip(document.tables, expected.tables):
+    for actual, table in zip(document.tables, tables):
         actual_rows = [[cell.text for cell in row.cells] for row in actual.rows]
         expected_rows = [list(table.headers), *[list(row) for row in table.rows]]
         if actual_rows != expected_rows:
             raise ValueError(f"技术交底书 DOCX 参数表内容不匹配：{table.title}")
     math_count = len(document.element.body.xpath(".//m:oMath"))
     raw_formula_count = sum(
-        paragraph.text.startswith("原始公式表达（需人工复核）：")
+        paragraph.text.startswith("原始公式表达：")
         for paragraph in document.paragraphs
     )
     if math_count + raw_formula_count < len(expected.formulas):
@@ -301,10 +336,10 @@ def _validate_spacing(paragraph, index: int) -> None:
         raise ValueError(f"第 {index + 1} 段段前段后间距必须为 0")
 
 
-def _set_rfonts(run_properties) -> None:
+def _set_rfonts(run_properties, font_name: str = DISCLOSURE_FONT) -> None:
     fonts = run_properties.get_or_add_rFonts()
     for attribute in ("ascii", "hAnsi", "eastAsia", "cs"):
-        fonts.set(qn(f"w:{attribute}"), DISCLOSURE_FONT)
+        fonts.set(qn(f"w:{attribute}"), font_name)
 
 
 def _set_property(parent, tag: str, attribute: str, value: str) -> None:

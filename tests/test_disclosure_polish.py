@@ -16,9 +16,9 @@ from PIL import Image
 from patent_summarizer.cli import main
 from patent_summarizer.config import AppConfig
 from patent_summarizer.disclosure.prompt_loader import load_prompt
-from patent_summarizer.disclosure.validation import SECTION_TITLES
+from patent_summarizer.disclosure.validation import LEGACY_SECTION_TITLES, SECTION_TITLES, chapter_heading
 from patent_summarizer.disclosure_docx import build_technical_disclosure_document
-from patent_summarizer.disclosure.models import TechnicalDisclosure
+from patent_summarizer.disclosure.models import DisclosureSection, TechnicalDisclosure
 from patent_summarizer.disclosure_polish import PolishError, polish_disclosure_docx
 from patent_summarizer.progress import ProgressTracker
 
@@ -57,7 +57,7 @@ class DisclosurePolishTests(unittest.TestCase):
         document.add_paragraph("冗余制动控制方法")
         document.add_paragraph("摘要")
         _prose(document, "控制器进行状态校验。")
-        for number, title in SECTION_TITLES.items():
+        for number, title in LEGACY_SECTION_TITLES.items():
             document.add_paragraph(f"{number}、{title}")
             _prose(document, "控制器在 20 ms 内进行状态校验。")
 
@@ -98,16 +98,33 @@ class DisclosurePolishTests(unittest.TestCase):
             self.assertEqual(polished_paragraph._element.xml, expected_xml)
         self.assertEqual(polished.tables[0].cell(0, 0).text, "校验周期 20 ms")
         requests = [json.loads(call.args[1]) for call in client.chat.call_args_list]
-        self.assertEqual([request["chapter"] for request in requests], ["摘要", *[f"{n}、{t}" for n, t in SECTION_TITLES.items()]])
+        self.assertEqual([request["chapter"] for request in requests],
+                         ["摘要", *[f"{n}、{t}" for n, t in LEGACY_SECTION_TITLES.items()]])
 
         skill = load_prompt("humanizer-zh/SKILL.md")
         self.assertEqual(
             hashlib.sha256(skill.encode("utf-8")).hexdigest(),
-            "95627fd4437d886f98032ccc62d79136e6310f1fc04e354bb86431795ff206df",
+            "3af2f533c85ab5f1bc7a7c2fb70e80b7b5f9dd42238271b431d94dfeffea33e3",
         )
         rules = skill.split("\n---\n", 1)[1].lstrip()
         for call in client.chat.call_args_list:
             self.assertEqual(call.args[0], f"{load_prompt('polish.md').rstrip()}\n\n{rules}")
+
+    def test_polishes_new_four_chapter_manuscript(self):
+        sentence = "控制器进行状态校验。"
+        sections = tuple(DisclosureSection(number, title, (sentence,)) for number, title in SECTION_TITLES.items())
+        disclosure = TechnicalDisclosure("冗余制动控制方法", sentence, sections=sections)
+        build_technical_disclosure_document(disclosure).save(self.source)
+        client = Mock()
+        client.chat.side_effect = lambda system, user: _respond(system, user, {sentence: "控制器校验状态。"})
+
+        result = polish_disclosure_docx(self.source, client, self.tracker)
+
+        self.assertEqual((result.changed, result.rejected, result.eligible), (5, 0, 5))
+        chapters = [chapter_heading(number, title) for number, title in SECTION_TITLES.items()]
+        self.assertEqual([p.text for p in Document(result.output).paragraphs if p.style.name == "Heading 1"], chapters)
+        self.assertEqual([json.loads(call.args[1])["chapter"] for call in client.chat.call_args_list],
+                         ["摘要", *chapters])
 
     def test_unavailable_rules_stop_before_model_or_output(self):
         self._legacy_source()
